@@ -16,6 +16,7 @@ export default function PWAInstallPrompt() {
     useState<BeforeInstallPromptEvent | null>(null);
   const [showInstallPrompt, setShowInstallPrompt] = useState(false);
   const [showUpdateAvailable, setShowUpdateAvailable] = useState(false);
+  const [isTestMode, setIsTestMode] = useState(false);
 
   useEffect(() => {
     const handleBeforeInstallPrompt = (e: Event) => {
@@ -24,6 +25,28 @@ export default function PWAInstallPrompt() {
       setDeferredPrompt(e as BeforeInstallPromptEvent);
       setShowInstallPrompt(true);
     };
+
+    // 개발 모드에서 테스트용: localStorage에서 테스트 모드 확인
+    const testMode = localStorage.getItem('pwa-test-mode') === 'true';
+    if (testMode && !window.matchMedia("(display-mode: standalone)").matches) {
+      setIsTestMode(true);
+      // 테스트 모드일 때는 즉시 팝업 표시 (deferredPrompt 없이)
+      setShowInstallPrompt(true);
+    }
+
+    // 개발 환경에서 자동으로 팝업 표시 (테스트용)
+    // localhost 또는 개발 서버에서 자동 표시
+    const isDev = window.location.hostname === 'localhost' || 
+                  window.location.hostname === '127.0.0.1' ||
+                  window.location.hostname.includes('localhost');
+    
+    if (isDev && !window.matchMedia("(display-mode: standalone)").matches) {
+      setTimeout(() => {
+        console.log('🧪 개발 모드: PWA 설치 팝업 자동 표시');
+        setShowInstallPrompt(true);
+        setIsTestMode(true);
+      }, 2000); // 2초 후 표시
+    }
 
     const handleAppInstalled = () => {
       console.log('✅ PWA가 설치되었습니다');
@@ -52,21 +75,27 @@ export default function PWAInstallPrompt() {
   }, []);
 
   const handleInstallClick = async () => {
-    if (!deferredPrompt) return;
-    
-    console.log('📱 PWA 설치 시작');
-    deferredPrompt.prompt();
-    
-    const { outcome } = await deferredPrompt.userChoice;
-    
-    if (outcome === "accepted") {
-      console.log("✅ 사용자가 PWA 설치를 승인했습니다");
-    } else {
-      console.log("❌ 사용자가 PWA 설치를 거부했습니다");
+    // 테스트 모드이거나 deferredPrompt가 있는 경우
+    if (deferredPrompt) {
+      console.log('📱 PWA 설치 시작');
+      deferredPrompt.prompt();
+      
+      const { outcome } = await deferredPrompt.userChoice;
+      
+      if (outcome === "accepted") {
+        console.log("✅ 사용자가 PWA 설치를 승인했습니다");
+      } else {
+        console.log("❌ 사용자가 PWA 설치를 거부했습니다");
+      }
+      
+      setDeferredPrompt(null);
+      setShowInstallPrompt(false);
+    } else if (isTestMode) {
+      // 테스트 모드: 브라우저 기본 설치 프롬프트 안내
+      console.log('📱 테스트 모드: 실제 설치를 위해서는 브라우저의 설치 메뉴를 사용하세요');
+      alert('PWA 설치를 위해서는:\n\nChrome/Edge: 주소창 오른쪽의 설치 아이콘 클릭\n또는 메뉴 > 앱 설치\n\nSafari iOS: 공유 버튼 > 홈 화면에 추가');
+      setShowInstallPrompt(false);
     }
-    
-    setDeferredPrompt(null);
-    setShowInstallPrompt(false);
   };
 
   const handleDismissInstall = () => {
@@ -83,6 +112,25 @@ export default function PWAInstallPrompt() {
     if (window.matchMedia("(display-mode: standalone)").matches) return false;
     return true;
   };
+
+  // 개발자 도구에서 수동으로 팝업 표시하는 함수 (전역으로 노출)
+  useEffect(() => {
+    (window as any).showPWAInstallPrompt = () => {
+      console.log('🔧 수동으로 PWA 설치 팝업 표시');
+      setShowInstallPrompt(true);
+      setIsTestMode(true);
+    };
+    
+    (window as any).hidePWAInstallPrompt = () => {
+      console.log('🔧 PWA 설치 팝업 숨김');
+      setShowInstallPrompt(false);
+    };
+
+    return () => {
+      delete (window as any).showPWAInstallPrompt;
+      delete (window as any).hidePWAInstallPrompt;
+    };
+  }, []);
 
   if (!shouldShowInstallPrompt() && !showUpdateAvailable) return null;
 
