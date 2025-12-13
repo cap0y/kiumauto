@@ -17,10 +17,62 @@ export default function PWAInstallPrompt() {
   const [showInstallPrompt, setShowInstallPrompt] = useState(false);
   const [showUpdateAvailable, setShowUpdateAvailable] = useState(false);
   const [isTestMode, setIsTestMode] = useState(false);
+  const [isPWAInstallable, setIsPWAInstallable] = useState(false);
 
   useEffect(() => {
+    // PWA 설치 가능 여부 확인
+    const checkPWAInstallable = async () => {
+      const isStandalone = window.matchMedia("(display-mode: standalone)").matches;
+      if (isStandalone) {
+        console.log('✅ 이미 PWA로 설치되어 있습니다');
+        return false;
+      }
+
+      // 사용자가 이미 팝업을 닫았는지 확인
+      const dismissed = localStorage.getItem('pwa-install-dismissed');
+      const dismissedTime = dismissed ? parseInt(dismissed, 10) : 0;
+      const now = Date.now();
+      // 24시간 후 다시 표시
+      if (dismissed && (now - dismissedTime) < 24 * 60 * 60 * 1000) {
+        console.log('⏰ 사용자가 최근에 팝업을 닫았습니다');
+        return false;
+      }
+
+      // HTTPS 확인
+      const isHTTPS = window.location.protocol === 'https:' || 
+                      window.location.hostname === 'localhost' ||
+                      window.location.hostname === '127.0.0.1';
+      
+      // manifest 확인
+      const hasManifest = !!document.querySelector('link[rel="manifest"]');
+      
+      // Service Worker 확인
+      let hasServiceWorker = false;
+      if ('serviceWorker' in navigator) {
+        try {
+          const registrations = await navigator.serviceWorker.getRegistrations();
+          hasServiceWorker = registrations.length > 0;
+        } catch (e) {
+          console.error('Service Worker 확인 실패:', e);
+        }
+      }
+
+      const installable = isHTTPS && hasManifest && hasServiceWorker;
+      
+      console.log('🔍 PWA 설치 가능 여부:', {
+        isHTTPS,
+        hasManifest,
+        hasServiceWorker,
+        isStandalone,
+        installable,
+        url: window.location.href
+      });
+
+      return installable;
+    };
+
     // PWA 설치 가능 여부 진단
-    const diagnosePWA = () => {
+    const diagnosePWA = async () => {
       const diagnostics = {
         isHTTPS: window.location.protocol === 'https:' || window.location.hostname === 'localhost',
         hasManifest: !!document.querySelector('link[rel="manifest"]'),
@@ -66,26 +118,15 @@ export default function PWAInstallPrompt() {
       e.preventDefault();
       setDeferredPrompt(e as BeforeInstallPromptEvent);
       setShowInstallPrompt(true);
+      setIsPWAInstallable(true);
     };
 
-    // 개발 모드에서 테스트용: localStorage에서 테스트 모드 확인
+    // 테스트 모드: localStorage에서 테스트 모드 확인
     const testMode = localStorage.getItem('pwa-test-mode') === 'true';
     if (testMode && !window.matchMedia("(display-mode: standalone)").matches) {
       setIsTestMode(true);
       setShowInstallPrompt(true);
-    }
-
-    // 개발 환경에서 자동으로 팝업 표시 (테스트용)
-    const isDev = window.location.hostname === 'localhost' || 
-                  window.location.hostname === '127.0.0.1' ||
-                  window.location.hostname.includes('localhost');
-    
-    if (isDev && !window.matchMedia("(display-mode: standalone)").matches) {
-      setTimeout(() => {
-        console.log('🧪 개발 모드: PWA 설치 팝업 자동 표시');
-        setShowInstallPrompt(true);
-        setIsTestMode(true);
-      }, 2000);
+      setIsPWAInstallable(true);
     }
 
     const handleAppInstalled = () => {
@@ -94,8 +135,45 @@ export default function PWAInstallPrompt() {
       setShowInstallPrompt(false);
     };
 
-    // 진단 실행
-    diagnosePWA();
+    // 모든 환경에서 PWA 설치 가능하면 팝업 표시
+    const initPWA = async () => {
+      await diagnosePWA();
+      const installable = await checkPWAInstallable();
+      
+      if (installable) {
+        setIsPWAInstallable(true);
+        
+        // Service Worker 확인 (있으면 기다리고, 없어도 팝업 표시)
+        const showPrompt = () => {
+          setTimeout(() => {
+            console.log('✅ PWA 설치 가능: 팝업 표시');
+            setShowInstallPrompt(true);
+            setIsTestMode(true); // deferredPrompt 없이도 표시하기 위해
+          }, 3000); // 3초 후 표시
+        };
+
+        if ('serviceWorker' in navigator) {
+          // Service Worker가 있으면 준비될 때까지 기다림 (최대 5초)
+          Promise.race([
+            navigator.serviceWorker.ready,
+            new Promise(resolve => setTimeout(resolve, 5000))
+          ]).then(() => {
+            showPrompt();
+          }).catch(() => {
+            // 실패해도 팝업 표시
+            showPrompt();
+          });
+        } else {
+          // Service Worker가 없어도 팝업 표시
+          showPrompt();
+        }
+      } else {
+        console.log('⚠️ PWA 설치 조건 미충족');
+      }
+    };
+
+    // 초기화 실행
+    initPWA();
 
     // 이벤트 리스너 등록
     window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
@@ -167,6 +245,8 @@ export default function PWAInstallPrompt() {
   const handleDismissInstall = () => {
     console.log('🚫 PWA 설치 프롬프트 닫기');
     setShowInstallPrompt(false);
+    // 24시간 동안 다시 표시하지 않음
+    localStorage.setItem('pwa-install-dismissed', Date.now().toString());
   };
 
   const handleUpdateClick = () => {
@@ -176,7 +256,8 @@ export default function PWAInstallPrompt() {
   const shouldShowInstallPrompt = () => {
     if (!showInstallPrompt) return false;
     if (window.matchMedia("(display-mode: standalone)").matches) return false;
-    return true;
+    // PWA 설치 가능하거나 테스트 모드일 때 표시
+    return isPWAInstallable || isTestMode || !!deferredPrompt;
   };
 
   // 개발자 도구에서 수동으로 팝업 표시하는 함수 (전역으로 노출)
