@@ -19,8 +19,50 @@ export default function PWAInstallPrompt() {
   const [isTestMode, setIsTestMode] = useState(false);
 
   useEffect(() => {
+    // PWA 설치 가능 여부 진단
+    const diagnosePWA = () => {
+      const diagnostics = {
+        isHTTPS: window.location.protocol === 'https:' || window.location.hostname === 'localhost',
+        hasManifest: !!document.querySelector('link[rel="manifest"]'),
+        hasServiceWorker: 'serviceWorker' in navigator,
+        isStandalone: window.matchMedia("(display-mode: standalone)").matches,
+        userAgent: navigator.userAgent,
+        url: window.location.href
+      };
+      
+      console.log('🔍 PWA 진단 정보:', diagnostics);
+      
+      // Service Worker 상태 확인
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.getRegistrations().then(registrations => {
+          console.log('📋 등록된 Service Worker:', registrations.length);
+          registrations.forEach((reg, index) => {
+            console.log(`  SW ${index + 1}:`, {
+              scope: reg.scope,
+              active: reg.active?.state,
+              installing: reg.installing?.state,
+              waiting: reg.waiting?.state
+            });
+          });
+        });
+      }
+      
+      // manifest.json 확인
+      const manifestLink = document.querySelector('link[rel="manifest"]') as HTMLLinkElement;
+      if (manifestLink) {
+        fetch(manifestLink.href)
+          .then(res => res.json())
+          .then(manifest => {
+            console.log('📱 manifest.json 내용:', manifest);
+          })
+          .catch(err => {
+            console.error('❌ manifest.json 로드 실패:', err);
+          });
+      }
+    };
+
     const handleBeforeInstallPrompt = (e: Event) => {
-      console.log('🚀 PWA 설치 프롬프트 감지됨');
+      console.log('🚀 PWA 설치 프롬프트 감지됨', e);
       e.preventDefault();
       setDeferredPrompt(e as BeforeInstallPromptEvent);
       setShowInstallPrompt(true);
@@ -30,12 +72,10 @@ export default function PWAInstallPrompt() {
     const testMode = localStorage.getItem('pwa-test-mode') === 'true';
     if (testMode && !window.matchMedia("(display-mode: standalone)").matches) {
       setIsTestMode(true);
-      // 테스트 모드일 때는 즉시 팝업 표시 (deferredPrompt 없이)
       setShowInstallPrompt(true);
     }
 
     // 개발 환경에서 자동으로 팝업 표시 (테스트용)
-    // localhost 또는 개발 서버에서 자동 표시
     const isDev = window.location.hostname === 'localhost' || 
                   window.location.hostname === '127.0.0.1' ||
                   window.location.hostname.includes('localhost');
@@ -45,7 +85,7 @@ export default function PWAInstallPrompt() {
         console.log('🧪 개발 모드: PWA 설치 팝업 자동 표시');
         setShowInstallPrompt(true);
         setIsTestMode(true);
-      }, 2000); // 2초 후 표시
+      }, 2000);
     }
 
     const handleAppInstalled = () => {
@@ -54,18 +94,44 @@ export default function PWAInstallPrompt() {
       setShowInstallPrompt(false);
     };
 
+    // 진단 실행
+    diagnosePWA();
+
     // 이벤트 리스너 등록
     window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
     window.addEventListener("appinstalled", handleAppInstalled);
 
-    // Service Worker 업데이트 감지 (등록은 main.tsx에서 수행)
+    // Service Worker 업데이트 감지
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.addEventListener("controllerchange", () => {
+        console.log('🔄 Service Worker 컨트롤러 변경됨');
         setShowUpdateAvailable(true);
+      });
+      
+      // Service Worker 준비 상태 확인
+      navigator.serviceWorker.ready.then(registration => {
+        console.log('✅ Service Worker 준비됨:', registration.scope);
+      }).catch(err => {
+        console.error('❌ Service Worker 준비 실패:', err);
       });
     }
 
+    // beforeinstallprompt 이벤트가 발생하지 않는 경우 진단
+    const timeoutId = setTimeout(() => {
+      if (!deferredPrompt && !window.matchMedia("(display-mode: standalone)").matches) {
+        console.warn('⚠️ beforeinstallprompt 이벤트가 발생하지 않았습니다.');
+        console.warn('가능한 원인:');
+        console.warn('  1. 이미 PWA가 설치되어 있음');
+        console.warn('  2. HTTPS가 아님 (Replit은 HTTPS 제공)');
+        console.warn('  3. manifest.json 문제');
+        console.warn('  4. Service Worker 미등록');
+        console.warn('  5. 브라우저 미지원 (Chrome, Edge 권장)');
+        console.warn('  6. PWA 설치 조건 미충족 (최소 2회 방문 필요할 수 있음)');
+      }
+    }, 5000);
+
     return () => {
+      clearTimeout(timeoutId);
       window.removeEventListener(
         "beforeinstallprompt",
         handleBeforeInstallPrompt,
