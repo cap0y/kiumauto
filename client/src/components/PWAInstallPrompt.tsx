@@ -16,6 +16,7 @@ export default function PWAInstallPrompt() {
     useState<BeforeInstallPromptEvent | null>(null);
   const [showInstallPrompt, setShowInstallPrompt] = useState(false);
   const [showUpdateAvailable, setShowUpdateAvailable] = useState(false);
+  const [isInstalling, setIsInstalling] = useState(false);
   const deferredPromptRef = useRef<BeforeInstallPromptEvent | null>(null);
 
   useEffect(() => {
@@ -79,19 +80,79 @@ export default function PWAInstallPrompt() {
       }
     };
 
-    // 이벤트 리스너 등록
-    window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+    // 이벤트 리스너 등록 (가능한 한 빨리)
+    window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt, { passive: false });
     window.addEventListener("appinstalled", handleAppInstalled);
+
+    // Service Worker 등록 확인 및 강제 등록 시도
+    const registerServiceWorker = async () => {
+      if (!('serviceWorker' in navigator)) {
+        console.warn('⚠️ Service Worker를 지원하지 않는 브라우저입니다.');
+        return;
+      }
+
+      try {
+        // 기존 등록 확인
+        const registration = await navigator.serviceWorker.getRegistration();
+        if (registration) {
+          console.log('✅ Service Worker가 이미 등록되어 있습니다:', registration.scope);
+          return;
+        }
+
+        // Service Worker 등록 시도
+        console.log('📝 Service Worker 등록 시도 중...');
+        
+        // VitePWA가 생성한 Service Worker 경로 시도
+        const swPaths = ['/dev-sw.js?dev-sw', '/sw.js', '/service-worker.js'];
+        
+        for (const swPath of swPaths) {
+          try {
+            const reg = await navigator.serviceWorker.register(swPath, {
+              scope: '/',
+              type: 'module'
+            });
+            console.log('✅ Service Worker 등록 성공:', swPath, reg.scope);
+            break;
+          } catch (err) {
+            console.log('❌ Service Worker 등록 실패:', swPath, err);
+          }
+        }
+      } catch (error) {
+        console.error('❌ Service Worker 등록 중 오류:', error);
+      }
+    };
 
     // Service Worker 업데이트 감지
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.addEventListener("controllerchange", () => {
         setShowUpdateAvailable(true);
       });
+      
+      // Service Worker 등록 시도
+      registerServiceWorker();
     }
 
     // 자동 팝업 표시 확인
     checkAndShowPrompt();
+    
+    // beforeinstallprompt 이벤트가 늦게 발생할 수 있으므로 추가 대기
+    const checkForPrompt = () => {
+      // 이미 설정되어 있으면 스킵
+      if (deferredPromptRef.current) {
+        return;
+      }
+      
+      // 이벤트가 발생했는지 확인 (이벤트는 이미 리스너에서 처리됨)
+      // 여기서는 단순히 로그만 남김
+      console.log('⏳ beforeinstallprompt 이벤트 대기 중...');
+    };
+    
+    // 5초 후에도 이벤트가 없으면 로그
+    setTimeout(() => {
+      if (!deferredPromptRef.current) {
+        console.warn('⚠️ beforeinstallprompt 이벤트가 아직 발생하지 않았습니다.');
+      }
+    }, 5000);
 
     return () => {
       window.removeEventListener(
@@ -103,13 +164,44 @@ export default function PWAInstallPrompt() {
   }, []);
 
   const handleInstallClick = async () => {
+    // 시각적 피드백 시작
+    setIsInstalling(true);
+    
+    // Service Worker 등록 확인 및 시도
+    if ('serviceWorker' in navigator) {
+      try {
+        const registration = await navigator.serviceWorker.getRegistration();
+        if (!registration) {
+          console.log('📝 Service Worker가 등록되지 않았습니다. 등록 시도 중...');
+          const swPaths = ['/dev-sw.js?dev-sw', '/sw.js', '/service-worker.js'];
+          for (const swPath of swPaths) {
+            try {
+              await navigator.serviceWorker.register(swPath, { scope: '/', type: 'module' });
+              console.log('✅ Service Worker 등록 성공:', swPath);
+              break;
+            } catch (err) {
+              console.log('❌ Service Worker 등록 실패:', swPath);
+            }
+          }
+          // Service Worker 등록 후 잠시 대기
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      } catch (error) {
+        console.error('❌ Service Worker 확인 중 오류:', error);
+      }
+    }
+    
     // deferredPromptRef에서도 확인 (상태 업데이트가 늦을 수 있음)
     const promptToUse = deferredPrompt || deferredPromptRef.current;
     
     console.log('🔘 추가 버튼 클릭됨', { 
       deferredPrompt: !!deferredPrompt,
       deferredPromptRef: !!deferredPromptRef.current,
-      promptToUse: !!promptToUse
+      promptToUse: !!promptToUse,
+      userAgent: navigator.userAgent,
+      isMobile: /iPhone|iPad|iPod|Android/i.test(navigator.userAgent),
+      protocol: window.location.protocol,
+      hasServiceWorker: 'serviceWorker' in navigator
     });
     
     if (promptToUse) {
@@ -123,6 +215,7 @@ export default function PWAInstallPrompt() {
         
         // 모달 닫기
         setShowInstallPrompt(false);
+        setIsInstalling(false);
         
         const { outcome } = await promptToUse.userChoice;
         console.log('📊 사용자 선택 결과:', outcome);
@@ -139,19 +232,48 @@ export default function PWAInstallPrompt() {
         deferredPromptRef.current = null;
       } catch (error) {
         console.error('❌ 설치 프롬프트 표시 중 오류:', error);
+        setIsInstalling(false);
         // 오류 발생 시 모달 다시 표시
         setShowInstallPrompt(true);
       }
     } else {
-      // beforeinstallprompt 이벤트가 없는 경우 - 모달은 계속 표시
+      // beforeinstallprompt 이벤트가 없는 경우
       console.warn('⚠️ beforeinstallprompt 이벤트가 없습니다. promptToUse가 null입니다.');
+      
+      const isHTTPS = window.location.protocol === 'https:' || 
+                      window.location.hostname === 'localhost' || 
+                      window.location.hostname === '127.0.0.1';
+      
       console.log('🔍 현재 상태:', {
         hasServiceWorker: 'serviceWorker' in navigator,
         hasManifest: !!document.querySelector('link[rel="manifest"]'),
         isStandalone: window.matchMedia("(display-mode: standalone)").matches,
-        protocol: window.location.protocol
+        protocol: window.location.protocol,
+        isHTTPS,
+        userAgent: navigator.userAgent
       });
-      // 모달은 계속 표시 (deferredPrompt가 설정될 때까지 대기)
+      
+      setIsInstalling(false);
+      
+      // HTTPS가 아닌 경우 안내
+      if (!isHTTPS) {
+        alert('PWA 설치를 위해서는 HTTPS 연결이 필요합니다.\n\n현재 HTTP 환경에서는 설치할 수 없습니다.\nHTTPS로 접속해주세요.');
+        return;
+      }
+      
+      // 모바일 Safari의 경우 다른 방법 안내
+      const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+      const isSafari = /Safari/i.test(navigator.userAgent) && !/Chrome|CriOS|FxiOS/i.test(navigator.userAgent);
+      
+      if (isIOS && isSafari) {
+        // iOS Safari는 beforeinstallprompt를 지원하지 않음
+        alert('iOS Safari에서는 공유 버튼(□↑)을 누른 후 "홈 화면에 추가"를 선택해주세요.');
+      } else {
+        // Android Chrome 등에서 이벤트가 아직 발생하지 않은 경우
+        console.log('⏳ beforeinstallprompt 이벤트 대기 중...');
+        alert('설치 프롬프트가 아직 준비되지 않았습니다.\n\n잠시 후 다시 시도해주세요.\n또는 브라우저 메뉴에서 "앱 설치"를 선택해주세요.');
+        // 모달은 계속 표시하고 이벤트를 기다림
+      }
     }
   };
 
@@ -233,9 +355,10 @@ export default function PWAInstallPrompt() {
               <Button
                 size="sm"
                 onClick={handleInstallClick}
-                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white h-8 text-sm font-semibold shadow min-w-0"
+                disabled={isInstalling}
+                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white h-8 text-sm font-semibold shadow min-w-0 disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                추가
+                {isInstalling ? '설치 중...' : '추가'}
               </Button>
             </div>
           </div>
