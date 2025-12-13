@@ -1,0 +1,54 @@
+{
+  "keys": [
+    {
+      "key": "CCDECA5F39810A68B5BEC6005FC159DB",
+      "issuedAt": "2025-12-12T13:41:30.030Z",
+      "expiresAt": "2026-02-10T13:41:30.030Z",
+      "validDays": 60,
+      "issuedBy": "admin",
+      "isActive": true,
+      "usedCount": 2,
+      "lastUsedAt": "2025-12-12T13:41:48.209Z"
+    },
+    {
+      "key": "B2FA331040937CA10DE64784112B68AB",
+      "issuedAt": "2025-12-12T13:46:46.015Z",
+      "expiresAt": "2026-02-10T13:46:46.015Z",
+      "validDays": 60,
+      "issuedBy": "admin",
+      "isActive": true,
+      "usedCount": 58,
+      "lastUsedAt": "2025-12-13T12:42:10.976Z"
+    },
+    {
+      "key": "0E411E94F5E1073BF0D7133DB32F7B94",
+      "issuedAt": "2025-12-13T00:03:54.786Z",
+      "expiresAt": "2026-02-11T00:03:54.786Z",
+      "validDays": 60,
+      "issuedBy": "admin",
+      "isActive": true,
+      "usedCount": 4,
+      "lastUsedAt": "2025-12-13T01:21:43.709Z"
+    },
+    {
+      "key": "698E106C2DC8B04904F4809EA21EFBFE",
+      "issuedAt": "2025-12-13T00:24:40.284Z",
+      "expiresAt": "2026-02-11T00:24:40.284Z",
+      "validDays": 60,
+      "issuedBy": "admin",
+      "isActive": true,
+      "usedCount": 2,
+      "lastUsedAt": "2025-12-13T00:24:42.054Z"
+    },
+    {
+      "key": "EB842534DCEC493A92491A6A150C81BD",
+      "issuedAt": "2025-12-13T00:37:26.113Z",
+      "expiresAt": "2026-02-11T00:37:26.113Z",
+      "validDays": 60,
+      "issuedBy": "admin",
+      "isActive": true,
+      "usedCount": 2,
+      "lastUsedAt": "2025-12-13T00:37:28.447Z"
+    }
+  ]
+}

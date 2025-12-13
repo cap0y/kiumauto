@@ -1,30 +1,29 @@
-import { Switch, Route } from "wouter";
-import { queryClient } from "./lib/queryClient";
-import { QueryClientProvider } from "@tanstack/react-query";
-import { Toaster } from "@/components/ui/toaster";
-import { TooltipProvider } from "@/components/ui/tooltip";
-import NotFound from "@/pages/not-found";
-
-function Router() {
-  return (
-    <Switch>
-      {/* Add pages below */}
-      {/* <Route path="/" component={Home}/> */}
-      {/* Fallback to 404 */}
-      <Route component={NotFound} />
-    </Switch>
-  );
-}
+import React from 'react'
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import Layout from './components/Layout'
+import AutoTrading from './pages/AutoTrading'
+import TradingSettings from './pages/TradingSettings'
+import Admin from './pages/Admin'
 
 function App() {
   return (
-    <QueryClientProvider client={queryClient}>
-      <TooltipProvider>
-        <Toaster />
-        <Router />
-      </TooltipProvider>
-    </QueryClientProvider>
-  );
+    <BrowserRouter
+      future={{
+        v7_startTransition: true,
+        v7_relativeSplatPath: true,
+      }}
+    >
+      <Layout>
+        <Routes>
+          <Route path="/" element={<AutoTrading />} />
+          <Route path="/settings" element={<TradingSettings />} />
+          <Route path="/admin" element={<Admin />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </Layout>
+    </BrowserRouter>
+  )
 }
 
-export default App;
+export default App
+
