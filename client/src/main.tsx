@@ -6,30 +6,8 @@ import App from './App'
 import './index.css'
 import { useThemeStore } from './store/useThemeStore'
 
-// Service Worker 등록
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js')
-      .then((registration) => {
-        console.log('Service Worker 등록 성공:', registration.scope)
-        
-        // Service Worker 업데이트 감지
-        registration.addEventListener('updatefound', () => {
-          const newWorker = registration.installing
-          if (newWorker) {
-            newWorker.addEventListener('statechange', () => {
-              if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-                console.log('새 Service Worker가 설치되었습니다. 페이지를 새로고침하세요.')
-              }
-            })
-          }
-        })
-      })
-      .catch((error) => {
-        console.error('Service Worker 등록 실패:', error)
-      })
-  })
-}
+// Service Worker는 VitePWA 플러그인이 자동으로 등록합니다
+// 수동 등록은 제거하여 충돌 방지
 
 const queryClient = new QueryClient({
   defaultOptions: {
