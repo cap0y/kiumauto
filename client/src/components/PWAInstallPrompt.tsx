@@ -31,16 +31,59 @@ export default function PWAInstallPrompt() {
       setShowInstallPrompt(false);
     };
 
+    // 무조건 팝업 표시 (이미 설치되어 있지 않은 경우)
+    const checkAndShowPrompt = () => {
+      console.log('🔍 PWA 설치 팝업 확인 시작');
+      
+      // 이미 설치되어 있으면 표시하지 않음
+      const isStandalone = window.matchMedia("(display-mode: standalone)").matches;
+      if (isStandalone) {
+        console.log('✅ 이미 PWA로 설치되어 있습니다');
+        return;
+      }
+
+      console.log('📱 PWA 설치 가능 상태:', {
+        isStandalone,
+        hasManifest: !!document.querySelector('link[rel="manifest"]'),
+        hasServiceWorker: 'serviceWorker' in navigator,
+        protocol: window.location.protocol,
+        hostname: window.location.hostname
+      });
+
+      // Service Worker 준비 대기 (최대 3초)
+      const showPrompt = () => {
+        console.log('✅ PWA 설치 팝업 표시');
+        setShowInstallPrompt(true);
+      };
+
+      if ('serviceWorker' in navigator) {
+        Promise.race([
+          navigator.serviceWorker.ready,
+          new Promise(resolve => setTimeout(resolve, 3000))
+        ]).then(() => {
+          setTimeout(showPrompt, 1000);
+        }).catch(() => {
+          setTimeout(showPrompt, 1000);
+        });
+      } else {
+        // Service Worker가 없어도 팝업 표시
+        setTimeout(showPrompt, 2000);
+      }
+    };
+
     // 이벤트 리스너 등록
     window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
     window.addEventListener("appinstalled", handleAppInstalled);
 
-    // Service Worker 업데이트 감지 (등록은 main.tsx에서 수행)
+    // Service Worker 업데이트 감지
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.addEventListener("controllerchange", () => {
         setShowUpdateAvailable(true);
       });
     }
+
+    // 자동 팝업 표시 확인
+    checkAndShowPrompt();
 
     return () => {
       window.removeEventListener(
@@ -52,26 +95,44 @@ export default function PWAInstallPrompt() {
   }, []);
 
   const handleInstallClick = async () => {
-    if (!deferredPrompt) return;
-    
-    console.log('📱 PWA 설치 시작');
-    deferredPrompt.prompt();
-    
-    const { outcome } = await deferredPrompt.userChoice;
-    
-    if (outcome === "accepted") {
-      console.log("✅ 사용자가 PWA 설치를 승인했습니다");
+    if (deferredPrompt) {
+      // beforeinstallprompt 이벤트가 있는 경우 - 바로 브라우저 네이티브 설치 프롬프트 표시
+      console.log('📱 PWA 설치 프롬프트 표시');
+      try {
+        // 모달을 먼저 닫고 브라우저 네이티브 프롬프트 표시
+        setShowInstallPrompt(false);
+        
+        // 브라우저 네이티브 설치 프롬프트 표시
+        await deferredPrompt.prompt();
+        
+        const { outcome } = await deferredPrompt.userChoice;
+        
+        if (outcome === "accepted") {
+          console.log("✅ 사용자가 PWA 설치를 승인했습니다");
+        } else {
+          console.log("❌ 사용자가 PWA 설치를 거부했습니다");
+          // 거부한 경우 모달 다시 표시
+          setShowInstallPrompt(true);
+        }
+        
+        setDeferredPrompt(null);
+      } catch (error) {
+        console.error('❌ 설치 프롬프트 표시 중 오류:', error);
+        // 오류 발생 시 모달 다시 표시
+        setShowInstallPrompt(true);
+      }
     } else {
-      console.log("❌ 사용자가 PWA 설치를 거부했습니다");
+      // beforeinstallprompt 이벤트가 없는 경우
+      console.log('⚠️ beforeinstallprompt 이벤트가 없습니다.');
+      // 모달은 계속 표시 (사용자가 브라우저에서 직접 설치해야 함)
     }
-    
-    setDeferredPrompt(null);
-    setShowInstallPrompt(false);
   };
 
   const handleDismissInstall = () => {
     console.log('🚫 PWA 설치 프롬프트 닫기');
     setShowInstallPrompt(false);
+    // 24시간 동안 다시 표시하지 않음
+    localStorage.setItem('pwa-install-dismissed', Date.now().toString());
   };
 
   const handleUpdateClick = () => {
@@ -79,10 +140,29 @@ export default function PWAInstallPrompt() {
   };
 
   const shouldShowInstallPrompt = () => {
-    if (!showInstallPrompt) return false;
-    if (window.matchMedia("(display-mode: standalone)").matches) return false;
+    if (!showInstallPrompt) {
+      console.log('❌ showInstallPrompt가 false입니다');
+      return false;
+    }
+    if (window.matchMedia("(display-mode: standalone)").matches) {
+      console.log('❌ 이미 standalone 모드입니다');
+      return false;
+    }
+    console.log('✅ 팝업 표시 조건 충족');
     return true;
   };
+
+  // 디버깅: 상태 로그
+  useEffect(() => {
+    const isStandalone = window.matchMedia("(display-mode: standalone)").matches;
+    console.log('🎨 PWA 설치 팝업 상태:', {
+      showInstallPrompt,
+      deferredPrompt: !!deferredPrompt,
+      showUpdateAvailable,
+      isStandalone,
+      shouldShow: showInstallPrompt && !isStandalone
+    });
+  }, [showInstallPrompt, deferredPrompt, showUpdateAvailable]);
 
   if (!shouldShowInstallPrompt() && !showUpdateAvailable) return null;
 
@@ -90,49 +170,45 @@ export default function PWAInstallPrompt() {
     <>
       {/* PWA 설치 프롬프트 - 네이티브 앱 설치 프롬프트 스타일 */}
       {shouldShowInstallPrompt() && (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[9999] flex items-center justify-center p-4">
-          <div className="bg-gray-800 text-white rounded-2xl shadow-2xl w-full max-w-[400px] border border-gray-700 overflow-hidden">
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[9999] flex items-end justify-center p-4 pb-6">
+          <div className="bg-gray-800 text-white rounded-3xl shadow-2xl w-full max-w-[320px] border border-gray-700 overflow-hidden">
             {/* 헤더 */}
-            <div className="px-6 py-4 border-b border-gray-700">
-              <h2 className="text-lg font-semibold">앱 설치</h2>
+            <div className="px-6 py-5 border-b border-gray-700">
+              <h2 className="text-2xl font-bold">앱 설치</h2>
             </div>
             
             {/* 앱 정보 */}
-            <div className="px-6 py-5">
-              <div className="flex items-center gap-4 mb-4">
-                {/* 앱 아이콘 */}
-                <div className="w-16 h-16 bg-gradient-to-br from-blue-500 to-purple-600 rounded-xl flex items-center justify-center flex-shrink-0 shadow-lg">
-                  <Download className="w-8 h-8 text-white" />
+            <div className="px-6 py-6">
+              <div className="flex items-center gap-5 mb-6">
+                {/* 앱 아이콘 - 큰 사이즈 */}
+                <div className="w-20 h-20 bg-gradient-to-br from-blue-500 via-purple-500 to-pink-500 rounded-2xl flex items-center justify-center flex-shrink-0 shadow-xl">
+                  <Download className="w-10 h-10 text-white" />
                 </div>
                 
                 {/* 앱 이름 및 도메인 */}
                 <div className="flex-1 min-w-0">
-                  <h3 className="text-xl font-semibold mb-1 truncate">키움증권 자동매매</h3>
+                  <h3 className="text-2xl font-bold mb-1 truncate">키움증권 자동매매</h3>
                   <p className="text-sm text-gray-400 truncate">{window.location.hostname}</p>
                 </div>
               </div>
-              
-              <p className="text-sm text-gray-300 mb-4">
-                빠른 접근을 위해 앱을 설치하세요
-              </p>
             </div>
             
             {/* 버튼 */}
-            <div className="px-6 py-4 border-t border-gray-700 flex gap-3">
+            <div className="px-6 py-5 border-t border-gray-700 flex gap-3">
               <Button
                 size="lg"
                 variant="ghost"
                 onClick={handleDismissInstall}
-                className="flex-1 text-gray-300 hover:text-white hover:bg-gray-700 h-12 text-base"
+                className="flex-1 text-blue-400 hover:text-blue-300 hover:bg-gray-700/50 h-14 text-lg font-medium"
               >
                 취소
               </Button>
               <Button
                 size="lg"
                 onClick={handleInstallClick}
-                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white h-12 text-base font-medium"
+                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white h-14 text-lg font-semibold shadow-lg"
               >
-                설치
+                추가
               </Button>
             </div>
           </div>
