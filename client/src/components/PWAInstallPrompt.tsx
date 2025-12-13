@@ -88,36 +88,51 @@ export default function PWAInstallPrompt() {
 
   return (
     <>
-      {/* PWA 설치 프롬프트 - 작고 깔끔한 디자인 */}
+      {/* PWA 설치 프롬프트 - 네이티브 앱 설치 프롬프트 스타일 */}
       {shouldShowInstallPrompt() && (
-        <div className="fixed bottom-20 left-1/2 transform -translate-x-1/2 z-[9999] md:bottom-6">
-          <div className="bg-gray-900 text-white rounded-2xl shadow-2xl p-4 max-w-[280px] border border-gray-700">
-            <div className="flex items-start mb-3">
-              <div className="w-10 h-10 bg-gradient-to-br from-purple-500 to-pink-500 rounded-xl flex items-center justify-center mr-3 flex-shrink-0">
-                <Download className="w-5 h-5" />
-              </div>
-              <div className="flex-1">
-                <h3 className="text-sm font-semibold">앱 설치하기</h3>
-                <p className="text-xs text-gray-300 mt-0.5">
-                  빠른 접근을 위해 설치해세요
-                </p>
-              </div>
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-[9999] flex items-center justify-center p-4">
+          <div className="bg-gray-800 text-white rounded-2xl shadow-2xl w-full max-w-[400px] border border-gray-700 overflow-hidden">
+            {/* 헤더 */}
+            <div className="px-6 py-4 border-b border-gray-700">
+              <h2 className="text-lg font-semibold">앱 설치</h2>
             </div>
-            <div className="flex gap-2">
+            
+            {/* 앱 정보 */}
+            <div className="px-6 py-5">
+              <div className="flex items-center gap-4 mb-4">
+                {/* 앱 아이콘 */}
+                <div className="w-16 h-16 bg-gradient-to-br from-blue-500 to-purple-600 rounded-xl flex items-center justify-center flex-shrink-0 shadow-lg">
+                  <Download className="w-8 h-8 text-white" />
+                </div>
+                
+                {/* 앱 이름 및 도메인 */}
+                <div className="flex-1 min-w-0">
+                  <h3 className="text-xl font-semibold mb-1 truncate">키움증권 자동매매</h3>
+                  <p className="text-sm text-gray-400 truncate">{window.location.hostname}</p>
+                </div>
+              </div>
+              
+              <p className="text-sm text-gray-300 mb-4">
+                빠른 접근을 위해 앱을 설치하세요
+              </p>
+            </div>
+            
+            {/* 버튼 */}
+            <div className="px-6 py-4 border-t border-gray-700 flex gap-3">
               <Button
-                size="sm"
+                size="lg"
                 variant="ghost"
                 onClick={handleDismissInstall}
-                className="flex-1 text-gray-300 hover:text-white hover:bg-gray-800 h-9"
+                className="flex-1 text-gray-300 hover:text-white hover:bg-gray-700 h-12 text-base"
               >
                 취소
               </Button>
               <Button
-                size="sm"
+                size="lg"
                 onClick={handleInstallClick}
-                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white h-9"
+                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white h-12 text-base font-medium"
               >
-                추가
+                설치
               </Button>
             </div>
           </div>
