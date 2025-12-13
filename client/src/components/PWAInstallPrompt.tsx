@@ -269,10 +269,10 @@ export default function PWAInstallPrompt() {
         // iOS Safari는 beforeinstallprompt를 지원하지 않음
         alert('iOS Safari에서는 공유 버튼(□↑)을 누른 후 "홈 화면에 추가"를 선택해주세요.');
       } else {
-        // Android Chrome 등에서 이벤트가 아직 발생하지 않은 경우
+        // Chrome, Edge 등에서 이벤트가 아직 발생하지 않은 경우
+        // alert 제거 - 모달은 계속 표시하고 이벤트를 기다림
         console.log('⏳ beforeinstallprompt 이벤트 대기 중...');
-        alert('설치 프롬프트가 아직 준비되지 않았습니다.\n\n잠시 후 다시 시도해주세요.\n또는 브라우저 메뉴에서 "앱 설치"를 선택해주세요.');
-        // 모달은 계속 표시하고 이벤트를 기다림
+        // 모달은 계속 표시하고 이벤트를 기다림 (alert 제거)
       }
     }
   };
