@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { Button } from "./ui/button";
 import { Download, X } from "lucide-react";
 
@@ -16,18 +16,22 @@ export default function PWAInstallPrompt() {
     useState<BeforeInstallPromptEvent | null>(null);
   const [showInstallPrompt, setShowInstallPrompt] = useState(false);
   const [showUpdateAvailable, setShowUpdateAvailable] = useState(false);
+  const deferredPromptRef = useRef<BeforeInstallPromptEvent | null>(null);
 
   useEffect(() => {
     const handleBeforeInstallPrompt = (e: Event) => {
-      console.log('🚀 PWA 설치 프롬프트 감지됨');
+      console.log('🚀 PWA 설치 프롬프트 감지됨', e);
       e.preventDefault();
-      setDeferredPrompt(e as BeforeInstallPromptEvent);
+      const promptEvent = e as BeforeInstallPromptEvent;
+      deferredPromptRef.current = promptEvent;
+      setDeferredPrompt(promptEvent);
       setShowInstallPrompt(true);
     };
 
     const handleAppInstalled = () => {
       console.log('✅ PWA가 설치되었습니다');
       setDeferredPrompt(null);
+      deferredPromptRef.current = null;
       setShowInstallPrompt(false);
     };
 
@@ -53,6 +57,10 @@ export default function PWAInstallPrompt() {
       // Service Worker 준비 대기 (최대 3초)
       const showPrompt = () => {
         console.log('✅ PWA 설치 팝업 표시');
+        // deferredPromptRef에 이미 설정되어 있으면 상태 업데이트
+        if (deferredPromptRef.current) {
+          setDeferredPrompt(deferredPromptRef.current);
+        }
         setShowInstallPrompt(true);
       };
 
@@ -95,17 +103,29 @@ export default function PWAInstallPrompt() {
   }, []);
 
   const handleInstallClick = async () => {
-    if (deferredPrompt) {
+    // deferredPromptRef에서도 확인 (상태 업데이트가 늦을 수 있음)
+    const promptToUse = deferredPrompt || deferredPromptRef.current;
+    
+    console.log('🔘 추가 버튼 클릭됨', { 
+      deferredPrompt: !!deferredPrompt,
+      deferredPromptRef: !!deferredPromptRef.current,
+      promptToUse: !!promptToUse
+    });
+    
+    if (promptToUse) {
       // beforeinstallprompt 이벤트가 있는 경우 - 바로 브라우저 네이티브 설치 프롬프트 표시
-      console.log('📱 PWA 설치 프롬프트 표시');
+      console.log('📱 PWA 설치 프롬프트 표시 시작');
       try {
-        // 모달을 먼저 닫고 브라우저 네이티브 프롬프트 표시
+        // 브라우저 네이티브 설치 프롬프트 표시
+        console.log('⏳ promptToUse.prompt() 호출 중...');
+        await promptToUse.prompt();
+        console.log('✅ 브라우저 네이티브 프롬프트 표시됨');
+        
+        // 모달 닫기
         setShowInstallPrompt(false);
         
-        // 브라우저 네이티브 설치 프롬프트 표시
-        await deferredPrompt.prompt();
-        
-        const { outcome } = await deferredPrompt.userChoice;
+        const { outcome } = await promptToUse.userChoice;
+        console.log('📊 사용자 선택 결과:', outcome);
         
         if (outcome === "accepted") {
           console.log("✅ 사용자가 PWA 설치를 승인했습니다");
@@ -116,15 +136,22 @@ export default function PWAInstallPrompt() {
         }
         
         setDeferredPrompt(null);
+        deferredPromptRef.current = null;
       } catch (error) {
         console.error('❌ 설치 프롬프트 표시 중 오류:', error);
         // 오류 발생 시 모달 다시 표시
         setShowInstallPrompt(true);
       }
     } else {
-      // beforeinstallprompt 이벤트가 없는 경우
-      console.log('⚠️ beforeinstallprompt 이벤트가 없습니다.');
-      // 모달은 계속 표시 (사용자가 브라우저에서 직접 설치해야 함)
+      // beforeinstallprompt 이벤트가 없는 경우 - 모달은 계속 표시
+      console.warn('⚠️ beforeinstallprompt 이벤트가 없습니다. promptToUse가 null입니다.');
+      console.log('🔍 현재 상태:', {
+        hasServiceWorker: 'serviceWorker' in navigator,
+        hasManifest: !!document.querySelector('link[rel="manifest"]'),
+        isStandalone: window.matchMedia("(display-mode: standalone)").matches,
+        protocol: window.location.protocol
+      });
+      // 모달은 계속 표시 (deferredPrompt가 설정될 때까지 대기)
     }
   };
 
@@ -168,45 +195,45 @@ export default function PWAInstallPrompt() {
 
   return (
     <>
-      {/* PWA 설치 프롬프트 - 네이티브 앱 설치 프롬프트 스타일 */}
+      {/* PWA 설치 프롬프트 - 네이티브 앱 설치 프롬프트(소형 & 컴팩트) */}
       {shouldShowInstallPrompt() && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[9999] flex items-end justify-center p-4 pb-6">
-          <div className="bg-gray-800 text-white rounded-3xl shadow-2xl w-full max-w-[320px] border border-gray-700 overflow-hidden">
+        <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-[9999] flex items-end justify-center p-2 pb-3">
+          <div className="bg-gray-800 text-white rounded-xl shadow-xl w-full max-w-[220px] border border-gray-700 overflow-hidden">
             {/* 헤더 */}
-            <div className="px-6 py-5 border-b border-gray-700">
-              <h2 className="text-2xl font-bold">앱 설치</h2>
+            <div className="px-3 py-2 border-b border-gray-700">
+              <h2 className="text-base font-bold leading-tight">앱 설치</h2>
             </div>
             
             {/* 앱 정보 */}
-            <div className="px-6 py-6">
-              <div className="flex items-center gap-5 mb-6">
-                {/* 앱 아이콘 - 큰 사이즈 */}
-                <div className="w-20 h-20 bg-gradient-to-br from-blue-500 via-purple-500 to-pink-500 rounded-2xl flex items-center justify-center flex-shrink-0 shadow-xl">
-                  <Download className="w-10 h-10 text-white" />
+            <div className="px-3 py-3">
+              <div className="flex items-center gap-2 mb-2">
+                {/* 앱 아이콘 - 작은 사이즈 */}
+                <div className="w-10 h-10 bg-gradient-to-br from-blue-500 via-purple-500 to-pink-500 rounded-lg flex items-center justify-center flex-shrink-0 shadow">
+                  <Download className="w-5 h-5 text-white" />
                 </div>
                 
                 {/* 앱 이름 및 도메인 */}
                 <div className="flex-1 min-w-0">
-                  <h3 className="text-2xl font-bold mb-1 truncate">키움증권 자동매매</h3>
-                  <p className="text-sm text-gray-400 truncate">{window.location.hostname}</p>
+                  <h3 className="text-base font-bold mb-0.5 truncate leading-snug">키움증권 자동매매</h3>
+                  <p className="text-xs text-gray-400 truncate leading-none">{window.location.hostname}</p>
                 </div>
               </div>
             </div>
             
             {/* 버튼 */}
-            <div className="px-6 py-5 border-t border-gray-700 flex gap-3">
+            <div className="px-3 py-2 border-t border-gray-700 flex gap-1">
               <Button
-                size="lg"
+                size="sm"
                 variant="ghost"
                 onClick={handleDismissInstall}
-                className="flex-1 text-blue-400 hover:text-blue-300 hover:bg-gray-700/50 h-14 text-lg font-medium"
+                className="flex-1 text-blue-400 hover:text-blue-300 hover:bg-gray-700/50 h-8 text-sm font-medium min-w-0"
               >
                 취소
               </Button>
               <Button
-                size="lg"
+                size="sm"
                 onClick={handleInstallClick}
-                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white h-14 text-lg font-semibold shadow-lg"
+                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white h-8 text-sm font-semibold shadow min-w-0"
               >
                 추가
               </Button>
