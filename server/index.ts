@@ -1,98 +1,100 @@
-import express, { type Request, Response, NextFunction } from "express";
-import { registerRoutes } from "./routes";
-import { serveStatic } from "./static";
-import { createServer } from "http";
+/**
+ * 키움증권 자동매매 API 서버
+ * Express + TypeScript 기반 백엔드 서버
+ */
+import express from 'express'
+import cors from 'cors'
+import { createServer } from 'http'
+import { WebSocketServer } from 'ws'
+import dotenv from 'dotenv'
+import routes from './routes/index'
+import { KiwoomService } from './services/kiwoomService'
 
-const app = express();
-const httpServer = createServer(app);
+// 환경 변수 로드
+dotenv.config()
 
-declare module "http" {
-  interface IncomingMessage {
-    rawBody: unknown;
-  }
-}
+const app = express()
+const PORT = process.env.PORT || 8000
 
-app.use(
-  express.json({
-    verify: (req, _res, buf) => {
-      req.rawBody = buf;
-    },
-  }),
-);
+// 미들웨어 설정
+app.use(cors({
+  origin: '*', // 프로덕션에서는 특정 도메인으로 제한
+  credentials: true,
+}))
+app.use(express.json())
+app.use(express.urlencoded({ extended: true }))
 
-app.use(express.urlencoded({ extended: false }));
+// 라우터 설정
+app.use('/api', routes)
 
-export function log(message: string, source = "express") {
-  const formattedTime = new Date().toLocaleTimeString("en-US", {
-    hour: "numeric",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: true,
-  });
+// 루트 엔드포인트
+app.get('/', (req, res) => {
+  res.json({
+    message: '키움증권 자동매매 API 서버',
+    status: 'running',
+    version: '1.0.0'
+  })
+})
 
-  console.log(`${formattedTime} [${source}] ${message}`);
-}
+// HTTP 서버 생성
+const server = createServer(app)
 
-app.use((req, res, next) => {
-  const start = Date.now();
-  const path = req.path;
-  let capturedJsonResponse: Record<string, any> | undefined = undefined;
+// WebSocket 서버 생성
+const wss = new WebSocketServer({ server })
 
-  const originalResJson = res.json;
-  res.json = function (bodyJson, ...args) {
-    capturedJsonResponse = bodyJson;
-    return originalResJson.apply(res, [bodyJson, ...args]);
-  };
+// WebSocket 연결 관리
+const connectedClients = new Set<any>()
 
-  res.on("finish", () => {
-    const duration = Date.now() - start;
-    if (path.startsWith("/api")) {
-      let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
-      if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
-      }
+wss.on('connection', (ws) => {
+  connectedClients.add(ws)
+  console.log('WebSocket 클라이언트 연결됨')
 
-      log(logLine);
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message.toString())
+      // 클라이언트로부터 메시지 수신 처리
+      ws.send(JSON.stringify({ message: 'received', data }))
+    } catch (error) {
+      console.error('WebSocket 메시지 처리 오류:', error)
     }
-  });
+  })
 
-  next();
-});
+  ws.on('close', () => {
+    connectedClients.delete(ws)
+    console.log('WebSocket 클라이언트 연결 해제됨')
+  })
 
-(async () => {
-  await registerRoutes(httpServer, app);
+  ws.on('error', (error) => {
+    console.error('WebSocket 오류:', error)
+    connectedClients.delete(ws)
+  })
+})
 
-  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
-    const status = err.status || err.statusCode || 500;
-    const message = err.message || "Internal Server Error";
+// 브로드캐스트 함수
+export const broadcastMessage = (message: any) => {
+  const data = JSON.stringify(message)
+  connectedClients.forEach((client) => {
+    if (client.readyState === 1) { // OPEN 상태
+      client.send(data)
+    }
+  })
+}
 
-    res.status(status).json({ message });
-    throw err;
-  });
+// 키움증권 WebSocket 실시간 데이터를 클라이언트에 브로드캐스트
+const kiwoomService = KiwoomService.getInstance()
+kiwoomService.onRealTimeData((data) => {
+  // 실시간 시세 데이터를 모든 클라이언트에 브로드캐스트
+  broadcastMessage({
+    type: 'realtime',
+    data: data,
+  })
+})
 
-  // importantly only setup vite in development and after
-  // setting up all the other routes so the catch-all route
-  // doesn't interfere with the other routes
-  if (process.env.NODE_ENV === "production") {
-    serveStatic(app);
-  } else {
-    const { setupVite } = await import("./vite");
-    await setupVite(httpServer, app);
-  }
+// 서버 시작
+server.listen(PORT, () => {
+  console.log(`서버가 포트 ${PORT}에서 실행 중입니다`)
+  console.log(`환경: ${process.env.NODE_ENV || 'development'}`)
+})
 
-  // ALWAYS serve the app on the port specified in the environment variable PORT
-  // Other ports are firewalled. Default to 5000 if not specified.
-  // this serves both the API and the client.
-  // It is the only port that is not firewalled.
-  const port = parseInt(process.env.PORT || "5000", 10);
-  httpServer.listen(
-    {
-      port,
-      host: "0.0.0.0",
-      reusePort: true,
-    },
-    () => {
-      log(`serving on port ${port}`);
-    },
-  );
-})();
+export default app
+
