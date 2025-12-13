@@ -7,33 +7,40 @@ import cors from 'cors'
 import { createServer } from 'http'
 import { WebSocketServer } from 'ws'
 import dotenv from 'dotenv'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import routes from './routes/index'
 import { KiwoomService } from './services/kiwoomService'
 
 // 환경 변수 로드
 dotenv.config()
 
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
 const app = express()
-const PORT = process.env.PORT || 8000
+const PORT = process.env.PORT || 5000
 
 // 미들웨어 설정
 app.use(cors({
-  origin: '*', // 프로덕션에서는 특정 도메인으로 제한
+  origin: '*',
   credentials: true,
 }))
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 
-// 라우터 설정
+// API 라우터 설정
 app.use('/api', routes)
 
-// 루트 엔드포인트
-app.get('/', (req, res) => {
-  res.json({
-    message: '키움증권 자동매매 API 서버',
-    status: 'running',
-    version: '1.0.0'
-  })
+// 정적 파일 제공 (프로덕션)
+const distPath = path.resolve(__dirname, '../dist')
+app.use(express.static(distPath))
+
+// SPA 라우팅 - API가 아닌 모든 요청은 index.html로
+app.get('*', (req, res) => {
+  if (!req.path.startsWith('/api')) {
+    res.sendFile(path.join(distPath, 'index.html'))
+  }
 })
 
 // HTTP 서버 생성
@@ -52,7 +59,6 @@ wss.on('connection', (ws) => {
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message.toString())
-      // 클라이언트로부터 메시지 수신 처리
       ws.send(JSON.stringify({ message: 'received', data }))
     } catch (error) {
       console.error('WebSocket 메시지 처리 오류:', error)
@@ -74,7 +80,7 @@ wss.on('connection', (ws) => {
 export const broadcastMessage = (message: any) => {
   const data = JSON.stringify(message)
   connectedClients.forEach((client) => {
-    if (client.readyState === 1) { // OPEN 상태
+    if (client.readyState === 1) {
       client.send(data)
     }
   })
@@ -83,7 +89,6 @@ export const broadcastMessage = (message: any) => {
 // 키움증권 WebSocket 실시간 데이터를 클라이언트에 브로드캐스트
 const kiwoomService = KiwoomService.getInstance()
 kiwoomService.onRealTimeData((data) => {
-  // 실시간 시세 데이터를 모든 클라이언트에 브로드캐스트
   broadcastMessage({
     type: 'realtime',
     data: data,
@@ -97,4 +102,3 @@ server.listen(PORT, () => {
 })
 
 export default app
-

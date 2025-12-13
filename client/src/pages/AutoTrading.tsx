@@ -3829,8 +3829,7 @@ const AutoTrading = () => {
             {/* 검색된 종목 리스트 */}
             <div 
               style={{
-                minHeight: '280px',
-                maxHeight: '400px',
+                height: '400px',
                 borderBottom: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
                 padding: '8px',
                 flexShrink: 0,
@@ -3847,7 +3846,8 @@ const AutoTrading = () => {
                 display: 'flex', 
                 justifyContent: 'space-between', 
                 alignItems: 'center',
-                borderRadius: '8px'
+                borderRadius: '8px',
+                flexShrink: 0
               }}>
                 <h3 style={{ 
                   fontSize: '12px', 
@@ -3872,11 +3872,11 @@ const AutoTrading = () => {
               <div 
                 ref={stocksScrollRef}
                 style={{ 
-                  overflowX: 'auto', 
+                  overflowX: 'hidden', 
                   overflowY: 'auto',
-                  flex: 1,
-                  maxHeight: '350px',
-                  minHeight: '200px'
+                  flex: '1 1 auto',
+                  height: 0, // flexbox에서 높이 계산을 위해 필요
+                  minHeight: 0 // flexbox 스크롤을 위한 필수 설정
                 }}
               >
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '11px', lineHeight: '1.2', tableLayout: 'fixed' }}>
