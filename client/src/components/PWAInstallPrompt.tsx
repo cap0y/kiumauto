@@ -20,6 +20,7 @@ export default function PWAInstallPrompt() {
   const deferredPromptRef = useRef<BeforeInstallPromptEvent | null>(null);
 
   useEffect(() => {
+    // 이벤트 리스너를 가장 먼저 등록 (beforeinstallprompt는 페이지 로드 전에도 발생할 수 있음)
     const handleBeforeInstallPrompt = (e: Event) => {
       console.log('🚀 PWA 설치 프롬프트 감지됨', e);
       e.preventDefault();
@@ -28,6 +29,9 @@ export default function PWAInstallPrompt() {
       setDeferredPrompt(promptEvent);
       setShowInstallPrompt(true);
     };
+    
+    // 즉시 이벤트 리스너 등록
+    window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt, { passive: false, capture: true });
 
     const handleAppInstalled = () => {
       console.log('✅ PWA가 설치되었습니다');
@@ -80,8 +84,7 @@ export default function PWAInstallPrompt() {
       }
     };
 
-    // 이벤트 리스너 등록 (가능한 한 빨리)
-    window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt, { passive: false });
+    // appinstalled 이벤트 리스너 등록
     window.addEventListener("appinstalled", handleAppInstalled);
 
     // Service Worker 등록 확인 및 강제 등록 시도
@@ -158,6 +161,7 @@ export default function PWAInstallPrompt() {
       window.removeEventListener(
         "beforeinstallprompt",
         handleBeforeInstallPrompt,
+        { capture: true }
       );
       window.removeEventListener("appinstalled", handleAppInstalled);
     };
@@ -303,7 +307,6 @@ export default function PWAInstallPrompt() {
         alert('iOS Safari에서는 공유 버튼(□↑)을 누른 후 "홈 화면에 추가"를 선택해주세요.');
       } else {
         // Chrome, Edge 등에서 이벤트가 아직 발생하지 않은 경우
-        // alert 제거 - 모달은 계속 표시하고 이벤트를 기다림
         console.log('⏳ beforeinstallprompt 이벤트 대기 중...');
         // 모달은 계속 표시하고 이벤트를 기다림 (alert 제거)
       }
