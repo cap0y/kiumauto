@@ -1105,18 +1105,47 @@ const AutoTrading = () => {
     }, 100)
   }
 
+  // displayedStockCount와 detectedStocks.length를 ref로 관리하여 클로저 문제 해결
+  const displayedStockCountRef = useRef<number>(20)
+  const detectedStocksLengthRef = useRef<number>(0)
+  
+  useEffect(() => {
+    displayedStockCountRef.current = displayedStockCount
+  }, [displayedStockCount])
+  
+  useEffect(() => {
+    detectedStocksLengthRef.current = detectedStocks.length
+  }, [detectedStocks.length])
+
+  // detectedStocks의 길이가 크게 증가할 때만 초기화 (새로운 검색 결과가 들어올 때)
+  const prevDetectedStocksLengthRef = useRef<number>(0)
+  useEffect(() => {
+    const currentLength = detectedStocks.length
+    const prevLength = prevDetectedStocksLengthRef.current
+    
+    // 길이가 크게 증가했을 때만 초기화 (새로운 검색 결과, 10개 이상 증가)
+    // 실시간 업데이트로 인한 작은 변화는 무시
+    if (currentLength > prevLength && (currentLength - prevLength >= 10 || prevLength === 0)) {
+      setDisplayedStockCount(20)
+      displayedStockCountRef.current = 20
+    }
+    prevDetectedStocksLengthRef.current = currentLength
+  }, [detectedStocks.length])
+
   // 무한 스크롤 핸들러
   useEffect(() => {
     const handleScroll = () => {
       if (!stocksScrollRef.current) return
       
       const { scrollTop, scrollHeight, clientHeight } = stocksScrollRef.current
+      const currentDisplayedCount = displayedStockCountRef.current
+      const currentDetectedLength = detectedStocksLengthRef.current
       
-      // 스크롤이 하단 50px 이내에 도달하면 다음 페이지 로드
+      // 스크롤이 하단 100px 이내에 도달하면 다음 페이지 로드
       const distanceFromBottom = scrollHeight - scrollTop - clientHeight
-      if (distanceFromBottom < 50 && displayedStockCount < detectedStocks.length) {
-        const nextCount = Math.min(displayedStockCount + 20, detectedStocks.length)
-        if (nextCount > displayedStockCount) {
+      if (distanceFromBottom < 100 && currentDisplayedCount < currentDetectedLength) {
+        const nextCount = Math.min(currentDisplayedCount + 20, currentDetectedLength)
+        if (nextCount > currentDisplayedCount) {
           setDisplayedStockCount(nextCount)
         }
       }
@@ -1132,10 +1161,13 @@ const AutoTrading = () => {
       const checkAndLoad = () => {
         if (!scrollElement) return
         const { scrollHeight, clientHeight } = scrollElement
-        if (scrollHeight <= clientHeight && displayedStockCount < detectedStocks.length) {
+        const currentDisplayedCount = displayedStockCountRef.current
+        const currentDetectedLength = detectedStocksLengthRef.current
+        
+        if (scrollHeight <= clientHeight && currentDisplayedCount < currentDetectedLength) {
           // 스크롤이 필요 없으면 자동으로 더 로드
-          const nextCount = Math.min(displayedStockCount + 20, detectedStocks.length)
-          if (nextCount > displayedStockCount) {
+          const nextCount = Math.min(currentDisplayedCount + 20, currentDetectedLength)
+          if (nextCount > currentDisplayedCount) {
             setDisplayedStockCount(nextCount)
           }
         }
@@ -1147,17 +1179,13 @@ const AutoTrading = () => {
       // 렌더링 완료 후 다시 확인
       setTimeout(checkAndLoad, 100)
       setTimeout(checkAndLoad, 300)
+      setTimeout(checkAndLoad, 500)
       
       return () => {
         scrollElement.removeEventListener('scroll', handleScroll)
       }
     }
-  }, [displayedStockCount, detectedStocks.length])
-
-  // detectedStocks가 변경되면 표시 개수 초기화
-  useEffect(() => {
-    setDisplayedStockCount(20)
-  }, [detectedStocks.length])
+  }, []) // 의존성 배열을 비워서 한 번만 등록
 
   // 스크롤 가능한 영역이 부족하면 자동으로 더 로드
   useEffect(() => {
