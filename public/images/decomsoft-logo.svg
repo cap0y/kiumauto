@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="60" viewBox="0 0 200 60">
+  <defs>
+    <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#1a56db;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#7e22ce;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <rect x="5" y="10" width="40" height="40" rx="8" fill="url(#gradient)" />
+  <text x="55" y="35" font-family="Arial, sans-serif" font-size="24" font-weight="bold" fill="#1a202c">DECOMSOFT</text>
+  <path d="M15 30 L25 20 L35 30" stroke="white" stroke-width="3" fill="none" />
+</svg> 
