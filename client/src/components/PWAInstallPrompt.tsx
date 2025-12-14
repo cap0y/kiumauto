@@ -208,16 +208,35 @@ export default function PWAInstallPrompt() {
       // beforeinstallprompt 이벤트가 있는 경우 - 바로 브라우저 네이티브 설치 프롬프트 표시
       console.log('📱 PWA 설치 프롬프트 표시 시작');
       try {
+        // 모달을 먼저 닫기 (프롬프트가 제대로 표시되도록)
+        setShowInstallPrompt(false);
+        
         // 브라우저 네이티브 설치 프롬프트 표시
         console.log('⏳ promptToUse.prompt() 호출 중...');
-        await promptToUse.prompt();
+        console.log('🔍 promptToUse 상세 정보:', {
+          platforms: promptToUse.platforms,
+          hasPrompt: typeof promptToUse.prompt === 'function',
+          hasUserChoice: typeof promptToUse.userChoice === 'object'
+        });
+        
+        // prompt() 호출 (타임아웃 추가)
+        const promptPromise = promptToUse.prompt();
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('prompt() 타임아웃')), 5000)
+        );
+        
+        await Promise.race([promptPromise, timeoutPromise]);
         console.log('✅ 브라우저 네이티브 프롬프트 표시됨');
         
-        // 모달 닫기
-        setShowInstallPrompt(false);
         setIsInstalling(false);
         
-        const { outcome } = await promptToUse.userChoice;
+        // userChoice 대기 (타임아웃 추가)
+        const userChoicePromise = promptToUse.userChoice;
+        const userChoiceTimeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('userChoice 타임아웃')), 30000)
+        );
+        
+        const { outcome } = await Promise.race([userChoicePromise, userChoiceTimeoutPromise]) as any;
         console.log('📊 사용자 선택 결과:', outcome);
         
         if (outcome === "accepted") {
@@ -230,11 +249,25 @@ export default function PWAInstallPrompt() {
         
         setDeferredPrompt(null);
         deferredPromptRef.current = null;
-      } catch (error) {
+      } catch (error: any) {
         console.error('❌ 설치 프롬프트 표시 중 오류:', error);
+        console.error('❌ 오류 상세:', {
+          message: error?.message,
+          name: error?.name,
+          stack: error?.stack
+        });
         setIsInstalling(false);
         // 오류 발생 시 모달 다시 표시
         setShowInstallPrompt(true);
+        
+        // HTTP 환경에서의 오류인지 확인
+        const isHTTPS = window.location.protocol === 'https:' || 
+                        window.location.hostname === 'localhost' || 
+                        window.location.hostname === '127.0.0.1';
+        
+        if (!isHTTPS && error?.message?.includes('prompt')) {
+          console.warn('⚠️ HTTP 환경에서는 설치 프롬프트가 제대로 작동하지 않을 수 있습니다.');
+        }
       }
     } else {
       // beforeinstallprompt 이벤트가 없는 경우
