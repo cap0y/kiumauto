@@ -323,13 +323,70 @@ export default function PWAInstallPrompt() {
         // Chrome, Edge 등에서 이벤트가 아직 발생하지 않은 경우
         console.log('⏳ beforeinstallprompt 이벤트 대기 중...');
         
-        // 모달을 닫고 일정 시간 동안 다시 표시하지 않음
-        setShowInstallPrompt(false);
-        setIsInstalling(false);
+        // 이벤트가 발생할 때까지 최대 3초 대기
+        let eventReceived = false;
+        const waitForEvent = new Promise<BeforeInstallPromptEvent | null>((resolve) => {
+          const timeout = setTimeout(() => {
+            if (!eventReceived) {
+              console.log('⏰ beforeinstallprompt 이벤트 대기 타임아웃');
+              resolve(null);
+            }
+          }, 3000);
+          
+          const handler = (e: Event) => {
+            console.log('🚀 beforeinstallprompt 이벤트 감지됨 (대기 중)');
+            e.preventDefault();
+            clearTimeout(timeout);
+            eventReceived = true;
+            window.removeEventListener("beforeinstallprompt", handler);
+            const promptEvent = e as BeforeInstallPromptEvent;
+            deferredPromptRef.current = promptEvent;
+            setDeferredPrompt(promptEvent);
+            resolve(promptEvent);
+          };
+          
+          window.addEventListener("beforeinstallprompt", handler, { once: true });
+        });
         
-        // "추가" 버튼을 눌렀다는 플래그 저장 (1시간 동안 모달 표시 안 함)
-        localStorage.setItem('pwa-install-clicked', Date.now().toString());
-        console.log('✅ 모달 닫기 - 1시간 동안 다시 표시하지 않음');
+        try {
+          const promptEvent = await waitForEvent;
+          
+          if (promptEvent) {
+            // 이벤트가 발생했으면 설치 프롬프트 표시
+            console.log('✅ beforeinstallprompt 이벤트 수신 - 설치 프롬프트 표시');
+            setShowInstallPrompt(false);
+            
+            try {
+              await promptEvent.prompt();
+              const { outcome } = await promptEvent.userChoice;
+              
+              if (outcome === "accepted") {
+                console.log("✅ 사용자가 PWA 설치를 승인했습니다");
+              } else {
+                console.log("❌ 사용자가 PWA 설치를 거부했습니다");
+              }
+              
+              setDeferredPrompt(null);
+              deferredPromptRef.current = null;
+            } catch (error) {
+              console.error('❌ 설치 프롬프트 표시 중 오류:', error);
+            }
+          } else {
+            // 이벤트가 발생하지 않았으면 모달 닫기
+            console.log('❌ beforeinstallprompt 이벤트가 발생하지 않았습니다');
+            setShowInstallPrompt(false);
+            setIsInstalling(false);
+            
+            // "추가" 버튼을 눌렀다는 플래그 저장 (1시간 동안 모달 표시 안 함)
+            localStorage.setItem('pwa-install-clicked', Date.now().toString());
+            console.log('✅ 모달 닫기 - 1시간 동안 다시 표시하지 않음');
+          }
+        } catch (error) {
+          console.error('❌ 이벤트 대기 중 오류:', error);
+          setShowInstallPrompt(false);
+          setIsInstalling(false);
+          localStorage.setItem('pwa-install-clicked', Date.now().toString());
+        }
       }
     }
   };
