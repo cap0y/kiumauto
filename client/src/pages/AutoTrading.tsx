@@ -596,6 +596,7 @@ const AutoTrading = () => {
   const [holdingStocks, setHoldingStocks] = useState<HoldingStock[]>([])
   const [orderLogs, setOrderLogs] = useState<OrderLog[]>([])
   const [logs, setLogs] = useState<LogMessage[]>([])
+  const [showLogSection, setShowLogSection] = useState<boolean>(false) // 로그 섹션 표시 여부
   const [activeTab, setActiveTab] = useState<'orders' | 'conditions' | 'strategies'>('orders')
   const [buyType, setBuyType] = useState<'cash' | 'credit'>('cash')
   const [selectedConditionText, setSelectedConditionText] = useState<string>('선택된 조건식이 없습니다. 조건식을 체크해주세요.')
@@ -1092,6 +1093,9 @@ const AutoTrading = () => {
       level,
     }
     setLogs(prev => [...prev.slice(-199), newLog]) // 최대 200개 유지
+    
+    // 로그가 추가되면 자동으로 로그 섹션 표시
+    setShowLogSection(true)
     
     // 로그 스크롤 자동 이동
     setTimeout(() => {
@@ -3872,7 +3876,7 @@ const AutoTrading = () => {
               <div 
                 ref={stocksScrollRef}
                 style={{ 
-                  overflowX: 'hidden', 
+                  overflowX: 'auto', 
                   overflowY: 'auto',
                   flex: '1 1 auto',
                   height: 0, // flexbox에서 높이 계산을 위해 필요
@@ -6330,53 +6334,57 @@ const AutoTrading = () => {
       </div>
 
       {/* 하단 로그 영역 */}
-      <div 
-        style={{
-          height: '256px',
-          backgroundColor: '#111827',
-          color: '#4ade80',
-          borderTop: '2px solid #374151',
-          display: 'flex',
-          flexDirection: 'column',
-          flexShrink: 0
-        }}
-      >
+      {showLogSection && (
         <div 
           style={{
-            padding: '5px',
-            backgroundColor: '#1f2937',
-            borderBottom: '1px solid #374151',
-            width: '100%',
+            height: '128px',
+            backgroundColor: '#111827',
+            color: '#4ade80',
+            borderTop: '2px solid #374151',
             display: 'flex',
-            flexFlow: 'row',
-            borderRadius: '9999px'
+            flexDirection: 'column',
+            flexShrink: 0
           }}
         >
-          <span style={{ 
-            fontSize: '14px', 
-            fontWeight: 500,
-            display: 'flex',
-            justifyContent: 'center',
-            alignItems: 'center',
-            fontFamily: '"Segoe UI Emoji"',
-            textAlign: 'center',
-            paddingLeft: '20px',
-            paddingRight: '20px',
-            marginLeft: '20px',
-            marginRight: '20px'
-          }}>로그</span>
-        </div>
-        <div
-          ref={logContainerRef}
-          style={{
-            flex: 1,
-            overflowY: 'auto',
-            padding: '5px',
-            fontFamily: 'Consolas, monospace',
-            fontSize: '12px',
-            width: '100%'
-          }}
-        >
+          <div 
+            onClick={() => setShowLogSection(false)}
+            style={{
+              padding: '5px',
+              backgroundColor: '#1f2937',
+              borderBottom: '1px solid #374151',
+              width: '100%',
+              display: 'flex',
+              flexFlow: 'row',
+              borderRadius: '9999px',
+              cursor: 'pointer',
+              userSelect: 'none'
+            }}
+          >
+            <span style={{ 
+              fontSize: '14px', 
+              fontWeight: 500,
+              display: 'flex',
+              justifyContent: 'center',
+              alignItems: 'center',
+              fontFamily: '"Segoe UI Emoji"',
+              textAlign: 'center',
+              paddingLeft: '20px',
+              paddingRight: '20px',
+              marginLeft: '20px',
+              marginRight: '20px'
+            }}>로그</span>
+          </div>
+          <div
+            ref={logContainerRef}
+            style={{
+              flex: 1,
+              overflowY: 'auto',
+              padding: '5px',
+              fontFamily: 'Consolas, monospace',
+              fontSize: '12px',
+              width: '100%'
+            }}
+          >
           {logs.length > 0 ? (
             logs.map((log) => (
               <div
@@ -6397,6 +6405,7 @@ const AutoTrading = () => {
           )}
         </div>
       </div>
+      )}
 
       {/* 로그인 모달 */}
       {showLoginModal && (
