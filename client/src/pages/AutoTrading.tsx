@@ -3602,17 +3602,34 @@ const AutoTrading = () => {
               <div 
                 style={{
                   minHeight: '200px',
-                  borderTop: '1px solid #d1d5db',
-                  borderBottom: '1px solid #d1d5db',
+                  borderTop: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
+                  borderBottom: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
                   padding: '8px',
                   flexShrink: 0,
-                  backgroundColor: '#fffbeb'
+                  backgroundColor: theme === 'dark' ? '#1f2937' : '#f9fafb'
                 }}
               >
-                <div style={{ marginBottom: '8px', padding: '4px', backgroundColor: '#fef3c7', borderBottom: '1px solid #f59e0b', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <h3 style={{ fontSize: '12px', fontWeight: 600 }}>
+                <div style={{ 
+                  marginBottom: '8px', 
+                  padding: '4px', 
+                  backgroundColor: theme === 'dark' ? '#374151' : '#e5e7eb', 
+                  borderBottom: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
+                  display: 'flex', 
+                  justifyContent: 'space-between', 
+                  alignItems: 'center',
+                  borderRadius: '4px'
+                }}>
+                  <h3 style={{ 
+                    fontSize: '12px', 
+                    fontWeight: 600,
+                    color: theme === 'dark' ? '#f3f4f6' : '#111827'
+                  }}>
                     ★ 선택된 종목 (지속 추적) 
-                    <span style={{ marginLeft: '8px', color: '#f59e0b', fontWeight: 'bold' }}>
+                    <span style={{ 
+                      marginLeft: '8px', 
+                      color: theme === 'dark' ? '#f59e0b' : '#d97706', 
+                      fontWeight: 'bold' 
+                    }}>
                       {watchlistStocks.length}개
                     </span>
                   </h3>
@@ -3631,7 +3648,14 @@ const AutoTrading = () => {
                       borderRadius: '4px',
                       cursor: 'pointer',
                       fontSize: '11px',
-                      fontWeight: 500
+                      fontWeight: 500,
+                      transition: 'background-color 0.2s'
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.backgroundColor = '#dc2626'
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.backgroundColor = '#ef4444'
                     }}
                   >
                     전체 삭제
@@ -3640,14 +3664,64 @@ const AutoTrading = () => {
                 <div style={{ overflowX: 'auto' }}>
                   <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
                     <thead>
-                      <tr style={{ backgroundColor: '#fef3c7' }}>
-                        <th style={{ border: '1px solid #f59e0b', padding: '4px 8px', textAlign: 'left', fontWeight: 'normal', whiteSpace: 'nowrap' }}>종목명</th>
-                        <th style={{ border: '1px solid #f59e0b', padding: '4px 8px', textAlign: 'left', fontWeight: 'normal', whiteSpace: 'nowrap' }}>추가시간</th>
-                        <th style={{ border: '1px solid #f59e0b', padding: '4px 8px', textAlign: 'right', fontWeight: 'normal', whiteSpace: 'nowrap' }}>현재가</th>
-                        <th style={{ border: '1px solid #f59e0b', padding: '4px 8px', textAlign: 'right', fontWeight: 'normal', whiteSpace: 'nowrap' }}>대비</th>
-                        <th style={{ border: '1px solid #f59e0b', padding: '4px 8px', textAlign: 'right', fontWeight: 'normal', whiteSpace: 'nowrap' }}>등락%</th>
-                        <th style={{ border: '1px solid #f59e0b', padding: '4px 8px', textAlign: 'right', fontWeight: 'normal', whiteSpace: 'nowrap' }}>거래량</th>
-                        <th style={{ border: '1px solid #f59e0b', padding: '4px 8px', textAlign: 'center', fontWeight: 'normal', width: '80px', whiteSpace: 'nowrap' }}>삭제</th>
+                      <tr style={{ backgroundColor: theme === 'dark' ? '#374151' : '#e5e7eb' }}>
+                        <th style={{ 
+                          border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
+                          padding: '4px 8px', 
+                          textAlign: 'left', 
+                          fontWeight: 'normal', 
+                          whiteSpace: 'nowrap',
+                          color: theme === 'dark' ? '#f3f4f6' : '#111827'
+                        }}>종목명</th>
+                        <th style={{ 
+                          border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
+                          padding: '4px 8px', 
+                          textAlign: 'left', 
+                          fontWeight: 'normal', 
+                          whiteSpace: 'nowrap',
+                          color: theme === 'dark' ? '#f3f4f6' : '#111827'
+                        }}>추가시간</th>
+                        <th style={{ 
+                          border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
+                          padding: '4px 8px', 
+                          textAlign: 'right', 
+                          fontWeight: 'normal', 
+                          whiteSpace: 'nowrap',
+                          color: theme === 'dark' ? '#f3f4f6' : '#111827'
+                        }}>현재가</th>
+                        <th style={{ 
+                          border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
+                          padding: '4px 8px', 
+                          textAlign: 'right', 
+                          fontWeight: 'normal', 
+                          whiteSpace: 'nowrap',
+                          color: theme === 'dark' ? '#f3f4f6' : '#111827'
+                        }}>대비</th>
+                        <th style={{ 
+                          border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
+                          padding: '4px 8px', 
+                          textAlign: 'right', 
+                          fontWeight: 'normal', 
+                          whiteSpace: 'nowrap',
+                          color: theme === 'dark' ? '#f3f4f6' : '#111827'
+                        }}>등락%</th>
+                        <th style={{ 
+                          border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
+                          padding: '4px 8px', 
+                          textAlign: 'right', 
+                          fontWeight: 'normal', 
+                          whiteSpace: 'nowrap',
+                          color: theme === 'dark' ? '#f3f4f6' : '#111827'
+                        }}>거래량</th>
+                        <th style={{ 
+                          border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
+                          padding: '4px 8px', 
+                          textAlign: 'center', 
+                          fontWeight: 'normal', 
+                          width: '80px', 
+                          whiteSpace: 'nowrap',
+                          color: theme === 'dark' ? '#f3f4f6' : '#111827'
+                        }}>삭제</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -3655,20 +3729,25 @@ const AutoTrading = () => {
                         <tr 
                           key={stock.code}
                           style={{ 
-                            backgroundColor: 'white',
-                            cursor: 'pointer'
+                            backgroundColor: theme === 'dark' ? '#1f2937' : 'white',
+                            cursor: 'pointer',
+                            transition: 'background-color 0.2s'
                           }}
                           onMouseEnter={(e) => {
-                            e.currentTarget.style.backgroundColor = '#fef3c7'
+                            e.currentTarget.style.backgroundColor = theme === 'dark' ? '#374151' : '#f3f4f6'
                           }}
                           onMouseLeave={(e) => {
-                            e.currentTarget.style.backgroundColor = 'white'
+                            e.currentTarget.style.backgroundColor = theme === 'dark' ? '#1f2937' : 'white'
                           }}
                         >
                           <td style={{ 
-                            border: '1px solid #f59e0b', 
+                            border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
                             padding: '4px 8px',
-                            color: stock.changePercent > 0 ? '#dc2626' : stock.changePercent < 0 ? '#2563eb' : '#000',
+                            color: stock.changePercent > 0 
+                              ? (theme === 'dark' ? '#f87171' : '#dc2626') 
+                              : stock.changePercent < 0 
+                              ? (theme === 'dark' ? '#60a5fa' : '#2563eb') 
+                              : (theme === 'dark' ? '#f3f4f6' : '#000'),
                             fontWeight: 'bold',
                             whiteSpace: 'nowrap',
                             overflow: 'hidden',
@@ -3677,27 +3756,52 @@ const AutoTrading = () => {
                           }}>
                             ★ {stock.name.length > 5 ? stock.name.substring(0, 5) + '...' : stock.name}
                           </td>
-                          <td style={{ border: '1px solid #f59e0b', padding: '4px 8px', textAlign: 'right', whiteSpace: 'nowrap' }}>{stock.price.toLocaleString()}</td>
                           <td style={{ 
-                            border: '1px solid #f59e0b', 
+                            border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
+                            padding: '4px 8px', 
+                            textAlign: 'right', 
+                            whiteSpace: 'nowrap',
+                            color: theme === 'dark' ? '#d1d5db' : '#374151'
+                          }}>{stock.price.toLocaleString()}</td>
+                          <td style={{ 
+                            border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
                             padding: '4px 8px', 
                             textAlign: 'right',
-                            color: stock.change > 0 ? '#dc2626' : stock.change < 0 ? '#2563eb' : '#000',
+                            color: stock.change > 0 
+                              ? (theme === 'dark' ? '#f87171' : '#dc2626') 
+                              : stock.change < 0 
+                              ? (theme === 'dark' ? '#60a5fa' : '#2563eb') 
+                              : (theme === 'dark' ? '#d1d5db' : '#000'),
                             whiteSpace: 'nowrap'
                           }}>
                             {stock.change > 0 ? '+' : ''}{stock.change.toLocaleString()}
                           </td>
                           <td style={{ 
-                            border: '1px solid #f59e0b', 
+                            border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
                             padding: '4px 8px', 
                             textAlign: 'right',
-                            color: stock.changePercent > 0 ? '#dc2626' : stock.changePercent < 0 ? '#2563eb' : '#000',
+                            color: stock.changePercent > 0 
+                              ? (theme === 'dark' ? '#f87171' : '#dc2626') 
+                              : stock.changePercent < 0 
+                              ? (theme === 'dark' ? '#60a5fa' : '#2563eb') 
+                              : (theme === 'dark' ? '#d1d5db' : '#000'),
                             whiteSpace: 'nowrap'
                           }}>
                             {stock.changePercent > 0 ? '+' : ''}{stock.changePercent.toFixed(2)}%
                           </td>
-                          <td style={{ border: '1px solid #f59e0b', padding: '4px 8px', textAlign: 'right', whiteSpace: 'nowrap' }}>{stock.volume.toLocaleString()}</td>
-                          <td style={{ border: '1px solid #f59e0b', padding: '4px 8px', textAlign: 'center', whiteSpace: 'nowrap' }}>
+                          <td style={{ 
+                            border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
+                            padding: '4px 8px', 
+                            textAlign: 'right', 
+                            whiteSpace: 'nowrap',
+                            color: theme === 'dark' ? '#d1d5db' : '#374151'
+                          }}>{stock.volume.toLocaleString()}</td>
+                          <td style={{ 
+                            border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
+                            padding: '4px 8px', 
+                            textAlign: 'center', 
+                            whiteSpace: 'nowrap'
+                          }}>
                             <button
                               onClick={(e) => {
                                 e.stopPropagation()
@@ -3712,18 +3816,26 @@ const AutoTrading = () => {
                                 borderRadius: '4px',
                                 cursor: 'pointer',
                                 fontSize: '10px',
-                                fontWeight: 500
+                                fontWeight: 500,
+                                transition: 'background-color 0.2s'
+                              }}
+                              onMouseEnter={(e) => {
+                                e.currentTarget.style.backgroundColor = '#dc2626'
+                              }}
+                              onMouseLeave={(e) => {
+                                e.currentTarget.style.backgroundColor = '#ef4444'
                               }}
                             >
                               삭제
                             </button>
                           </td>
                           <td style={{ 
-                            border: '1px solid #f59e0b', 
+                            border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
                             padding: '4px 8px',
                             whiteSpace: 'nowrap',
                             overflow: 'hidden',
-                            textOverflow: 'ellipsis'
+                            textOverflow: 'ellipsis',
+                            color: theme === 'dark' ? '#9ca3af' : '#6b7280'
                           }}>{stock.detectedTime}</td>
                         </tr>
                       ))}
