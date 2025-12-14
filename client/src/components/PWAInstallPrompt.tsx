@@ -308,7 +308,16 @@ export default function PWAInstallPrompt() {
       } else {
         // Chrome, Edge 등에서 이벤트가 아직 발생하지 않은 경우
         console.log('⏳ beforeinstallprompt 이벤트 대기 중...');
-        // 모달은 계속 표시하고 이벤트를 기다림 (alert 제거)
+        
+        // 모달을 닫고 페이지를 새로고침하여 이벤트를 다시 트리거
+        setShowInstallPrompt(false);
+        setIsInstalling(false);
+        
+        // 페이지를 새로고침하여 beforeinstallprompt 이벤트를 다시 트리거
+        console.log('🔄 페이지 새로고침하여 설치 프롬프트 재시도...');
+        setTimeout(() => {
+          window.location.reload();
+        }, 500);
       }
     }
   };
