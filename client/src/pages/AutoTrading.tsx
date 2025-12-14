@@ -3006,9 +3006,41 @@ const AutoTrading = () => {
             max-height: 500px;
           }
         }
+        @media (max-width: 768px) {
+          .auto-trading-container {
+            padding-left: 24px;
+            padding-right: 24px;
+          }
+          .trading-conditions-section {
+            border-radius: 8px;
+            margin-left: 8px;
+            margin-right: 8px;
+            margin-top: 8px;
+            margin-bottom: 8px;
+          }
+          .bg-gradient-dark .trading-conditions-section {
+            border: 1px solid #4b5563;
+          }
+          .bg-gray-50 .trading-conditions-section {
+            border: 1px solid #d1d5db;
+          }
+          .account-summary-section {
+            border-radius: 8px;
+            margin-left: 8px;
+            margin-right: 8px;
+            margin-top: 8px;
+            margin-bottom: 8px;
+          }
+          .bg-gradient-dark .account-summary-section {
+            border: 1px solid #4b5563;
+          }
+          .bg-gray-50 .account-summary-section {
+            border: 1px solid #d1d5db;
+          }
+        }
       `}</style>
       <div 
-        className={`w-screen h-screen overflow-hidden flex flex-col ${
+        className={`w-screen h-screen overflow-hidden flex flex-col auto-trading-container ${
           theme === 'dark' 
             ? 'bg-gradient-dark text-dark-text' 
             : 'bg-gray-50 text-gray-900'
@@ -3190,6 +3222,7 @@ const AutoTrading = () => {
           >
             {/* 상단: 매매 조건 섹션 */}
             <div 
+              className="trading-conditions-section"
               style={{
                 borderBottom: theme === 'dark' ? '1px solid #374151' : '1px solid #d1d5db',
                 padding: '5px',
@@ -3309,7 +3342,7 @@ const AutoTrading = () => {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                   </svg>
-                  <span className="font-bold text-white text-base">자동매매시작</span>
+                  <span className="font-bold text-white text-base">자동매매</span>
                 </button>
                 <button
                   onClick={handleCancelUnfilledOrders}
@@ -3337,7 +3370,7 @@ const AutoTrading = () => {
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 17h8m0 0V9m0 8l-8-8-4 4-6-6" />
                   </svg>
-                  <span className="font-bold text-white text-base">선택종목매도</span>
+                  <span className="font-bold text-white text-base">선택매도</span>
                 </button>
                 <button
                   onClick={handleStop}
@@ -3381,6 +3414,7 @@ const AutoTrading = () => {
 
             {/* 계좌 요약 */}
             <div
+              className="account-summary-section"
               style={{
                 padding: '12px',
                 backgroundColor: theme === 'dark' ? '#1f2937' : '#f9fafb',
