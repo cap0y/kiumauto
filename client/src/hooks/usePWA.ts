@@ -86,58 +86,9 @@ export function usePWA() {
   }, [deferredPrompt, isInstalled]);
 
   const installApp = async () => {
-    // deferredPrompt가 없으면 이벤트가 발생할 때까지 최대 3초 대기
     if (!deferredPrompt) {
-      // 로그를 한 번만 출력하도록 개선
-      const isFirstAttempt = !sessionStorage.getItem('pwa-install-attempted');
-      if (isFirstAttempt) {
-        console.log('[usePWA] deferredPrompt가 없음 - 이벤트 대기 중...');
-        sessionStorage.setItem('pwa-install-attempted', 'true');
-      }
-      
-      return new Promise<boolean>((resolve) => {
-        const timeout = setTimeout(() => {
-          // 타임아웃 로그는 첫 시도에서만 출력
-          if (isFirstAttempt) {
-            console.log('[usePWA] 이벤트 대기 타임아웃 - 브라우저가 설치 프롬프트를 지원하지 않거나 아직 준비되지 않았습니다');
-          }
-          resolve(false);
-        }, 3000);
-        
-        const handler = (e: Event) => {
-          console.log('[usePWA] beforeinstallprompt 이벤트 감지됨');
-          e.preventDefault();
-          clearTimeout(timeout);
-          window.removeEventListener('beforeinstallprompt', handler);
-          sessionStorage.removeItem('pwa-install-attempted');
-          
-          const promptEvent = e as BeforeInstallPromptEvent;
-          setDeferredPrompt(promptEvent);
-          setIsInstallable(true);
-          
-          // 즉시 프롬프트 표시
-          promptEvent.prompt().then(() => {
-            return promptEvent.userChoice;
-          }).then(({ outcome }) => {
-            if (outcome === 'accepted') {
-              setIsInstalled(true);
-              setIsInstallable(false);
-              console.log('[usePWA] 설치 승인됨');
-              resolve(true);
-            } else {
-              console.log('[usePWA] 설치 거부됨');
-              resolve(false);
-            }
-            setDeferredPrompt(null);
-          }).catch((error) => {
-            console.error('[usePWA] 설치 중 오류:', error);
-            resolve(false);
-            setDeferredPrompt(null);
-          });
-        };
-        
-        window.addEventListener('beforeinstallprompt', handler, { once: true });
-      });
+      console.log('[usePWA] deferredPrompt가 없음 - 수동 설치 안내');
+      return false;
     }
 
     try {

@@ -14,6 +14,10 @@ export default defineConfig({
   server: {
     port: 5000,
     host: "0.0.0.0", // 외부 접근 허용
+    middlewareMode: false,
+    fs: {
+      strict: false,
+    },
     proxy: {
       "/api": {
         target: "http://localhost:8000",
