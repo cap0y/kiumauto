@@ -50,6 +50,20 @@ export default function PWAInstallPrompt() {
         console.log('✅ 이미 PWA로 설치되어 있습니다');
         return;
       }
+      
+      // "추가" 버튼을 눌렀는지 확인 (1시간 동안 모달 표시 안 함)
+      const installClicked = localStorage.getItem('pwa-install-clicked');
+      if (installClicked) {
+        const clickedTime = parseInt(installClicked, 10);
+        const oneHour = 60 * 60 * 1000; // 1시간
+        if (Date.now() - clickedTime < oneHour) {
+          console.log('⏸️ "추가" 버튼을 눌렀으므로 모달 표시 안 함');
+          return;
+        } else {
+          // 1시간이 지났으면 플래그 제거
+          localStorage.removeItem('pwa-install-clicked');
+        }
+      }
 
       console.log('📱 PWA 설치 가능 상태:', {
         isStandalone,
@@ -309,15 +323,13 @@ export default function PWAInstallPrompt() {
         // Chrome, Edge 등에서 이벤트가 아직 발생하지 않은 경우
         console.log('⏳ beforeinstallprompt 이벤트 대기 중...');
         
-        // 모달을 닫고 페이지를 새로고침하여 이벤트를 다시 트리거
+        // 모달을 닫고 일정 시간 동안 다시 표시하지 않음
         setShowInstallPrompt(false);
         setIsInstalling(false);
         
-        // 페이지를 새로고침하여 beforeinstallprompt 이벤트를 다시 트리거
-        console.log('🔄 페이지 새로고침하여 설치 프롬프트 재시도...');
-        setTimeout(() => {
-          window.location.reload();
-        }, 500);
+        // "추가" 버튼을 눌렀다는 플래그 저장 (1시간 동안 모달 표시 안 함)
+        localStorage.setItem('pwa-install-clicked', Date.now().toString());
+        console.log('✅ 모달 닫기 - 1시간 동안 다시 표시하지 않음');
       }
     }
   };
