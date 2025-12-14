@@ -1,155 +1,85 @@
-import React, { useState, useEffect } from "react";
-import { Button } from "../components/ui/button";
+import React, { useEffect, useState } from "react";
+import { Button } from "./ui/button";
 import { Download, X } from "lucide-react";
-
-interface BeforeInstallPromptEvent extends Event {
-  readonly platforms: string[];
-  readonly userChoice: Promise<{
-    outcome: "accepted" | "dismissed";
-    platform: string;
-  }>;
-  prompt(): Promise<void>;
-}
+import { usePWA, registerServiceWorker } from "../hooks/usePWA";
 
 export default function PWAInstaller() {
-  const [deferredPrompt, setDeferredPrompt] =
-    useState<BeforeInstallPromptEvent | null>(null);
+  const { isInstallable, isInstalled, installApp } = usePWA();
   const [showInstallPrompt, setShowInstallPrompt] = useState(false);
-  const [showUpdateAvailable, setShowUpdateAvailable] = useState(false);
 
   useEffect(() => {
-    const handleBeforeInstallPrompt = (e: Event) => {
-      e.preventDefault();
-      setDeferredPrompt(e as BeforeInstallPromptEvent);
-      setShowInstallPrompt(true);
-    };
-
-    const handleAppInstalled = () => {
-      setDeferredPrompt(null);
-      setShowInstallPrompt(false);
-      console.log("PWA가 설치되었습니다");
-    };
-
-    // 이벤트 리스너 등록
-    window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
-    window.addEventListener("appinstalled", handleAppInstalled);
-
-    // Service Worker 업데이트 감지 (등록은 main.tsx에서 수행)
-    if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.addEventListener("controllerchange", () => {
-        setShowUpdateAvailable(true);
-      });
+    // 서비스워커 미등록 시 등록 시도
+    if ("serviceWorker" in navigator && !navigator.serviceWorker.controller) {
+      registerServiceWorker();
     }
-
-    return () => {
-      window.removeEventListener(
-        "beforeinstallprompt",
-        handleBeforeInstallPrompt,
-      );
-      window.removeEventListener("appinstalled", handleAppInstalled);
-    };
-  }, []);
-
-  const handleInstallClick = async () => {
-    if (!deferredPrompt) return;
-    deferredPrompt.prompt();
-    const { outcome } = await deferredPrompt.userChoice;
-    if (outcome === "accepted") {
-      console.log("사용자가 PWA 설치를 수락했습니다");
+    // 설치되지 않았으면 항상 배너 노출
+    if (!isInstalled) {
+      // 약간의 지연 후 표시 (페이지 로드 후)
+      const timer = setTimeout(() => {
+        setShowInstallPrompt(true);
+      }, 2000);
+      return () => clearTimeout(timer);
     } else {
-      console.log("사용자가 PWA 설치를 거부했습니다");
+      setShowInstallPrompt(false);
     }
-    setDeferredPrompt(null);
-    setShowInstallPrompt(false);
+  }, [isInstalled]);
+
+  // 클릭 시 무조건 installApp 실행
+  const handleInstallClick = async () => {
+    const result = await installApp();
+    if (result) {
+      // 설치 성공 시 모달 닫기
+      setShowInstallPrompt(false);
+    }
+    // 설치 실패해도 모달은 계속 표시 (사용자가 다시 시도할 수 있도록)
   };
 
-  const handleDismissInstall = () => {
-    setShowInstallPrompt(false);
-  };
-
-  const handleUpdateClick = () => {
-    window.location.reload();
-  };
-
-  const shouldShowInstallPrompt = () => {
-    if (!showInstallPrompt) return false;
-    if (window.matchMedia("(display-mode: standalone)").matches) return false;
-    return true;
-  };
-
-  if (!shouldShowInstallPrompt() && !showUpdateAvailable) return null;
+  if (!showInstallPrompt || isInstalled) return null;
 
   return (
-    <>
-      {/* PWA 설치 프롬프트 - 작고 깔끔한 디자인 */}
-      {shouldShowInstallPrompt() && (
-        <div className="fixed bottom-20 left-1/2 transform -translate-x-1/2 z-[9999] md:bottom-6">
-          <div className="bg-gray-900 text-white rounded-2xl shadow-2xl p-4 max-w-[280px] border border-gray-700">
-            <div className="flex items-start mb-3">
-              <div className="w-10 h-10 bg-gradient-to-br from-purple-500 to-pink-500 rounded-xl flex items-center justify-center mr-3 flex-shrink-0">
-                <Download className="w-5 h-5" />
-              </div>
-              <div className="flex-1">
-                <h3 className="text-sm font-semibold">앱 설치하기</h3>
-                <p className="text-xs text-gray-300 mt-0.5">
-                  빠른 접근을 위해 설치해세요
-                </p>
-              </div>
+    <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-[9999] flex items-end justify-center p-2 pb-3">
+      <div className="bg-gray-800 text-white rounded-xl shadow-xl w-full max-w-[220px] border border-gray-700 overflow-hidden">
+        {/* 헤더 */}
+        <div className="px-3 py-2 border-b border-gray-700">
+          <h2 className="text-base font-bold leading-tight">앱 설치</h2>
+        </div>
+        
+        {/* 앱 정보 */}
+        <div className="px-3 py-3">
+          <div className="flex items-center gap-2 mb-2">
+            {/* 앱 아이콘 - 작은 사이즈 */}
+            <div className="w-10 h-10 bg-gradient-to-br from-blue-500 via-purple-500 to-pink-500 rounded-lg flex items-center justify-center flex-shrink-0 shadow">
+              <Download className="w-5 h-5 text-white" />
             </div>
-            <div className="flex gap-2">
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={handleDismissInstall}
-                className="flex-1 text-gray-300 hover:text-white hover:bg-gray-800 h-9"
-              >
-                취소
-              </Button>
-              <Button
-                size="sm"
-                onClick={handleInstallClick}
-                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white h-9"
-              >
-                추가
-              </Button>
+            
+            {/* 앱 이름 및 도메인 */}
+            <div className="flex-1 min-w-0">
+              <h3 className="text-base font-bold mb-0.5 truncate leading-snug">키움증권 자동매매</h3>
+              <p className="text-xs text-gray-400 truncate leading-none">{window.location.hostname}</p>
             </div>
           </div>
         </div>
-      )}
-
-      {/* 수동 가이드는 제거 (간단 동작 유지) */}
-
-      {/* 업데이트 알림 */}
-      {showUpdateAvailable && (
-        <div className="fixed top-4 left-4 right-4 z-50 bg-blue-600 text-white rounded-lg shadow-lg p-4">
-          <div className="flex items-center justify-between">
-            <div className="flex-1">
-              <h3 className="text-sm font-medium">새 버전 사용 가능</h3>
-              <p className="text-xs opacity-90 mt-1">
-                새로운 기능과 개선사항이 포함된 업데이트가 있습니다
-              </p>
-            </div>
-            <div className="flex items-center gap-2 ml-4">
-              <Button
-                size="sm"
-                variant="secondary"
-                onClick={handleUpdateClick}
-                className="bg-white text-blue-600 hover:bg-gray-100"
-              >
-                업데이트
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => setShowUpdateAvailable(false)}
-                className="text-white hover:bg-blue-700"
-              >
-                <X className="w-4 h-4" />
-              </Button>
-            </div>
-          </div>
+        
+        {/* 버튼 */}
+        <div className="px-3 py-2 border-t border-gray-700 flex gap-1">
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => setShowInstallPrompt(false)}
+            className="flex-1 text-blue-400 hover:text-blue-300 hover:bg-gray-700/50 h-8 text-sm font-medium min-w-0"
+          >
+            취소
+          </Button>
+          <Button
+            size="sm"
+            onClick={handleInstallClick}
+            disabled={!isInstallable}
+            className="flex-1 bg-blue-600 hover:bg-blue-700 text-white h-8 text-sm font-semibold shadow min-w-0 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            추가
+          </Button>
         </div>
-      )}
-    </>
+      </div>
+    </div>
   );
 }

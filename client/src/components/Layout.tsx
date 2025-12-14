@@ -1,6 +1,6 @@
 import React, { ReactNode, useEffect } from 'react'
 import { useThemeStore } from '../store/useThemeStore'
-import PWAInstallPrompt from './PWAInstallPrompt'
+import PWAInstaller from './PWAInstallButton'
 
 interface LayoutProps {
   children: ReactNode
@@ -27,7 +27,7 @@ const Layout = ({ children }: LayoutProps) => {
   return (
     <div className="w-screen h-screen overflow-hidden dark">
       {children}
-      <PWAInstallPrompt />
+      <PWAInstaller />
     </div>
   )
 }
