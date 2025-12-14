@@ -1209,12 +1209,11 @@ const AutoTrading = () => {
 
     const connectWebSocket = async () => {
       try {
-        // 서버의 WebSocket에 연결 (서버가 키움증권 WebSocket과 연결되어 있음)
-        // 개발 환경: ws://localhost:8000, 프로덕션: wss://서버주소
-        const isDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+        // 서버의 WebSocket에 연결 (Vite 프록시를 통해 /ws 경로로 연결)
+        // Vite 프록시가 자동으로 서버(포트 3000)로 전달합니다
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-        const wsHost = isDev ? 'localhost:8000' : window.location.host
-        const wsUrl = `${wsProtocol}//${wsHost}`
+        const wsHost = window.location.host
+        const wsUrl = `${wsProtocol}//${wsHost}/ws`
         ws = new WebSocket(wsUrl)
 
         ws.onopen = async () => {
