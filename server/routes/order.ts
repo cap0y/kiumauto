@@ -29,6 +29,29 @@ router.post('/', async (req: Request, res: Response) => {
         error: 'accountNo, accountProductCode가 필요합니다'
       })
     }
+    
+    // 종목코드 형식 검증 (6자리 숫자만 허용)
+    const stockCode = String(code).trim()
+    if (!/^\d{6}$/.test(stockCode)) {
+      return res.status(400).json({
+        error: `지원하지 않는 종목코드 형식입니다: ${stockCode}`,
+        detail: '6자리 숫자 종목코드만 지원됩니다 (ELW, ETF 등 비표준 종목코드는 제외)'
+      })
+    }
+    
+    // 주문 수량 검증
+    if (quantity <= 0 || !Number.isInteger(Number(quantity))) {
+      return res.status(400).json({
+        error: '주문 수량은 1 이상의 정수여야 합니다'
+      })
+    }
+    
+    // 지정가 주문 시 가격 검증
+    if (order_option === '00' && (!price || price <= 0)) {
+      return res.status(400).json({
+        error: '지정가 주문 시 주문 가격이 필요합니다'
+      })
+    }
 
     const result = await kiwoomService.placeOrder(
       {
@@ -45,9 +68,31 @@ router.post('/', async (req: Request, res: Response) => {
     res.json(result)
   } catch (error: any) {
     console.error('주문 전송 오류:', error)
-    res.status(500).json({
+    
+    // 클라이언트 에러 (400번대)는 그대로 전달
+    if (error.message && error.message.includes('지원하지 않는 종목코드')) {
+      return res.status(400).json({
+        error: error.message,
+        detail: '6자리 숫자 종목코드만 지원됩니다'
+      })
+    }
+    
+    // 모의투자 환경 제한사항인 경우
+    if (error.isMockApiLimit) {
+      return res.status(503).json({
+        error: '모의투자 환경 제한',
+        detail: error.message || '모의투자 환경에서 일부 종목은 주문이 제한될 수 있습니다',
+        code: error.stockCode || req.body.code || '알 수 없음',
+        isMockApiLimit: true
+      })
+    }
+    
+    // 서버 에러 (500번대)는 상세 정보 포함
+    const statusCode = error.response?.status || error.status || 500
+    res.status(statusCode).json({
       error: '주문 전송 실패',
-      detail: error.message
+      detail: error.message || '알 수 없는 오류가 발생했습니다',
+      code: req.body.code || '알 수 없음' // 실패한 종목코드 포함
     })
   }
 })

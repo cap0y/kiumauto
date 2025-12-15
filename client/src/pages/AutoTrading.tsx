@@ -1123,105 +1123,12 @@ const AutoTrading = () => {
     const currentLength = detectedStocks.length
     const prevLength = prevDetectedStocksLengthRef.current
     
-    // 길이가 크게 증가했을 때만 초기화 (새로운 검색 결과, 10개 이상 증가)
-    // 실시간 업데이트로 인한 작은 변화는 무시
-    if (currentLength > prevLength && (currentLength - prevLength >= 10 || prevLength === 0)) {
-      setDisplayedStockCount(20)
-      displayedStockCountRef.current = 20
-    }
+    // displayedStockCount 초기화 제거 - 모든 종목 표시
+    // 길이가 크게 증가했을 때도 초기화하지 않음 (모든 종목 표시 유지)
     prevDetectedStocksLengthRef.current = currentLength
   }, [detectedStocks.length])
 
-  // 무한 스크롤 핸들러
-  useEffect(() => {
-    const handleScroll = () => {
-      if (!stocksScrollRef.current) return
-      
-      const { scrollTop, scrollHeight, clientHeight } = stocksScrollRef.current
-      const currentDisplayedCount = displayedStockCountRef.current
-      const currentDetectedLength = detectedStocksLengthRef.current
-      
-      // 스크롤이 하단 100px 이내에 도달하면 다음 페이지 로드
-      const distanceFromBottom = scrollHeight - scrollTop - clientHeight
-      if (distanceFromBottom < 100 && currentDisplayedCount < currentDetectedLength) {
-        const nextCount = Math.min(currentDisplayedCount + 20, currentDetectedLength)
-        if (nextCount > currentDisplayedCount) {
-          setDisplayedStockCount(nextCount)
-        }
-      }
-    }
-
-    const scrollElement = stocksScrollRef.current
-    if (scrollElement) {
-      // 스크롤 이벤트 리스너 등록
-      scrollElement.addEventListener('scroll', handleScroll, { passive: true })
-      
-      // 초기 로드 시에도 스크롤 가능한지 확인
-      // 스크롤이 필요 없을 정도로 내용이 적으면 자동으로 더 로드
-      const checkAndLoad = () => {
-        if (!scrollElement) return
-        const { scrollHeight, clientHeight } = scrollElement
-        const currentDisplayedCount = displayedStockCountRef.current
-        const currentDetectedLength = detectedStocksLengthRef.current
-        
-        if (scrollHeight <= clientHeight && currentDisplayedCount < currentDetectedLength) {
-          // 스크롤이 필요 없으면 자동으로 더 로드
-          const nextCount = Math.min(currentDisplayedCount + 20, currentDetectedLength)
-          if (nextCount > currentDisplayedCount) {
-            setDisplayedStockCount(nextCount)
-          }
-        }
-      }
-      
-      // 즉시 확인
-      checkAndLoad()
-      
-      // 렌더링 완료 후 다시 확인
-      setTimeout(checkAndLoad, 100)
-      setTimeout(checkAndLoad, 300)
-      setTimeout(checkAndLoad, 500)
-      
-      return () => {
-        scrollElement.removeEventListener('scroll', handleScroll)
-      }
-    }
-  }, []) // 의존성 배열을 비워서 한 번만 등록
-
-  // 스크롤 가능한 영역이 부족하면 자동으로 더 로드
-  useEffect(() => {
-    if (detectedStocks.length === 0 || displayedStockCount >= detectedStocks.length) {
-      return
-    }
-
-    // 여러 번 확인하여 스크롤 영역이 충분한지 체크
-    const checkAndLoad = () => {
-      if (stocksScrollRef.current && displayedStockCount < detectedStocks.length) {
-        const { scrollHeight, clientHeight } = stocksScrollRef.current
-        // 스크롤이 필요 없을 정도로 내용이 적으면 자동으로 더 로드
-        if (scrollHeight <= clientHeight + 10) { // 10px 여유를 둠
-          const nextCount = Math.min(displayedStockCount + 20, detectedStocks.length)
-          if (nextCount > displayedStockCount) {
-            setDisplayedStockCount(nextCount)
-          }
-        }
-      }
-    }
-
-    // 즉시 확인
-    checkAndLoad()
-    
-    // 렌더링 완료 후 여러 번 확인
-    const timers = [
-      setTimeout(checkAndLoad, 50),
-      setTimeout(checkAndLoad, 150),
-      setTimeout(checkAndLoad, 300),
-      setTimeout(checkAndLoad, 500)
-    ]
-
-    return () => {
-      timers.forEach(timer => clearTimeout(timer))
-    }
-  }, [displayedStockCount, detectedStocks.length])
+  // 모든 종목 표시하므로 무한 스크롤 로직 제거
 
   // 검색된 종목 실시간 시세 업데이트 (WebSocket 사용)
   useEffect(() => {
@@ -1372,6 +1279,127 @@ const AutoTrading = () => {
       // 서버 WebSocket 연결 해제는 하지 않음 (다른 클라이언트가 사용할 수 있음)
     }
   }, [isConnected, connected, detectedStocks.length]) // 연결 상태와 종목 개수 확인
+
+  // 차트 데이터로 검색된 종목 화면 갱신 (주기적으로 차트 데이터 조회하여 가격 정보 업데이트)
+  // 조건검색 직후에는 차트 데이터 조회를 지연시켜 API 제한 방지
+  const lastSearchTimeRef = useRef<number>(0)
+  
+  useEffect(() => {
+    if (!isConnected || !connected || detectedStocks.length === 0) {
+      return
+    }
+
+    let isMounted = true
+    let intervalId: number | null = null
+
+    const updateStocksFromChartData = async () => {
+      if (!isMounted || detectedStocks.length === 0) {
+        return
+      }
+
+      // 조건검색 직후 30초 이내에는 차트 데이터 조회하지 않음 (API 제한 방지)
+      const timeSinceLastSearch = Date.now() - lastSearchTimeRef.current
+      if (timeSinceLastSearch < 30000) {
+        if (process.env.NODE_ENV === 'development') {
+          console.log(`[차트 갱신] 조건검색 직후 대기 중 (${Math.ceil((30000 - timeSinceLastSearch) / 1000)}초 남음)`)
+        }
+        return
+      }
+
+      try {
+        // 검색된 종목들에 대해 차트 데이터 조회하여 최신 가격 정보 업데이트 (모든 종목)
+        // API 제한을 고려하여 배치 크기를 줄이고 딜레이를 늘림
+        const batchSize = 3 // 한 번에 3개씩 처리 (5개에서 줄임)
+        const delayBetweenBatches = 2000 // 배치 간 2초 딜레이 (500ms에서 증가)
+        
+        for (let i = 0; i < detectedStocks.length; i += batchSize) {
+          if (!isMounted) break
+          
+          const batch = detectedStocks.slice(i, i + batchSize)
+          const batchPromises = batch.map(async (stock) => {
+            try {
+              // 분봉 차트 데이터 조회 (최신 데이터 1개만 필요)
+              const candles = await kiwoomApi.getCandle(stock.code, 'min')
+              
+              if (candles && candles.length > 0 && isMounted) {
+                // 최신 차트 데이터에서 종가를 가져와서 가격 정보 업데이트
+                const latestCandle = candles[0]
+                const closePrice = parseFloat(latestCandle.종가 || latestCandle.close || '0') || 0
+                const volume = parseFloat(latestCandle.거래량 || latestCandle.volume || '0') || 0
+                
+                if (closePrice > 0) {
+                  // detectedStocks 업데이트 (가격이 변경된 경우만)
+                  setDetectedStocks(prevStocks => {
+                    return prevStocks.map(s => {
+                      if (s.code === stock.code && s.price !== closePrice) {
+                        // 가격 변화율 계산
+                        const change = closePrice - (s.startPrice || closePrice)
+                        const changePercent = s.startPrice && s.startPrice > 0
+                          ? ((closePrice - s.startPrice) / s.startPrice) * 100
+                          : 0
+                        
+                        return {
+                          ...s,
+                          price: closePrice,
+                          change: change,
+                          changePercent: changePercent,
+                          volume: volume > 0 ? volume : s.volume,
+                        }
+                      }
+                      return s
+                    })
+                  })
+                }
+              }
+            } catch (error: any) {
+              // API 제한 에러(429)는 조용히 처리
+              if (error.response?.status === 429) {
+                if (process.env.NODE_ENV === 'development') {
+                  console.log(`[차트 갱신] ${stock.code} API 제한으로 건너뜀`)
+                }
+                return
+              }
+              // 개별 종목 조회 실패는 조용히 처리
+              if (process.env.NODE_ENV === 'development') {
+                console.log(`[차트 갱신] ${stock.code} 조회 실패:`, error)
+              }
+            }
+          })
+
+          await Promise.all(batchPromises)
+          
+          // 배치 간 딜레이 (API 호출 제한 방지)
+          if (i + batchSize < detectedStocks.length && isMounted) {
+            await new Promise(resolve => setTimeout(resolve, delayBetweenBatches))
+          }
+        }
+      } catch (error) {
+        if (process.env.NODE_ENV === 'development') {
+          console.error('[차트 갱신] 오류:', error)
+        }
+      }
+    }
+
+    // 첫 실행은 조건검색 후 충분한 시간이 지난 후 (30초 후)
+    const timeoutId = window.setTimeout(() => {
+      updateStocksFromChartData()
+      
+      // 이후 30초마다 차트 데이터로 갱신 (15초에서 30초로 증가)
+      intervalId = window.setInterval(() => {
+        if (isMounted) {
+          updateStocksFromChartData()
+        }
+      }, 30000) // 30초마다
+    }, 30000) // 첫 실행은 30초 후
+
+    return () => {
+      isMounted = false
+      window.clearTimeout(timeoutId)
+      if (intervalId) {
+        window.clearInterval(intervalId)
+      }
+    }
+  }, [isConnected, connected, detectedStocks.length])
 
   // 컬럼 리사이즈 핸들러
   const handleResizeStart = (column: string, e: React.MouseEvent) => {
@@ -1585,6 +1613,9 @@ const AutoTrading = () => {
         
         setDetectedStocks(newStocks)
         
+        // 조건검색 시간 기록 (차트 데이터 조회 지연용)
+        lastSearchTimeRef.current = Date.now()
+        
         // 선택된 종목도 업데이트 (가격만 갱신)
         if (watchlistStocks.length > 0) {
           const updatedWatchlist = watchlistStocks.map(watchStock => {
@@ -1601,7 +1632,7 @@ const AutoTrading = () => {
           addLog(`선택된 종목 ${updatedWatchlist.length}개 업데이트`, 'info')
         }
         
-        addLog(`${result.stocks.length}개 종목 검색 완료`, 'success')
+        addLog(`${result.stocks.length}개 종목 검색 완료 (차트 데이터는 30초 후부터 조회됩니다)`, 'success')
       } else {
         addLog('검색된 종목이 없습니다', 'warning')
       }
@@ -2260,20 +2291,93 @@ const AutoTrading = () => {
     // 이 차이가 매매 설정의 % 범위와 비교됨
     const 등락률차이 = 실시간등락률 - 감지시점등락률
 
-    // 차트 데이터 조회: 모든 감지된 종목에 대해 차트 데이터를 조회하여 차트 기반 전략 실행
-    // 차트 데이터가 있으면 차트 기반 전략을 우선 사용하고, 없으면 실시간 시세 기반으로 fallback
-    let candles: CandleData[] = []
+    // 차트 데이터 조회: 체크된 알고리즘 중 차트 분석이 필요한 알고리즘이 있으면 차트 데이터 조회
+    // 차트 분석이 필요한 알고리즘: 장시작급등주, 볼린저밴드, 스캘핑, 돌파매매, 장마감종가배팅
+    // 기본매수설정은 차트 분석이 필요 없음 (등락률 차이만 확인)
+    const 차트분석필요알고리즘 = [
+      strategyMarketOpen,   // 장시작급등주
+      strategyBollinger,    // 볼린저밴드
+      strategyScalping,      // 스캘핑
+      strategyBreakout,      // 돌파매매
+      strategyMarketClose    // 장마감종가배팅
+    ]
     
-    try {
-      // 모든 종목에 대해 차트 데이터 조회 시도
-      candles = await getCandleData(stock.code)
-      if (!candles || candles.length < breakoutBuy.shortTermPeriod) {
-        // 최소 설정값 개수 이상의 차트 데이터가 필요
-        candles = []
+    const 차트분석필요 = 차트분석필요알고리즘.some(checked => checked)
+    
+    let candles: CandleData[] = []
+    const maxRetries = 2 // 최대 2번 재시도
+    let retryCount = 0
+    
+    // 차트 분석이 필요한 알고리즘이 체크되어 있으면 차트 데이터 조회
+    // 단, 조건검색 직후 10초 이내에는 차트 데이터 조회를 지연시켜 API 제한 방지
+    if (차트분석필요) {
+      const timeSinceLastSearch = Date.now() - lastSearchTimeRef.current
+      if (timeSinceLastSearch < 10000) {
+        // 조건검색 직후 10초 이내에는 차트 데이터 조회하지 않음
+        if (process.env.NODE_ENV === 'development') {
+          console.log(`[차트 데이터] ${stock.name}: 조건검색 직후 대기 중 (${Math.ceil((10000 - timeSinceLastSearch) / 1000)}초 남음)`)
+        }
+        // 차트 데이터 없이 진행 (실시간 시세 기반으로만 판단)
+      } else {
+        while (retryCount <= maxRetries && candles.length === 0) {
+          try {
+            // 차트 분석이 필요한 종목에 대해 차트 데이터 조회 시도
+            candles = await getCandleData(stock.code)
+            
+            // API 제한 방지를 위한 추가 딜레이
+            await new Promise(resolve => setTimeout(resolve, 500))
+            
+            if (candles && candles.length > 0) {
+              // 체크된 알고리즘 중 가장 많은 차트 데이터가 필요한 알고리즘의 최소 요구사항 확인
+              const requiredPeriods: number[] = []
+              if (strategyMarketOpen) requiredPeriods.push(marketOpenBuy.shortTermPeriod || 5)
+              if (strategyBollinger) requiredPeriods.push(bollingerBuy.shortTermPeriod || 5)
+              if (strategyScalping) requiredPeriods.push(scalpingBuy.minCandleCount || scalpingBuy.shortTermPeriod || 5)
+              if (strategyBreakout) requiredPeriods.push(breakoutBuy.shortTermPeriod || 5)
+              if (strategyMarketClose) requiredPeriods.push(marketCloseBuy.minCandleCount || 5)
+              
+              const minRequired = requiredPeriods.length > 0 ? Math.max(...requiredPeriods) : 5
+              
+              if (candles.length >= minRequired) {
+                // 충분한 차트 데이터가 있으면 성공
+                if (retryCount > 0) {
+                  addLog(`[차트 데이터] ${stock.name}: 재시도 후 성공 (${candles.length}개, 필요: ${minRequired}개)`, 'info')
+                }
+                break
+              } else {
+                // 차트 데이터가 부족하면 재시도
+                candles = []
+              }
+            } else {
+              candles = []
+            }
+          } catch (error: any) {
+            // 차트 데이터 조회 실패 시 재시도
+            candles = []
+            const errorMessage = error.response?.data?.error || error.message || ''
+            
+            // API 제한 에러(429)는 재시도하지 않음
+            if (error.response?.status === 429) {
+              if (process.env.NODE_ENV === 'development') {
+                console.log(`[차트 데이터] ${stock.name}: API 제한으로 재시도 중단`)
+              }
+              break
+            }
+          }
+          
+          // 재시도 전 대기 (API 호출 제한 방지)
+          if (retryCount < maxRetries && candles.length === 0) {
+            await new Promise(resolve => setTimeout(resolve, 2000 * (retryCount + 1))) // 2초, 4초 대기 (1초, 2초에서 증가)
+          }
+          
+          retryCount++
+        }
+        
+        // 차트 데이터가 없으면 실시간 시세 기반 로직으로 fallback
+        if (candles.length === 0 && process.env.NODE_ENV === 'development') {
+          console.log(`[차트 데이터] ${stock.name}: 차트 데이터 없음, 실시간 시세 기반으로 진행`)
+        }
       }
-    } catch (error) {
-      // 차트 데이터 조회 실패 시 빈 배열로 설정 (실시간 시세 기반 로직으로 fallback)
-      candles = []
     }
 
     // 5. My_매수신호_2 로직 적용: 체크된 매매 전략별 조건 확인
@@ -2526,8 +2630,13 @@ const AutoTrading = () => {
             return newStocks
           })
 
-          // 2. 매수 조건 확인 및 실행
-          for (const stock of newStocks) {
+          // 조건검색 시간 기록 (차트 데이터 조회 지연용)
+          lastSearchTimeRef.current = Date.now()
+
+          // 2. 매수 조건 확인 및 실행 (차트 데이터 기반으로 수행)
+          // API 제한을 고려하여 종목별로 딜레이 추가
+          for (let i = 0; i < newStocks.length; i++) {
+            const stock = newStocks[i]
             if (!isRunning) break // 중지되면 중단
             
             // 당일 최대매매종목수 체크
@@ -2542,8 +2651,26 @@ const AutoTrading = () => {
               continue // 이 종목은 더 이상 매매 불가
             }
             
+            // API 제한 방지를 위한 딜레이 (조건검색 직후에는 더 긴 딜레이)
+            const timeSinceLastSearch = Date.now() - lastSearchTimeRef.current
+            if (timeSinceLastSearch < 10000) {
+              // 조건검색 직후 10초 이내에는 각 종목 처리 전 1초 대기
+              await new Promise(resolve => setTimeout(resolve, 1000))
+            } else {
+              // 그 이후에는 500ms 대기
+              await new Promise(resolve => setTimeout(resolve, 500))
+            }
+            
+            // 차트 데이터 기반으로 매수 조건 확인 (차트 데이터를 우선적으로 사용)
             if (await checkBuyConditions(stock)) {
               try {
+                // 종목코드 검증: 6자리 숫자만 허용 (ELW, ETF 등 비표준 종목코드 제외)
+                const stockCode = String(stock.code).trim()
+                if (!/^\d{6}$/.test(stockCode)) {
+                  addLog(`[자동매수 건너뜀] ${stock.name} (${stockCode}): 지원하지 않는 종목코드 형식 (6자리 숫자만 지원)`, 'warning')
+                  continue
+                }
+                
                 // 매수 수량 계산 (종목당 투자금액 기준)
                 const buyPrice = stock.price || 0
                 if (buyPrice <= 0) continue
@@ -2559,7 +2686,7 @@ const AutoTrading = () => {
                 // 매수 주문 실행
                 const orderPrice = buyPrice + Math.floor(buyPrice * (basicBuy.buyPriceAdjustment / 100))
                 await kiwoomApi.placeOrder({
-                  code: stock.code,
+                  code: stockCode,
                   quantity: quantity,
                   price: orderPrice, // 지정가 (현재가 + 조정%)
                   order_type: 'buy',
@@ -2586,7 +2713,12 @@ const AutoTrading = () => {
                 // API 호출 제한을 위한 딜레이
                 await new Promise(resolve => setTimeout(resolve, 500))
               } catch (error: any) {
-                addLog(`[자동매수 실패] ${stock.name}: ${error.message}`, 'error')
+                // 모의투자 환경 제한 에러인 경우 경고로 처리
+                if (error.response?.data?.isMockApiLimit || error.message?.includes('모의투자 환경 제한')) {
+                  addLog(`[자동매수 건너뜀] ${stock.name}: 모의투자 환경에서 주문 제한됨`, 'warning')
+                } else {
+                  addLog(`[자동매수 실패] ${stock.name}: ${error.message}`, 'error')
+                }
               }
             }
           }
@@ -2632,9 +2764,16 @@ const AutoTrading = () => {
               orderOption = '03' // 시장가
             }
 
+            // 종목코드 검증: 6자리 숫자만 허용 (ELW, ETF 등 비표준 종목코드 제외)
+            const stockCode = String(holding.code).trim()
+            if (!/^\d{6}$/.test(stockCode)) {
+              addLog(`[자동매도 건너뜀] ${holding.name} (${stockCode}): 지원하지 않는 종목코드 형식 (6자리 숫자만 지원)`, 'warning')
+              continue
+            }
+
             // 매도 주문 실행
             await kiwoomApi.placeOrder({
-              code: holding.code,
+              code: stockCode,
               quantity: holding.quantity,
               price: sellPrice,
               order_type: 'sell',
@@ -2649,7 +2788,12 @@ const AutoTrading = () => {
             // API 호출 제한을 위한 딜레이
             await new Promise(resolve => setTimeout(resolve, 500))
           } catch (error: any) {
-            addLog(`[자동매도 실패] ${holding.name}: ${error.message}`, 'error')
+            // 모의투자 환경 제한 에러인 경우 경고로 처리
+            if (error.response?.data?.isMockApiLimit || error.message?.includes('모의투자 환경 제한')) {
+              addLog(`[자동매도 건너뜀] ${holding.name}: 모의투자 환경에서 주문 제한됨`, 'warning')
+            } else {
+              addLog(`[자동매도 실패] ${holding.name}: ${error.message}`, 'error')
+            }
           }
         }
       }
@@ -2729,12 +2873,19 @@ const AutoTrading = () => {
       let successCount = 0
       for (const stock of holdingStocks) {
         try {
+          // 종목코드 검증: 6자리 숫자만 허용 (ELW, ETF 등 비표준 종목코드 제외)
+          const stockCode = String(stock.code).trim()
+          if (!/^\d{6}$/.test(stockCode)) {
+            addLog(`[전량매도 건너뜀] ${stock.name} (${stockCode}): 지원하지 않는 종목코드 형식 (6자리 숫자만 지원)`, 'warning')
+            continue
+          }
+          
           const accountParts = selectedAccount.split('-')
           const accountNo = accountParts[0] || selectedAccount
           const accountProductCode = accountParts[1] || '01'
 
           await kiwoomApi.placeOrder({
-            code: stock.code,
+            code: stockCode,
             quantity: stock.quantity,
             price: 0, // 시장가
             order_type: 'sell',
@@ -2747,7 +2898,12 @@ const AutoTrading = () => {
           addLog(`${stock.name} 전량매도 주문 전송`, 'success')
           await new Promise(resolve => setTimeout(resolve, 100))
         } catch (error: any) {
-          addLog(`${stock.name} 매도 실패: ${error.message}`, 'error')
+          // 모의투자 환경 제한 에러인 경우 경고로 처리
+          if (error.response?.data?.isMockApiLimit || error.message?.includes('모의투자 환경 제한')) {
+            addLog(`${stock.name} 전량매도 건너뜀: 모의투자 환경에서 주문 제한됨`, 'warning')
+          } else {
+            addLog(`${stock.name} 매도 실패: ${error.message}`, 'error')
+          }
         }
       }
 
@@ -4043,7 +4199,7 @@ const AutoTrading = () => {
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" style={{ WebkitTextFillColor: theme === 'dark' ? '#f3f4f6' : '#111827', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
                   </svg>
-                  검색된 종목 ({detectedStocks.length}개) - 표시: {Math.min(displayedStockCount, detectedStocks.length)}개 ([추가] 버튼으로 선택된 종목에 추가)
+                  검색된 종목 ({detectedStocks.length}개) - 모두 표시 ([추가] 버튼으로 선택된 종목에 추가)
                 </h3>
               </div>
               <div 
@@ -4513,7 +4669,7 @@ const AutoTrading = () => {
                   </thead>
                   <tbody>
                     {detectedStocks.length > 0 ? (
-                      detectedStocks.slice(0, displayedStockCount).map((stock) => {
+                      detectedStocks.map((stock) => {
                         const isInWatchlist = watchlistStocks.some(w => w.code === stock.code)
                         return (
                         <tr 
