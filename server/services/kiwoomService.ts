@@ -1293,13 +1293,39 @@ export class KiwoomService {
     // TTTC0802U: 현금매수주문, TTTC0801U: 현금매도주문
     const trId = order.order_type === 'buy' ? 'TTTC0802U' : 'TTTC0801U'
     
+    // 종목코드 검증: 6자리 숫자만 허용 (ELW, ETF 등 비표준 종목코드 제외)
+    const stockCode = order.code.trim()
+    if (!/^\d{6}$/.test(stockCode)) {
+      throw new Error(`지원하지 않는 종목코드 형식입니다: ${stockCode} (6자리 숫자만 지원)`)
+    }
+    
+    // 계좌번호 검증
+    if (!accountNo || accountNo.trim().length === 0) {
+      throw new Error('계좌번호가 필요합니다')
+    }
+    
+    // 계좌상품코드 검증
+    if (!accountProductCode || accountProductCode.trim().length === 0) {
+      throw new Error('계좌상품코드가 필요합니다')
+    }
+    
+    // 주문 수량 검증
+    if (!order.quantity || order.quantity <= 0) {
+      throw new Error('주문 수량은 1 이상이어야 합니다')
+    }
+    
+    // 지정가 주문 시 가격 검증
+    if (order.order_option === '00' && (!order.price || order.price <= 0)) {
+      throw new Error('지정가 주문 시 주문 가격이 필요합니다')
+    }
+    
     const data = {
-      CANO: accountNo || '', // 계좌번호 (8자리)
-      ACNT_PRDT_CD: accountProductCode || '', // 계좌상품코드 (2자리)
-      PDNO: order.code, // 종목코드 (6자리)
+      CANO: accountNo.trim(), // 계좌번호 (8자리)
+      ACNT_PRDT_CD: accountProductCode.trim(), // 계좌상품코드 (2자리)
+      PDNO: stockCode, // 종목코드 (6자리 숫자)
       ORD_DVSN: order.order_option, // 주문구분 (00: 지정가, 01: 시장가, 03: 시장가)
       ORD_QTY: order.quantity.toString(), // 주문수량
-      ORD_UNPR: order.order_option === '00' ? order.price.toString() : '0', // 주문단가 (지정가일 경우만)
+      ORD_UNPR: order.order_option === '00' ? Math.floor(order.price).toString() : '0', // 주문단가 (지정가일 경우만, 정수로 변환)
     }
 
     try {
@@ -1313,8 +1339,37 @@ export class KiwoomService {
         message: response.return_msg || response.메시지 || '',
       }
     } catch (error: any) {
-      console.error('주문 전송 오류:', error)
-      throw new Error(error.response?.data?.return_msg || error.message || '주문 전송 실패')
+      // 에러 응답에서 상세 정보 추출
+      const errorResponse = error.response?.data
+      const errorMessage = errorResponse?.message || errorResponse?.return_msg || error.message || '주문 전송 실패'
+      const errorStatus = error.response?.status || 500
+      
+      // 500 에러인 경우 모의투자 환경 제한사항으로 처리
+      if (errorStatus === 500) {
+        // 모의투자 환경에서는 일부 종목에 대해 주문이 제한될 수 있음
+        // 이는 정상적인 제한사항이므로 조용히 처리
+        const isMockApi = this.config?.host?.includes('mockapi.kiwoom.com')
+        if (isMockApi) {
+          // 모의투자 환경에서는 500 에러를 특별한 에러 타입으로 처리
+          const mockError = new Error(`모의투자 환경 제한: ${errorMessage}`)
+          ;(mockError as any).isMockApiLimit = true
+          ;(mockError as any).stockCode = stockCode
+          ;(mockError as any).status = 500
+          throw mockError
+        }
+        
+        console.error('주문 전송 오류 (500):', {
+          종목코드: stockCode,
+          주문구분: order.order_option,
+          수량: order.quantity,
+          가격: order.price,
+          API응답: errorResponse
+        })
+        throw new Error(`주문 전송 실패: ${errorMessage} (종목코드: ${stockCode})`)
+      }
+      
+      console.error('주문 전송 오류:', errorMessage)
+      throw new Error(errorMessage)
     }
   }
 
@@ -1605,7 +1660,6 @@ export class KiwoomService {
       const response = await this.request(endpoint, trId, finalParams, 'POST')
       
       console.log(`[${trId}] 순위정보 조회 성공`)
-      console.log('응답 데이터:', JSON.stringify(response, null, 2))
       
       // 응답 구조 확인 및 변환
       // 키움증권 API는 TR_ID별로 다른 응답 필드명을 사용할 수 있음
