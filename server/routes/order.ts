@@ -77,13 +77,15 @@ router.post('/', async (req: Request, res: Response) => {
       })
     }
     
-    // 모의투자 환경 제한사항인 경우
-    if (error.isMockApiLimit) {
+    // 모의투자 환경 제한사항인 경우 (매매제한 종목 포함)
+    if (error.isMockApiLimit || error.isTradingRestricted) {
       return res.status(503).json({
         error: '모의투자 환경 제한',
         detail: error.message || '모의투자 환경에서 일부 종목은 주문이 제한될 수 있습니다',
         code: error.stockCode || req.body.code || '알 수 없음',
-        isMockApiLimit: true
+        isMockApiLimit: true,
+        isTradingRestricted: error.isTradingRestricted || false,
+        returnCode: error.returnCode
       })
     }
     
@@ -92,7 +94,7 @@ router.post('/', async (req: Request, res: Response) => {
     res.status(statusCode).json({
       error: '주문 전송 실패',
       detail: error.message || '알 수 없는 오류가 발생했습니다',
-      code: req.body.code || '알 수 없음' // 실패한 종목코드 포함
+      code: error.stockCode || req.body.code || '알 수 없음' // 실패한 종목코드 포함
     })
   }
 })
