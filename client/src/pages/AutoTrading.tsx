@@ -49,6 +49,15 @@ interface DetectedStock {
   detectedTime: string
   startPrice?: number // 자동매매 시작 시점의 가격 (상대 변화율 계산용)
   detectedChangePercent?: number // 조건 감지 시점의 등락률 (매수 조건 비교용)
+  isHolding?: boolean // 계좌 보유 중 여부 (C# 코드의 b계좌보유중과 동일)
+  purchasePrice?: number // 매수 가격 (C# 코드의 매수가격과 동일)
+  purchaseQuantity?: number // 매수 수량 (C# 코드의 매수수량과 동일)
+  purchaseTime?: string // 매수 시간 (C# 코드의 dt마지막매수시간과 동일)
+  maxProfitPercent?: number // 최고 수익률 (C# 코드의 최고수익률과 동일)
+  isScalpingBuy?: boolean // 스캘핑 매수 여부
+  isBollingerBuy?: boolean // 볼린저 밴드 매수 여부
+  isBreakoutBuy?: boolean // 돌파 매수 여부
+  isPatternBuy?: boolean // 패턴 매수 여부
 }
 
 interface HoldingStock {
@@ -73,6 +82,10 @@ interface OrderLog {
   price: number
   status: string
   orderNumber?: string
+  isExecuted?: boolean // 체결 여부 플래그
+  orderTimestamp?: number // 주문 접수 시점의 타임스탬프 (밀리초)
+  cancelTimestamp?: number // 주문 취소 시점의 타임스탬프 (밀리초)
+  isMarketOrder?: boolean // 시장가 주문 여부
 }
 
 interface LogMessage {
@@ -583,6 +596,7 @@ const AutoTrading = () => {
     highPercent: 70,
     volume: 90,
     action: 60,
+    algorithm: 120,
     detectedTime: 100
   })
   const [resizingColumn, setResizingColumn] = useState<string | null>(null)
@@ -605,6 +619,10 @@ const AutoTrading = () => {
   const [stockTradeCounts, setStockTradeCounts] = useState<Map<string, number>>(new Map()) // 종목별 매매 횟수
   const [dailyTradedStocks, setDailyTradedStocks] = useState<Set<string>>(new Set()) // 당일 매매한 종목 목록
   const [dailyTradeCount, setDailyTradeCount] = useState<number>(0) // 당일 매매 종목 수
+  const [restrictedStocks, setRestrictedStocks] = useState<Set<string>>(new Set()) // 매매제한 종목 목록 (재시도 방지)
+  const [processingOrders, setProcessingOrders] = useState<Set<string>>(new Set()) // 주문 처리 중인 종목코드 목록 (중복 방지)
+  const [processedOrderNumbers, setProcessedOrderNumbers] = useState<Set<string>>(new Set()) // 처리된 주문번호 목록 (중복 방지)
+  const [orderedOrHoldingStocks, setOrderedOrHoldingStocks] = useState<Set<string>>(new Set()) // 매수 주문했거나 보유 중인 종목 목록 (C# 코드의 매수주문했거나보유중인종목과 동일)
   
   // 매매설정 상태 (useTradingConditions 제거 - 각 전략별 체크박스로 대체)
   const [amountPerStock, setAmountPerStock] = useState<number>(50000)
@@ -612,6 +630,13 @@ const AutoTrading = () => {
   const [tradeLimitPerStock, setTradeLimitPerStock] = useState<number>(30)
   const [maxDailyStocks, setMaxDailyStocks] = useState<number>(50)
   const [feePercent, setFeePercent] = useState<number>(0.92)
+  
+  // 종목별 매수가격 설정
+  const [buyPriceSettings, setBuyPriceSettings] = useState({
+    종목별매수가격설정실행: true,
+    매수가격옵션: '지정가' as '시장가' | '지정가',
+    매수호가: 0,
+  })
   
   // 매매시간 설정
   const [startHour, setStartHour] = useState<number>(9)
@@ -976,7 +1001,7 @@ const AutoTrading = () => {
     },
     {
       enabled: isConnected && !!selectedAccount,
-      refetchInterval: isRunning ? 30000 : 60000, // 요청 빈도 감소 (30초/1분)
+      refetchInterval: isRunning ? 5000 : false, // 자동매매 실행 중일 때 5초마다 계좌 정보 조회
       retry: false, // 자동 재시도 비활성화
       retryOnMount: false,
       onSuccess: (data: any) => {
@@ -996,7 +1021,7 @@ const AutoTrading = () => {
   )
 
   // 계좌 잔고 조회
-  const { data: balanceData, error: balanceError } = useQuery(
+  const { data: balanceData, error: balanceError, refetch: refetchBalance } = useQuery(
     ['balance', selectedAccount],
     () => {
       if (!selectedAccount) return Promise.resolve([])
@@ -1009,7 +1034,7 @@ const AutoTrading = () => {
     },
     {
       enabled: isConnected && !!selectedAccount,
-      refetchInterval: false, // 계좌 잔고는 자동 갱신 비활성화 (수동 갱신만)
+      refetchInterval: isRunning ? 3000 : false, // 자동매매 실행 중일 때 3초마다 보유 종목 조회 (체결 확인용)
       retry: false, // 자동 재시도 비활성화
       retryOnMount: false,
       onSuccess: (data) => {
@@ -1022,8 +1047,10 @@ const AutoTrading = () => {
           return
         }
         
+        const newHoldingStocks: HoldingStock[] = []
+        
         if (Array.isArray(data)) {
-          setHoldingStocks(data.map((stock: any) => ({
+          newHoldingStocks.push(...data.map((stock: any) => ({
             code: stock.code || stock.종목코드 || '',
             name: stock.name || stock.종목명 || '',
             quantity: stock.quantity || stock.보유수량 || 0,
@@ -1034,7 +1061,7 @@ const AutoTrading = () => {
             maxProfitPercent: stock.maxProfitPercent || stock.maxProfitPercent || 0,
           })))
         } else if (data?.stocks && Array.isArray(data.stocks)) {
-          setHoldingStocks(data.stocks.map((stock: any) => ({
+          newHoldingStocks.push(...data.stocks.map((stock: any) => ({
             code: stock.code || stock.종목코드 || '',
             name: stock.name || stock.종목명 || '',
             quantity: stock.quantity || stock.보유수량 || 0,
@@ -1045,6 +1072,164 @@ const AutoTrading = () => {
             maxProfitPercent: stock.maxProfitPercent || stock.maxProfitPercent || 0,
           })))
         }
+        
+        setHoldingStocks(newHoldingStocks)
+        
+        // C# 코드의 계좌 조회 로직과 동일하게 보유 종목 관리
+        // 1. 보유 종목에 isHolding = true 설정 및 orderedOrHoldingStocks에 추가
+        setDetectedStocks(prev => {
+          const updated = prev.map(stock => {
+            const holdingStock = newHoldingStocks.find(h => h.code === stock.code)
+            if (holdingStock && holdingStock.quantity > 0) {
+              // 보유 종목인 경우 isHolding = true 설정 및 매수 정보 업데이트
+              return {
+                ...stock,
+                isHolding: true,
+                purchasePrice: holdingStock.purchasePrice,
+                purchaseQuantity: holdingStock.quantity,
+                purchaseTime: stock.purchaseTime || new Date().toLocaleTimeString(),
+                maxProfitPercent: Math.max(stock.maxProfitPercent || 0, holdingStock.maxProfitPercent || holdingStock.profitPercent),
+              }
+            }
+            return stock
+          })
+          
+          // 계좌에 있지만 detectedStocks에 없는 종목 추가 (C# 코드의 로직과 동일)
+          newHoldingStocks.forEach(holdingStock => {
+            const exists = updated.find(s => s.code === holdingStock.code)
+            if (!exists && holdingStock.quantity > 0) {
+              updated.push({
+                code: holdingStock.code,
+                name: holdingStock.name,
+                price: holdingStock.currentPrice,
+                change: 0,
+                changePercent: holdingStock.profitPercent,
+                volume: 0,
+                detectedCondition: '계좌보유종목',
+                detectedTime: new Date().toLocaleTimeString(),
+                isHolding: true,
+                purchasePrice: holdingStock.purchasePrice,
+                purchaseQuantity: holdingStock.quantity,
+                purchaseTime: new Date().toLocaleTimeString(),
+                maxProfitPercent: holdingStock.maxProfitPercent || holdingStock.profitPercent,
+              })
+            }
+          })
+          
+          return updated
+        })
+        
+        // 2. 매수주문했거나보유중인종목 리스트 업데이트 (C# 코드의 프로그램제어인스턴스.매수주문했거나보유중인종목과 동일)
+        setOrderedOrHoldingStocks(prev => {
+          const updated = new Set(prev)
+          // 보유 수량이 0보다 큰 종목만 추가
+          newHoldingStocks.forEach(holdingStock => {
+            if (holdingStock.quantity > 0) {
+              updated.add(holdingStock.code)
+            } else {
+              // 보유 수량이 0이면 제거 (매도 완료)
+              updated.delete(holdingStock.code)
+            }
+          })
+          // 보유 종목에 없는 종목도 제거 (매도 완료된 종목)
+          const holdingCodes = new Set(newHoldingStocks.map(h => h.code))
+          prev.forEach(code => {
+            if (!holdingCodes.has(code)) {
+              updated.delete(code)
+            }
+          })
+          return updated
+        })
+        
+        // 보유 종목 조회를 통해 체결 여부 확인 (실제 계좌 요약에 표시되는지가 체결 여부의 기준)
+        // 체결이 나와도 실제 계좌 요약에 표시 안되면 체결이 안된 것
+        console.log(`[보유종목 조회] 체결 확인 시작 - 보유종목: ${newHoldingStocks.length}개, 주문 내역 확인 중...`)
+        setOrderLogs(prev => {
+          const updated = prev.map(order => {
+            // 미체결 매수 주문이고 보유 종목에 해당 종목이 있으면 체결된 것으로 처리
+            if (order.type === 'buy' && 
+                (order.status === '접수' || order.status === '확인' || order.status === '미체결' || order.status === '부분체결') && 
+                !order.isExecuted &&
+                order.orderNumber) {
+              console.log(`[보유종목 조회] 체결 확인 중 - ${order.stockName} (${order.stockCode}), 주문수량: ${order.quantity}주, 상태: ${order.status}`)
+              const holdingStock = newHoldingStocks.find(h => h.code === order.stockCode)
+              if (holdingStock && holdingStock.quantity > 0) {
+                console.log(`[보유종목 조회] 보유종목 발견 - ${order.stockName} (${order.stockCode}), 보유수량: ${holdingStock.quantity}주, 주문수량: ${order.quantity}주`)
+                // 보유 종목에 있으면 체결 확인
+                // 주문 수량과 보유 수량을 비교하여 체결 여부 확인
+                if (holdingStock.quantity >= order.quantity) {
+                  // 전량 체결
+                  console.log(`[체결 확인] ${order.stockName} 매수 주문 전량 체결 확인 (보유 종목에 존재: ${holdingStock.quantity}주, 주문: ${order.quantity}주)`)
+                  addLog(`[체결 확인] ${order.stockName} ${order.quantity}주 매수 체결 완료 (보유: ${holdingStock.quantity}주)`, 'success')
+                  
+                  // detectedStocks의 isHolding 플래그 업데이트
+                  setDetectedStocks(prevStocks => {
+                    return prevStocks.map(stock => 
+                      stock.code === order.stockCode
+                        ? {
+                            ...stock,
+                            isHolding: true,
+                            purchasePrice: holdingStock.purchasePrice,
+                            purchaseQuantity: holdingStock.quantity,
+                            purchaseTime: order.time || new Date().toLocaleTimeString(),
+                            maxProfitPercent: 0, // 매수 시 최고수익률 초기화
+                          }
+                        : stock
+                    )
+                  })
+                  
+                  // orderedOrHoldingStocks에 추가
+                  setOrderedOrHoldingStocks(prev => new Set(prev).add(order.stockCode))
+                  
+                  return {
+                    ...order,
+                    status: '체결',
+                    isExecuted: true,
+                  }
+                } else if (holdingStock.quantity > 0) {
+                  // 부분 체결: 체결된 부분만 처리하고 나머지는 취소
+                  const executedQuantity = holdingStock.quantity
+                  const cancelledQuantity = order.quantity - executedQuantity
+                  console.log(`[부분 체결] ${order.stockName} 매수 주문 부분 체결 (체결: ${executedQuantity}주, 취소: ${cancelledQuantity}주, 주문: ${order.quantity}주)`)
+                  addLog(`[부분 체결] ${order.stockName} ${executedQuantity}주 체결, ${cancelledQuantity}주 자동 취소 (전체: ${order.quantity}주)`, 'info')
+                  
+                  // detectedStocks의 isHolding 플래그 업데이트
+                  setDetectedStocks(prevStocks => {
+                    return prevStocks.map(stock => 
+                      stock.code === order.stockCode
+                        ? {
+                            ...stock,
+                            isHolding: true,
+                            purchasePrice: holdingStock.purchasePrice,
+                            purchaseQuantity: holdingStock.quantity,
+                            purchaseTime: order.time || new Date().toLocaleTimeString(),
+                            maxProfitPercent: 0, // 매수 시 최고수익률 초기화
+                          }
+                        : stock
+                    )
+                  })
+                  
+                  // orderedOrHoldingStocks에 추가
+                  setOrderedOrHoldingStocks(prev => new Set(prev).add(order.stockCode))
+                  
+                  // 체결된 부분만 처리 (나머지는 취소)
+                  return {
+                    ...order,
+                    status: '체결',
+                    isExecuted: true,
+                    quantity: executedQuantity, // 체결된 수량으로 업데이트
+                  }
+                }
+              }
+            }
+            
+            // 체결된 주문은 항상 유지 (체결 취소 개념 없음)
+            // 체결 후에는 매도만 가능하며, 체결된 주문은 그대로 유지됨
+            
+            return order
+          })
+          return updated
+        })
       },
       onError: (error: any) => {
         if (error.response?.data?.error) {
@@ -1056,7 +1241,7 @@ const AutoTrading = () => {
   )
 
   // 주문 리스트 조회
-  const { data: ordersData } = useQuery(
+  const { data: ordersData, refetch: refetchOrders } = useQuery(
     ['orders', selectedAccount],
     () => {
       if (!selectedAccount) return Promise.resolve([])
@@ -1066,25 +1251,334 @@ const AutoTrading = () => {
       enabled: connected && !!selectedAccount,
       refetchInterval: isRunning ? 3000 : false,
       onSuccess: (data) => {
+        console.log(`[주문 내역] UI 업데이트 - 받은 데이터 개수: ${Array.isArray(data) ? data.length : 0}`)
         if (Array.isArray(data)) {
-          setOrderLogs(data.map((order: any, idx: number) => ({
-            id: order.id || idx,
-            date: order.date || new Date().toLocaleDateString('ko-KR'),
-            time: order.time || new Date().toLocaleTimeString('ko-KR'),
-            type: order.type || 'buy',
-            stockName: order.stockName || order.종목명 || '',
-            stockCode: order.stockCode || order.종목코드 || '',
-            quantity: order.quantity || order.수량 || 0,
-            price: order.price || order.가격 || 0,
-            status: order.status || order.주문상태 || '접수',
-            orderNumber: order.orderNumber || order.주문번호,
-          })))
+          // API에서 주문 내역을 받아온 경우
+          if (data.length > 0) {
+            // API에서 주문 내역이 있으면 병합 (로컬 주문과 API 주문 병합)
+            const mappedOrders = data.map((order: any, idx: number) => {
+              // 주문 상태 확인 및 체결 여부 판단
+              const orderStatus = order.status || order.주문상태 || '접수'
+              // 체결 상태 확인: '체결', '전량체결', '부분체결' 등은 체결된 것으로 판단
+              const isExecuted = orderStatus.includes('체결') || orderStatus === '완료' || orderStatus === '체결완료'
+              // 취소 상태 확인
+              const isCancelled = orderStatus === '취소' || order.type === 'cancel'
+              
+              // 주문 시간을 기반으로 orderTimestamp 추정
+              const orderDate = order.date || new Date().toLocaleDateString('ko-KR')
+              const orderTime = order.time || new Date().toLocaleTimeString('ko-KR')
+              let orderTimestamp: number | undefined = undefined
+              try {
+                // 날짜와 시간을 합쳐서 타임스탬프 계산
+                const dateTimeStr = `${orderDate} ${orderTime}`
+                const parsedDate = new Date(dateTimeStr)
+                if (!isNaN(parsedDate.getTime())) {
+                  orderTimestamp = parsedDate.getTime()
+                }
+              } catch (e) {
+                // 파싱 실패 시 현재 시간 사용 (최악의 경우)
+                orderTimestamp = Date.now()
+              }
+              
+              // 취소된 주문의 경우 취소 시점 기록 (API에서 받은 취소 주문은 현재 시간을 취소 시점으로 설정)
+              let cancelTimestamp: number | undefined = undefined
+              if (isCancelled) {
+                cancelTimestamp = Date.now() // API에서 받은 취소 주문은 현재 시간을 취소 시점으로 설정
+              }
+              
+              return {
+                id: order.id || idx,
+                date: orderDate,
+                time: orderTime,
+                type: order.type || (isCancelled ? 'cancel' : 'buy'),
+                stockName: order.stockName || order.종목명 || '',
+                stockCode: order.stockCode || order.종목코드 || '',
+                quantity: order.quantity || order.수량 || 0,
+                price: order.price || order.가격 || 0,
+                status: orderStatus,
+                orderNumber: order.orderNumber || order.주문번호,
+                isExecuted, // 체결 여부 플래그 추가
+                orderTimestamp, // 주문 접수 시점 (API에서 받은 주문의 경우 추정값)
+                cancelTimestamp, // 취소 시점 (취소된 주문인 경우)
+              }
+            })
+            console.log(`[주문 내역] API에서 받은 주문 개수: ${mappedOrders.length}`)
+            
+            // 주문한 종목코드 추출 (매수 주문만, 체결되지 않은 주문 포함)
+            const orderedStockCodes = new Set(
+              mappedOrders
+                .filter((o: any) => o.type === 'buy' && o.stockCode)
+                .map((o: any) => o.stockCode)
+            )
+            
+            // 주문한 종목을 검색된 종목에서 제거 (주문 내역에 있는 종목은 검색된 종목에 표시하지 않음)
+            if (orderedStockCodes.size > 0) {
+              setDetectedStocks(prev => {
+                const filtered = prev.filter(s => !orderedStockCodes.has(s.code))
+                if (filtered.length !== prev.length) {
+                  console.log(`[검색된 종목] 주문 내역의 종목 제거 - ${prev.length - filtered.length}개 종목 제거됨, 남은 종목: ${filtered.length}개`)
+                }
+                return filtered
+              })
+            }
+            
+            // 기존 로컬 주문 내역과 병합 (중복 제거: 주문번호 기준)
+            // 체결된 주문은 항상 유지 (API 응답에 없어도 로컬 주문 유지)
+            setOrderLogs(prev => {
+              const orderNumberSet = new Set(mappedOrders.map((o: any) => o.orderNumber).filter(Boolean))
+              
+              // 로컬 주문 분류:
+              // 1. 체결된 주문: 항상 유지 (API 응답에 없어도)
+              // 2. 미체결 주문: API 주문번호에 없으면 유지 (주문번호가 없는 경우도 유지)
+              const localOrders = prev.filter(o => {
+                // 체결된 주문은 항상 유지
+                if (o.isExecuted) {
+                  return true
+                }
+                // 주문번호가 없거나 API 주문번호에 없는 로컬 주문 유지
+                return !o.orderNumber || !orderNumberSet.has(o.orderNumber)
+              })
+              
+              // 로컬 주문의 상태도 업데이트 (API에서 받은 주문 상태로 업데이트)
+              const updatedLocalOrders = localOrders.map(localOrder => {
+                // 체결된 주문은 API 응답과 관계없이 유지
+                if (localOrder.isExecuted) {
+                  // API에서 같은 주문번호의 주문이 있으면 상태만 업데이트 (체결 상태는 유지)
+                  const apiOrder = mappedOrders.find((o: any) => o.orderNumber === localOrder.orderNumber)
+                  if (apiOrder) {
+                    return {
+                      ...localOrder,
+                      status: apiOrder.status || localOrder.status, // API 상태가 있으면 업데이트, 없으면 기존 상태 유지
+                      isExecuted: true, // 체결 상태는 항상 유지
+                    }
+                  }
+                  // API 응답에 없어도 체결된 주문은 그대로 유지
+                  return localOrder
+                }
+                
+                // 미체결 주문은 API 주문 상태로 업데이트
+                const apiOrder = mappedOrders.find((o: any) => o.orderNumber === localOrder.orderNumber)
+                if (apiOrder) {
+                  const isCancelled = apiOrder.status === '취소' || apiOrder.type === 'cancel'
+                  const updatedOrder = {
+                    ...localOrder,
+                    status: apiOrder.status,
+                    isExecuted: apiOrder.isExecuted,
+                    type: isCancelled ? ('cancel' as const) : localOrder.type,
+                  }
+                  // 취소된 주문이고 아직 cancelTimestamp가 없으면 현재 시간을 취소 시점으로 설정
+                  if (isCancelled && !localOrder.cancelTimestamp) {
+                    return {
+                      ...updatedOrder,
+                      cancelTimestamp: Date.now(),
+                    }
+                  }
+                  return updatedOrder
+                }
+                return localOrder
+              })
+              
+              // API 주문과 로컬 주문 병합 (중복 제거: 주문번호 기준, 로컬 주문 우선)
+              const mergedMap = new Map<string, OrderLog>()
+              
+              // 먼저 로컬 주문 추가 (우선순위 높음)
+              updatedLocalOrders.forEach(order => {
+                if (order.orderNumber) {
+                  mergedMap.set(order.orderNumber, order)
+                } else {
+                  // 주문번호가 없는 경우 ID로 구분
+                  mergedMap.set(`local_${order.id}`, order)
+                }
+              })
+              
+              // API 주문 추가 (로컬 주문에 없는 경우만)
+              mappedOrders.forEach((apiOrder: any) => {
+                if (apiOrder.orderNumber && !mergedMap.has(apiOrder.orderNumber)) {
+                  mergedMap.set(apiOrder.orderNumber, apiOrder)
+                } else if (!apiOrder.orderNumber) {
+                  // 주문번호가 없는 경우 ID로 구분
+                  const key = `api_${apiOrder.id || Date.now()}`
+                  if (!mergedMap.has(key)) {
+                    mergedMap.set(key, apiOrder)
+                  }
+                }
+              })
+              
+              const merged = Array.from(mergedMap.values())
+              
+              // 시간순 정렬 (최신순)
+              merged.sort((a, b) => {
+                const timeA = new Date(`${a.date} ${a.time}`).getTime()
+                const timeB = new Date(`${b.date} ${b.time}`).getTime()
+                return timeB - timeA
+              })
+              
+              // 체결된 주문이 있는지 확인하여 로그 출력
+              const executedOrders = merged.filter((o: any) => o.isExecuted)
+              if (executedOrders.length > 0) {
+                console.log(`[주문 내역 병합] 체결된 주문 ${executedOrders.length}개 유지됨`)
+                executedOrders.forEach((order: any) => {
+                  console.log(`[체결 확인] ${order.stockName} ${order.quantity}주 ${order.type === 'buy' ? '매수' : '매도'} 체결 완료 (주문번호: ${order.orderNumber || '없음'})`)
+                })
+              }
+              
+              console.log(`[주문 내역 병합] API: ${mappedOrders.length}개, 로컬: ${updatedLocalOrders.length}개, 병합 후: ${merged.length}개`)
+              
+              return merged
+            })
+          } else {
+            // API에서 빈 배열이 반환되면 기존 로컬 주문 내역 유지 (덮어쓰지 않음)
+            // orderLogs는 클로저로 접근할 수 없으므로, setOrderLogs를 호출하지 않음
+            console.log(`[주문 내역] API에서 빈 배열 반환 - 기존 로컬 주문 내역 유지 (setOrderLogs 호출 안 함)`)
+            // setOrderLogs는 호출하지 않음 (기존 상태 유지)
+          }
+        } else {
+          console.log(`[주문 내역] 데이터가 배열이 아님:`, typeof data)
+          // 데이터가 배열이 아니어도 기존 로컬 주문 내역 유지
         }
+      },
+      onError: (error: any) => {
+        console.error(`[주문 내역] 조회 실패:`, error.response?.data || error.message)
       },
     }
   )
 
   // 로그 추가
+  // C# 코드의 SaveTradingState / LoadTradingState와 동일한 기능
+  // 보유 종목 상태 저장 (C# 코드의 SaveTradingState와 동일)
+  const saveTradingState = useCallback(() => {
+    try {
+      const holdingStocksData = detectedStocks
+        .filter(stock => stock.isHolding)
+        .map(stock => ({
+          종목코드: stock.code,
+          종목명: stock.name,
+          매수가격: stock.purchasePrice || 0,
+          매수수량: stock.purchaseQuantity || 0,
+          매수시간: stock.purchaseTime || new Date().toLocaleTimeString(),
+          최고수익률: stock.maxProfitPercent || 0,
+          스캘핑매수여부: stock.isScalpingBuy || false,
+          볼린저매수여부: stock.isBollingerBuy || false,
+          돌파매수여부: stock.isBreakoutBuy || false,
+          패턴매수여부: stock.isPatternBuy || false,
+        }))
+      
+      const tradingState = {
+        보유종목정보: holdingStocksData
+      }
+      
+      localStorage.setItem('trading_state', JSON.stringify(tradingState))
+      console.log(`[보유 종목 상태 저장] ${holdingStocksData.length}개 종목 저장 완료`)
+    } catch (error: any) {
+      console.error(`[보유 종목 상태 저장 실패]:`, error.message)
+      addLog(`매매 상태 저장 실패: ${error.message}`, 'error')
+    }
+  }, [detectedStocks])
+  
+  // 보유 종목 상태 복원 (C# 코드의 LoadTradingState와 동일)
+  const loadTradingState = useCallback(() => {
+    try {
+      const savedState = localStorage.getItem('trading_state')
+      if (!savedState) {
+        return
+      }
+      
+      const tradingState = JSON.parse(savedState)
+      if (!tradingState.보유종목정보 || !Array.isArray(tradingState.보유종목정보)) {
+        return
+      }
+      
+      console.log(`[보유 종목 상태 복원] ${tradingState.보유종목정보.length}개 종목 복원 시작`)
+      
+      // 복원할 종목 목록
+      const restoredStocks: DetectedStock[] = []
+      const restoredCodes = new Set<string>()
+      
+      tradingState.보유종목정보.forEach((savedItem: any) => {
+        restoredCodes.add(savedItem.종목코드)
+        
+        // 새로운 종목 정보 생성 (계좌에 있지만 detectedStocks에 없는 경우)
+        const newStock: DetectedStock = {
+          code: savedItem.종목코드,
+          name: savedItem.종목명,
+          price: 0, // 복원 시에는 가격 정보가 없으므로 0으로 설정 (계좌 조회 시 업데이트됨)
+          change: 0,
+          changePercent: 0,
+          volume: 0,
+          detectedCondition: '계좌보유종목',
+          detectedTime: savedItem.매수시간,
+          isHolding: true,
+          purchasePrice: savedItem.매수가격,
+          purchaseQuantity: savedItem.매수수량,
+          purchaseTime: savedItem.매수시간,
+          maxProfitPercent: savedItem.최고수익률,
+          isScalpingBuy: savedItem.스캘핑매수여부,
+          isBollingerBuy: savedItem.볼린저매수여부,
+          isBreakoutBuy: savedItem.돌파매수여부,
+          isPatternBuy: savedItem.패턴매수여부,
+        }
+        
+        restoredStocks.push(newStock)
+        addLog(`보유종목 정보 복원: ${savedItem.종목명}`, 'info')
+      })
+      
+      // 기존 detectedStocks와 병합 (기존 종목이면 업데이트, 없으면 추가)
+      setDetectedStocks(prev => {
+        const updated = prev.map(stock => {
+          const restoredStock = restoredStocks.find(s => s.code === stock.code)
+          if (restoredStock) {
+            return {
+              ...stock,
+              isHolding: true,
+              purchasePrice: restoredStock.purchasePrice,
+              purchaseQuantity: restoredStock.purchaseQuantity,
+              purchaseTime: restoredStock.purchaseTime,
+              maxProfitPercent: restoredStock.maxProfitPercent,
+              isScalpingBuy: restoredStock.isScalpingBuy,
+              isBollingerBuy: restoredStock.isBollingerBuy,
+              isBreakoutBuy: restoredStock.isBreakoutBuy,
+              isPatternBuy: restoredStock.isPatternBuy,
+            }
+          }
+          return stock
+        })
+        
+        // 새로운 종목 추가 (기존에 없던 종목)
+        restoredStocks.forEach(restoredStock => {
+          if (!updated.find(s => s.code === restoredStock.code)) {
+            updated.push(restoredStock)
+          }
+        })
+        
+        return updated
+      })
+      
+      // 매수주문했거나보유중인종목에 추가
+      setOrderedOrHoldingStocks(prev => {
+        const updated = new Set(prev)
+        restoredCodes.forEach(code => updated.add(code))
+        return updated
+      })
+      
+      console.log(`[보유 종목 상태 복원] 완료`)
+    } catch (error: any) {
+      console.error(`[보유 종목 상태 복원 실패]:`, error.message)
+      addLog(`매매 상태 복원 실패: ${error.message}`, 'error')
+    }
+  }, []) // 빈 배열로 한 번만 실행
+  
+  // 보유 종목 상태가 변경될 때마다 저장
+  useEffect(() => {
+    if (detectedStocks.some(s => s.isHolding)) {
+      saveTradingState()
+    }
+  }, [detectedStocks, saveTradingState])
+  
+  // 컴포넌트 마운트 시 보유 종목 상태 복원
+  useEffect(() => {
+    loadTradingState()
+  }, []) // 빈 배열로 한 번만 실행
+  
   const addLog = (message: string, level: LogMessage['level'] = 'info') => {
     const newLog: LogMessage = {
       id: logIdRef.current++,
@@ -1108,6 +1602,7 @@ const AutoTrading = () => {
   // displayedStockCount와 detectedStocks.length를 ref로 관리하여 클로저 문제 해결
   const displayedStockCountRef = useRef<number>(20)
   const detectedStocksLengthRef = useRef<number>(0)
+  const detectedStocksRef = useRef<DetectedStock[]>([])
   
   useEffect(() => {
     displayedStockCountRef.current = displayedStockCount
@@ -1115,7 +1610,8 @@ const AutoTrading = () => {
   
   useEffect(() => {
     detectedStocksLengthRef.current = detectedStocks.length
-  }, [detectedStocks.length])
+    detectedStocksRef.current = detectedStocks // 최신 detectedStocks를 ref에 저장
+  }, [detectedStocks])
 
   // detectedStocks의 길이가 크게 증가할 때만 초기화 (새로운 검색 결과가 들어올 때)
   const prevDetectedStocksLengthRef = useRef<number>(0)
@@ -1193,6 +1689,20 @@ const AutoTrading = () => {
                   const change = parseFloat(values['11'] || '0')
                   const changePercent = parseFloat(values['12'] || '0')
                   const volume = parseFloat(values['13'] || '0')
+                  
+                  // 체결 정보 파싱 (주문 체결 확인용)
+                  // '900': 주문수량, '901': 체결수량, '902': 미체결수량, '903': 체결가격, '905': 매수/매도 구분, '906': 주문구분
+                  const orderQuantity = parseInt(values['900'] || '0')
+                  const filledQuantity = parseInt(values['901'] || '0') // 체결수량
+                  const unfilledQuantity = parseInt(values['902'] || '0')
+                  const executedPrice = parseFloat(values['903'] || '0')
+                  const orderType = values['905'] || '' // "+매수" 또는 "-매도"
+                  const orderOption = values['906'] || '' // "시장가", "지정가" 등
+                  
+                  // 디버깅: 체결 정보 로그 출력
+                  if (orderQuantity > 0 && (executedPrice > 0 || filledQuantity > 0)) {
+                    console.log(`[체결 정보 파싱] 종목코드: ${code}, 주문수량: ${orderQuantity}, 체결수량: ${filledQuantity}, 미체결수량: ${unfilledQuantity}, 체결가격: ${executedPrice}, 주문구분: ${orderType}`)
+                  }
 
                   if (currentPrice > 0 && isMounted) {
                     // 검색된 종목 업데이트
@@ -1228,6 +1738,15 @@ const AutoTrading = () => {
                         return stock
                       })
                     })
+                  }
+                  
+                  // WebSocket 체결 정보는 참고용으로만 사용
+                  // 실제 체결 여부는 보유종목 조회를 통해서만 확인 (계좌 요약에 표시되는지가 기준)
+                  // 체결 정보가 있으면 로그만 출력하고, 실제 체결 확인은 보유종목 조회에서 처리
+                  if (orderQuantity > 0 && executedPrice > 0 && isMounted) {
+                    // 체결 정보 로그만 출력 (실제 체결 확인은 보유종목 조회에서 처리)
+                    console.log(`[WebSocket 체결 정보] 종목코드: ${code}, 주문수량: ${orderQuantity}, 체결수량: ${filledQuantity}, 미체결수량: ${unfilledQuantity}, 체결가격: ${executedPrice}, 주문구분: ${orderType}`)
+                    // 실제 체결 여부는 보유종목 조회를 통해서만 확인하므로 여기서는 orderLogs를 업데이트하지 않음
                   }
                 }
               })
@@ -1283,6 +1802,10 @@ const AutoTrading = () => {
   // 차트 데이터로 검색된 종목 화면 갱신 (주기적으로 차트 데이터 조회하여 가격 정보 업데이트)
   // 조건검색 직후에는 차트 데이터 조회를 지연시켜 API 제한 방지
   const lastSearchTimeRef = useRef<number>(0)
+  
+  // 주문 API 요청 제한 방지를 위한 마지막 주문 시간 추적
+  const lastOrderTimeRef = useRef<number>(0)
+  const minOrderInterval = 3000 // 주문 간 최소 간격: 3초 (API 요청 제한 방지)
   
   useEffect(() => {
     if (!isConnected || !connected || detectedStocks.length === 0) {
@@ -1670,6 +2193,53 @@ const AutoTrading = () => {
     } catch (error) {
       console.error(`[분봉데이터] ${code} 조회 실패:`, error)
       return []
+    }
+  }
+
+  // 0. My_매수신호_1 함수 (이동평균선 기반 간단한 매수 신호)
+  const My_매수신호_1 = async (stock: DetectedStock, candles: CandleData[]): Promise<boolean> => {
+    try {
+      // 분봉 데이터 유효성 체크 (최소 20개 필요)
+      if (!candles || candles.length < 20) {
+        return false
+      }
+
+      // 이동평균선 계산 (MA5, MA20)
+      const ma5 = calculateMA(candles, 5, '종가')
+      const ma20 = calculateMA(candles, 20, '종가')
+
+      if (ma5.length < 2 || ma20.length < 2) {
+        return false
+      }
+
+      // 상승봉 카운트 계산 (최근 3개 봉 중)
+      let 상승봉카운트 = 0
+      for (let i = 0; i < Math.min(3, candles.length); i++) {
+        if (candles[i].종가 > candles[i].시가) {
+          상승봉카운트++
+        }
+      }
+
+      // 현재가 상승 여부 확인
+      const 현재가 = stock.price
+      const 현재봉시가 = candles[0].시가
+      const 현재가상승 = 현재가 > 현재봉시가
+
+      // MA5가 MA20 위에 있는지 확인
+      const ma5Above = ma5[0] > ma20[0]
+
+      // 매수 신호 조건: (MA5 > MA20 && 상승봉카운트 >= 3 && 현재가상승)
+      // C# 코드에서는 차트 패턴 분석도 포함하지만, 여기서는 기본 조건만 구현
+      if (ma5Above && 상승봉카운트 >= 3 && 현재가상승) {
+        const ma5ma20비율 = ((ma5[0] / ma20[0]) - 1) * 100
+        addLog(`[매수신호1] ${stock.name}: MA5/MA20 상승비율:${ma5ma20비율.toFixed(2)}%, 연속상승봉:${상승봉카운트}개, 현재가:${현재가.toLocaleString()}원`, 'success')
+        return true
+      }
+
+      return false
+    } catch (error: any) {
+      console.error(`[My_매수신호_1] ${stock.name} 오류:`, error)
+      return false
     }
   }
 
@@ -2217,13 +2787,18 @@ const AutoTrading = () => {
 
   // 매수 조건 확인 함수 (async로 변경)
   const checkBuyConditions = async (stock: DetectedStock): Promise<boolean> => {
-    // 기본 매수 조건 체크
-    // 1. 이미 보유 중인 종목은 제외
+    // 기본 매수 조건 체크 (C# 코드의 기존매수조건확인과 동일)
+    // 1. 이미 보유 중인 종목은 제외 (C# 코드: b계좌보유중 || 매수주문했거나보유중인종목.Contains)
+    if (stock.isHolding || orderedOrHoldingStocks.has(stock.code)) {
+      return false
+    }
+    
+    // 2. holdingStocks에도 있는지 확인 (이중 체크)
     if (holdingStocks.some(h => h.code === stock.code)) {
       return false
     }
 
-    // 2. 최대 동시 보유 종목 수 체크
+    // 3. 최대 동시 보유 종목 수 체크
     if (holdingStocks.length >= maxSimultaneousBuy) {
       return false
     }
@@ -2292,9 +2867,10 @@ const AutoTrading = () => {
     const 등락률차이 = 실시간등락률 - 감지시점등락률
 
     // 차트 데이터 조회: 체크된 알고리즘 중 차트 분석이 필요한 알고리즘이 있으면 차트 데이터 조회
-    // 차트 분석이 필요한 알고리즘: 장시작급등주, 볼린저밴드, 스캘핑, 돌파매매, 장마감종가배팅
+    // 차트 분석이 필요한 알고리즘: My_매수신호_1, 장시작급등주, 볼린저밴드, 스캘핑, 돌파매매, 장마감종가배팅
     // 기본매수설정은 차트 분석이 필요 없음 (등락률 차이만 확인)
     const 차트분석필요알고리즘 = [
+      buyFormula1,           // My_매수신호_1 (이동평균선 기반)
       strategyMarketOpen,   // 장시작급등주
       strategyBollinger,    // 볼린저밴드
       strategyScalping,      // 스캘핑
@@ -2309,13 +2885,13 @@ const AutoTrading = () => {
     let retryCount = 0
     
     // 차트 분석이 필요한 알고리즘이 체크되어 있으면 차트 데이터 조회
-    // 단, 조건검색 직후 10초 이내에는 차트 데이터 조회를 지연시켜 API 제한 방지
+    // 단, 조건검색 직후 5초 이내에는 차트 데이터 조회를 지연시켜 API 제한 방지 (10초 -> 5초로 단축)
     if (차트분석필요) {
       const timeSinceLastSearch = Date.now() - lastSearchTimeRef.current
-      if (timeSinceLastSearch < 10000) {
-        // 조건검색 직후 10초 이내에는 차트 데이터 조회하지 않음
+      if (timeSinceLastSearch < 5000) {
+        // 조건검색 직후 5초 이내에는 차트 데이터 조회하지 않음 (실시간 시세 기반으로 진행)
         if (process.env.NODE_ENV === 'development') {
-          console.log(`[차트 데이터] ${stock.name}: 조건검색 직후 대기 중 (${Math.ceil((10000 - timeSinceLastSearch) / 1000)}초 남음)`)
+          console.log(`[차트 데이터] ${stock.name}: 조건검색 직후 대기 중 (${Math.ceil((5000 - timeSinceLastSearch) / 1000)}초 남음), 실시간 시세 기반으로 진행`)
         }
         // 차트 데이터 없이 진행 (실시간 시세 기반으로만 판단)
       } else {
@@ -2324,12 +2900,13 @@ const AutoTrading = () => {
             // 차트 분석이 필요한 종목에 대해 차트 데이터 조회 시도
             candles = await getCandleData(stock.code)
             
-            // API 제한 방지를 위한 추가 딜레이
-            await new Promise(resolve => setTimeout(resolve, 500))
+            // API 제한 방지를 위한 추가 딜레이 (500ms -> 1000ms로 증가)
+            await new Promise(resolve => setTimeout(resolve, 1000))
             
             if (candles && candles.length > 0) {
               // 체크된 알고리즘 중 가장 많은 차트 데이터가 필요한 알고리즘의 최소 요구사항 확인
               const requiredPeriods: number[] = []
+              if (buyFormula1) requiredPeriods.push(20) // My_매수신호_1은 최소 20개 필요
               if (strategyMarketOpen) requiredPeriods.push(marketOpenBuy.shortTermPeriod || 5)
               if (strategyBollinger) requiredPeriods.push(bollingerBuy.shortTermPeriod || 5)
               if (strategyScalping) requiredPeriods.push(scalpingBuy.minCandleCount || scalpingBuy.shortTermPeriod || 5)
@@ -2356,36 +2933,50 @@ const AutoTrading = () => {
             candles = []
             const errorMessage = error.response?.data?.error || error.message || ''
             
-            // API 제한 에러(429)는 재시도하지 않음
-            if (error.response?.status === 429) {
+            // API 제한 에러(429)는 재시도하지 않고 즉시 실시간 시세 기반으로 진행
+            if (error.response?.status === 429 || error.response?.data?.return_code === 5) {
               if (process.env.NODE_ENV === 'development') {
-                console.log(`[차트 데이터] ${stock.name}: API 제한으로 재시도 중단`)
+                console.log(`[차트 데이터] ${stock.name}: API 제한으로 차트 데이터 조회 중단, 실시간 시세 기반으로 진행`)
               }
+              addLog(`[차트 데이터] ${stock.name}: API 제한으로 차트 데이터 없이 진행`, 'warning')
               break
             }
           }
           
-          // 재시도 전 대기 (API 호출 제한 방지)
+          // 재시도 전 대기 (API 호출 제한 방지) - 재시도 횟수에 따라 대기 시간 증가
           if (retryCount < maxRetries && candles.length === 0) {
-            await new Promise(resolve => setTimeout(resolve, 2000 * (retryCount + 1))) // 2초, 4초 대기 (1초, 2초에서 증가)
+            await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1))) // 1초, 2초 대기
           }
           
           retryCount++
         }
         
         // 차트 데이터가 없으면 실시간 시세 기반 로직으로 fallback
-        if (candles.length === 0 && process.env.NODE_ENV === 'development') {
-          console.log(`[차트 데이터] ${stock.name}: 차트 데이터 없음, 실시간 시세 기반으로 진행`)
+        if (candles.length === 0) {
+          if (process.env.NODE_ENV === 'development') {
+            console.log(`[차트 데이터] ${stock.name}: 차트 데이터 없음, 실시간 시세 기반으로 진행`)
+          }
+          // 차트 데이터가 없어도 실시간 시세 기반 매수 조건 확인은 계속 진행됨
         }
       }
     }
 
-    // 5. My_매수신호_2 로직 적용: 체크된 매매 전략별 조건 확인
+    // 5. My_매수신호_1 로직 적용 (이동평균선 기반 간단한 매수 신호)
+    // My_매수신호_1은 차트 데이터가 필요하므로 차트 데이터가 있을 때만 실행
+    if (buyFormula1 && candles.length >= 20) {
+      const 매수신호1결과 = await My_매수신호_1(stock, candles)
+      if (매수신호1결과) {
+        return true // My_매수신호_1이 발생하면 즉시 매수 신호 반환
+      }
+    }
+
+    // 6. My_매수신호_2 로직 적용: 체크된 매매 전략별 조건 확인
     let 매수신호 = false
 
     // 기본매수설정이 체크되어 있고, 등락률 차이가 0% 이하이면 다른 알고리즘의 매수 신호를 무시
     // 기본매수설정: 등락률 차이가 2% 이상 15% 이하로 상승한 종목만 매수
-    const 기본매수설정차단 = strategyBasicBuy && 등락률차이 <= 0
+    // 단, 등락률차이가 0%인 경우(변화 없음)에는 다른 알고리즘도 실행 가능하도록 허용
+    const 기본매수설정차단 = strategyBasicBuy && 등락률차이 < 0 // 0% 이하 -> 0% 미만으로 변경 (0%는 허용)
 
     // 시간 구간 체크 (My_매수신호_2의 시간 구간 로직)
     const 시간외시작시각 = (startHour - 1) * 60 + 30 // 시작 1시간 전
@@ -2519,11 +3110,30 @@ const AutoTrading = () => {
         addLog(`[기본매수설정] ${stock.name}: 조건 충족 (감지시점: ${감지시점등락률.toFixed(2)}% → 현재: ${실시간등락률.toFixed(2)}%, 차이: ${등락률차이.toFixed(2)}%, 거래량: ${실시간거래량.toLocaleString()})`, 'info')
       } else {
         // 등락률 차이가 0% 이하인 경우 다른 알고리즘의 매수 신호를 무시
+        // 단, 이미 다른 알고리즘에서 매수 신호가 발생한 경우는 유지
         if (등락률차이 <= 0) {
           // 기본매수설정이 체크되어 있고 등락률 차이가 0% 이하면 다른 알고리즘의 매수 신호를 무시
-          매수신호 = false
+          // 하지만 이미 매수신호가 true인 경우는 유지 (다른 알고리즘이 먼저 신호를 발생시킨 경우)
+          if (!매수신호) {
+            // 다른 알고리즘에서도 매수 신호가 없었던 경우에만 차단
+            if (process.env.NODE_ENV === 'development') {
+              console.log(`[매수조건] ${stock.name}: 기본매수설정 차단 (등락률차이: ${등락률차이.toFixed(2)}%, 다른 알고리즘 매수신호 없음)`)
+            }
+          } else {
+            // 다른 알고리즘에서 매수 신호가 발생한 경우는 유지
+            if (process.env.NODE_ENV === 'development') {
+              console.log(`[매수조건] ${stock.name}: 기본매수설정 조건 불충족하지만 다른 알고리즘 매수신호 유지 (등락률차이: ${등락률차이.toFixed(2)}%)`)
+            }
+          }
         }
       }
+    }
+
+    // 매수 신호 결과 로그 출력
+    if (매수신호) {
+      console.log(`[매수조건] ${stock.name}: 매수 신호 발생 ✓ (차트데이터: ${candles.length}개, 등락률차이: ${등락률차이.toFixed(2)}%, 상대변화율: ${상대변화율.toFixed(2)}%, 가격: ${실시간가격.toLocaleString()}원)`)
+    } else {
+      console.log(`[매수조건] ${stock.name}: 매수 신호 없음 (차트데이터: ${candles.length}개, 등락률차이: ${등락률차이.toFixed(2)}%, 상대변화율: ${상대변화율.toFixed(2)}%, 가격: ${실시간가격.toLocaleString()}원)`)
     }
 
     return 매수신호
@@ -2587,7 +3197,13 @@ const AutoTrading = () => {
 
   // 자동매매 실행 함수
   const executeAutoTrading = async () => {
-    if (!isRunning || !selectedAccount) {
+    if (!isRunning) {
+      console.log('[자동매매] isRunning이 false입니다')
+      return
+    }
+    
+    if (!selectedAccount) {
+      console.log('[자동매매] 계좌가 선택되지 않았습니다')
       return
     }
 
@@ -2598,45 +3214,68 @@ const AutoTrading = () => {
 
       // 1. 조건식 검색 실행 (주기적으로)
       const enabledConditions = conditions.filter(c => c.enabled)
-      if (enabledConditions.length > 0) {
+      if (enabledConditions.length === 0) {
+        console.log('[자동매매] 활성화된 조건식이 없습니다')
+        // 조건식이 없어도 기존 detectedStocks에 대해 매수 조건 확인은 계속 진행
+      } else {
         const result = await kiwoomApi.searchCondition(enabledConditions)
         
         if (result.success && result.stocks && result.stocks.length > 0) {
           // 검색된 종목 업데이트
           // 기존 종목의 시작 가격과 감지 시점 등락률은 유지하고, 새로 검색된 종목만 설정
-          let newStocks: DetectedStock[] = []
-          setDetectedStocks(prevStocks => {
-            const existingStartPrices = new Map(prevStocks.map(s => [s.code, s.startPrice]))
-            const existingDetectedChangePercent = new Map(prevStocks.map(s => [s.code, s.detectedChangePercent]))
-            
-            newStocks = result.stocks.map((stock: any) => {
-              const existingStock = prevStocks.find(s => s.code === stock.code)
-              return {
-                code: stock.code,
-                name: stock.name,
-                price: stock.price,
-                change: stock.price * (stock.changeRate / 100),
-                changePercent: stock.changeRate,
-                volume: stock.volume,
-                detectedCondition: result.appliedConditions.join(', '),
-                detectedTime: existingStock?.detectedTime || new Date().toLocaleTimeString(),
-                // 기존 종목이면 시작 가격 유지, 새 종목이면 현재 가격을 시작 가격으로 설정
-                startPrice: existingStartPrices.get(stock.code) || stock.price,
-                // 기존 종목이면 감지 시점 등락률 유지, 새 종목이면 현재 등락률을 감지 시점 등락률로 설정
-                detectedChangePercent: existingDetectedChangePercent.get(stock.code) ?? stock.changeRate
-              }
-            })
-            
-            return newStocks
+          // newStocks를 먼저 계산 (setDetectedStocks 밖에서)
+          // ref를 통해 최신 값을 가져옴 (클로저 문제 방지)
+          const prevStocks = detectedStocksRef.current // 현재 상태 가져오기
+          const existingStartPrices = new Map(prevStocks.map(s => [s.code, s.startPrice]))
+          const existingDetectedChangePercent = new Map(prevStocks.map(s => [s.code, s.detectedChangePercent]))
+          
+          const newStocks: DetectedStock[] = result.stocks.map((stock: any) => {
+            const existingStock = prevStocks.find(s => s.code === stock.code)
+            return {
+              code: stock.code,
+              name: stock.name,
+              price: stock.price,
+              change: stock.price * (stock.changeRate / 100),
+              changePercent: stock.changeRate,
+              volume: stock.volume,
+              detectedCondition: result.appliedConditions.join(', '),
+              detectedTime: existingStock?.detectedTime || new Date().toLocaleTimeString(),
+              // 기존 종목이면 시작 가격 유지, 새 종목이면 현재 가격을 시작 가격으로 설정
+              startPrice: existingStartPrices.get(stock.code) || stock.price,
+              // 기존 종목이면 감지 시점 등락률 유지, 새 종목이면 현재 등락률을 감지 시점 등락률로 설정
+              detectedChangePercent: existingDetectedChangePercent.get(stock.code) ?? stock.changeRate
+            }
           })
+          
+          // 상태 업데이트
+          setDetectedStocks(newStocks)
 
           // 조건검색 시간 기록 (차트 데이터 조회 지연용)
           lastSearchTimeRef.current = Date.now()
+          
+          console.log(`[자동매매] 조건식 검색 완료: ${newStocks.length}개 종목`)
+        } else {
+          console.log('[자동매매] 조건식 검색 결과가 없습니다')
+        }
+      }
 
-          // 2. 매수 조건 확인 및 실행 (차트 데이터 기반으로 수행)
-          // API 제한을 고려하여 종목별로 딜레이 추가
-          for (let i = 0; i < newStocks.length; i++) {
-            const stock = newStocks[i]
+      // 2. 매수 조건 확인 및 실행 (차트 데이터 기반으로 수행)
+      // detectedStocks가 있으면 해당 종목들에 대해 매수 조건 확인
+      // ref를 통해 최신 값을 가져옴 (클로저 문제 방지)
+      const currentDetectedStocks = detectedStocksRef.current
+      const stocksToCheck = currentDetectedStocks.length > 0 ? currentDetectedStocks : []
+      
+      if (stocksToCheck.length === 0) {
+        console.log('[자동매매] 확인할 종목이 없습니다')
+        return
+      }
+      
+      console.log(`[자동매매] ${stocksToCheck.length}개 종목에 대해 매수 조건 확인 시작`)
+      addLog(`[자동매매] ${stocksToCheck.length}개 종목 매수 조건 확인 시작`, 'info')
+      
+      // API 제한을 고려하여 종목별로 딜레이 추가
+      for (let i = 0; i < stocksToCheck.length; i++) {
+            const stock = stocksToCheck[i]
             if (!isRunning) break // 중지되면 중단
             
             // 당일 최대매매종목수 체크
@@ -2651,6 +3290,17 @@ const AutoTrading = () => {
               continue // 이 종목은 더 이상 매매 불가
             }
             
+            // 매매제한 종목 체크 (이전에 매매제한으로 판단된 종목은 재시도하지 않음)
+            if (restrictedStocks.has(stock.code)) {
+              continue // 매매제한 종목은 건너뜀
+            }
+            
+            // 주문 처리 중인 종목 체크 (중복 주문 방지)
+            if (processingOrders.has(stock.code)) {
+              console.log(`[자동매수 건너뜀] ${stock.name} (${stock.code}): 이미 주문 처리 중입니다`)
+              continue // 이미 주문 처리 중인 종목은 건너뜀
+            }
+            
             // API 제한 방지를 위한 딜레이 (조건검색 직후에는 더 긴 딜레이)
             const timeSinceLastSearch = Date.now() - lastSearchTimeRef.current
             if (timeSinceLastSearch < 10000) {
@@ -2662,38 +3312,276 @@ const AutoTrading = () => {
             }
             
             // 차트 데이터 기반으로 매수 조건 확인 (차트 데이터를 우선적으로 사용)
-            if (await checkBuyConditions(stock)) {
+            const buyConditionResult = await checkBuyConditions(stock)
+            if (buyConditionResult) {
+              console.log(`[자동매수] ${stock.name}: 매수 조건 확인 완료, 주문 준비 시작`)
               try {
                 // 종목코드 검증: 6자리 숫자만 허용 (ELW, ETF 등 비표준 종목코드 제외)
                 const stockCode = String(stock.code).trim()
                 if (!/^\d{6}$/.test(stockCode)) {
                   addLog(`[자동매수 건너뜀] ${stock.name} (${stockCode}): 지원하지 않는 종목코드 형식 (6자리 숫자만 지원)`, 'warning')
+                  console.log(`[자동매수] ${stock.name}: 종목코드 형식 오류로 건너뜀`)
                   continue
                 }
                 
                 // 매수 수량 계산 (종목당 투자금액 기준)
                 const buyPrice = stock.price || 0
-                if (buyPrice <= 0) continue
+                if (buyPrice <= 0) {
+                  console.log(`[자동매수] ${stock.name}: 가격이 0 이하로 건너뜀 (가격: ${buyPrice})`)
+                  continue
+                }
                 
                 // 수수료 고려한 매수 수량 계산
                 const investmentAmount = amountPerStock
                 const feeRate = feePercent / 100
                 const availableAmount = investmentAmount * (1 - feeRate)
-                const quantity = Math.floor(availableAmount / buyPrice)
                 
-                if (quantity <= 0) continue
-
-                // 매수 주문 실행
-                const orderPrice = buyPrice + Math.floor(buyPrice * (basicBuy.buyPriceAdjustment / 100))
-                await kiwoomApi.placeOrder({
-                  code: stockCode,
-                  quantity: quantity,
-                  price: orderPrice, // 지정가 (현재가 + 조정%)
-                  order_type: 'buy',
-                  order_option: buyType === 'cash' ? '00' : '03', // 현금매수 또는 신용매수
-                  accountNo,
-                  accountProductCode,
+                // 종목별 매수가격 설정에 따른 매수 가격 결정 (C# 코드의 매수가격결정 메서드 참고)
+                // 기본값은 시장가로 설정하여 즉시 체결되도록 함
+                let orderPrice = buyPrice
+                let orderOption = '03' // 기본값: 시장가 (즉시 체결을 위해)
+                
+                if (buyPriceSettings.종목별매수가격설정실행) {
+                  if (buyPriceSettings.매수가격옵션 === '시장가') {
+                    // 시장가: 현재가 그대로 사용
+                    orderPrice = buyPrice
+                    orderOption = '03' // 시장가
+                  } else if (buyPriceSettings.매수가격옵션 === '지정가') {
+                    // 지정가: 매수호가 값 사용
+                    // C# 코드: 호가비율 = 매수호가 / 100.0, 매수희망가 = 현재가 * (1.0 - 호가비율)
+                    const 호가비율 = buyPriceSettings.매수호가 / 100.0
+                    orderPrice = Math.floor(buyPrice * (1.0 - 호가비율))
+                    
+                    // 지정가가 현재가보다 높으면 체결이 어려우므로 시장가로 변경
+                    if (orderPrice > buyPrice) {
+                      console.warn(`[주문 가격] ${stock.name}: 지정가(${orderPrice.toLocaleString()}원)가 현재가(${buyPrice.toLocaleString()}원)보다 높아 시장가로 변경`)
+                      orderPrice = buyPrice
+                      orderOption = '03' // 시장가로 변경
+                    } else {
+                      orderOption = '00' // 지정가
+                      console.log(`[주문 가격] ${stock.name}: 지정가 주문 (현재가: ${buyPrice.toLocaleString()}원, 호가비율: ${호가비율.toFixed(2)}%, 주문가격: ${orderPrice.toLocaleString()}원)`)
+                    }
+                  }
+                } else {
+                  // 설정이 비활성화된 경우 시장가 주문 사용 (즉시 체결을 위해)
+                  orderPrice = buyPrice
+                  orderOption = '03' // 시장가 (현금/신용 모두 시장가로 통일)
+                  console.log(`[주문 가격] ${stock.name}: 종목별매수가격설정 비활성화 - 시장가 주문 사용 (현재가: ${buyPrice.toLocaleString()}원)`)
+                }
+                
+                // 주문 수량 계산: (투자금액 * (1 - 수수료율)) / 주문가격
+                const quantity = Math.floor(availableAmount / orderPrice)
+                
+                // 주문 수량 계산 상세 로그
+                console.log(`[주문 수량 계산] ${stock.name}:`, {
+                  투자금액: `${investmentAmount.toLocaleString()}원`,
+                  수수료율: `${(feeRate * 100).toFixed(2)}%`,
+                  수수료제외금액: `${availableAmount.toLocaleString()}원`,
+                  현재가: `${buyPrice.toLocaleString()}원`,
+                  주문가격: `${orderPrice.toLocaleString()}원`,
+                  계산된수량: `${quantity}주`,
+                  총주문금액: `${(quantity * orderPrice).toLocaleString()}원`,
                 })
+                
+                if (quantity <= 0) {
+                  console.log(`[자동매수] ${stock.name}: 수량이 0 이하로 건너뜀 (수량: ${quantity}, 투자금액: ${investmentAmount}, 주문가격: ${orderPrice})`)
+                  addLog(`[자동매수 건너뜀] ${stock.name}: 수량 부족 (투자금액: ${investmentAmount.toLocaleString()}원, 주문가격: ${orderPrice.toLocaleString()}원)`, 'warning')
+                  continue
+                }
+
+                console.log(`[자동매수] ${stock.name}: 주문 전송 시작 (종목코드: ${stockCode}, 수량: ${quantity}, 가격: ${orderPrice}, 옵션: ${orderOption}, 계좌: ${accountNo})`)
+                
+                // 주문 API 요청 제한 방지: 마지막 주문 시간 확인
+                const timeSinceLastOrder = Date.now() - lastOrderTimeRef.current
+                if (timeSinceLastOrder < minOrderInterval) {
+                  const waitTime = minOrderInterval - timeSinceLastOrder
+                  console.log(`[주문 제한] 마지막 주문 후 ${timeSinceLastOrder}ms 경과, ${waitTime}ms 대기 후 주문 진행`)
+                  addLog(`[주문 제한] API 요청 제한 방지를 위해 ${Math.ceil(waitTime / 1000)}초 대기`, 'info')
+                  await new Promise(resolve => setTimeout(resolve, waitTime))
+                }
+                
+                // 주문 처리 중 상태로 표시 (중복 방지)
+                setProcessingOrders(prev => new Set(prev).add(stockCode))
+                
+                // 매수 주문 실행
+                let orderResult
+                try {
+                  orderResult = await kiwoomApi.placeOrder({
+                    code: stockCode,
+                    quantity: quantity,
+                    price: orderPrice,
+                    order_type: 'buy',
+                    order_option: orderOption,
+                    accountNo,
+                    accountProductCode,
+                  })
+                  console.log(`[자동매수] ${stock.name}: 주문 전송 완료`, orderResult)
+                  
+                  // 주문 성공 시 마지막 주문 시간 업데이트 (API 요청 제한 방지)
+                  lastOrderTimeRef.current = Date.now()
+                } catch (orderError: any) {
+                  // 에러 상세 정보 로깅 (항상 실행되도록 보장)
+                  const errorDetail = orderError.response?.data?.detail || orderError.response?.data?.error || orderError.message || '알 수 없는 오류'
+                  const errorCode = orderError.response?.data?.code || stockCode
+                  const isMockApiLimit = orderError.response?.data?.isMockApiLimit || false
+                  const isTradingRestricted = orderError.response?.data?.isTradingRestricted || false
+                  const statusCode = orderError.response?.status || 'N/A'
+                  
+                  // 상세 에러 로그 출력 (항상 실행)
+                  console.error(`[자동매수 실패] ${stock.name} (${stockCode}):`, {
+                    에러메시지: errorDetail,
+                    종목코드: errorCode,
+                    수량: quantity,
+                    가격: orderPrice,
+                    상태코드: statusCode,
+                    isMockApiLimit,
+                    isTradingRestricted,
+                    전체응답: orderError.response?.data,
+                    에러객체: orderError,
+                  })
+                  
+                  // 모의투자 환경 제한 에러인 경우 매매제한 종목으로 추가
+                  if (isMockApiLimit || 
+                      isTradingRestricted ||
+                      orderError.message?.includes('모의투자 환경 제한') ||
+                      orderError.message?.includes('매매제한 종목') ||
+                      orderError.message?.includes('RC4007') ||
+                      statusCode === 503) {
+                    setRestrictedStocks(prev => new Set(prev).add(stock.code))
+                    addLog(`[자동매수 건너뜀] ${stock.name}: 모의투자 매매 제한 종목 (${errorDetail})`, 'warning')
+                  } else {
+                    // 일반 에러인 경우에도 매매제한 종목으로 추가하여 재시도 방지
+                    setRestrictedStocks(prev => new Set(prev).add(stock.code))
+                    addLog(`[자동매수 실패] ${stock.name}: ${errorDetail} (상태코드: ${statusCode})`, 'error')
+                  }
+                  
+                  // 에러 발생 시 주문 처리 중 상태 해제
+                  setProcessingOrders(prev => {
+                    const updated = new Set(prev)
+                    updated.delete(stockCode)
+                    return updated
+                  })
+                  
+                  // 에러 발생 시 다음 종목으로 진행
+                  continue
+                }
+
+                // 주문 내역 즉시 갱신 (주문번호가 있는 경우)
+                if (orderResult?.orderNumber) {
+                  // 주문번호 중복 체크
+                  const orderNumber = orderResult.orderNumber
+                  const isMarketOrderValue = orderOption === '03' // 시장가 주문 여부 (스코프 밖에서 사용하기 위해 여기서 정의)
+                  
+                  setProcessedOrderNumbers(prev => {
+                    if (prev.has(orderNumber)) {
+                      console.log(`[주문 내역] 중복 주문번호 감지 - ${stock.name} (주문번호: ${orderNumber}) 이미 처리됨, 건너뜀`)
+                      // 주문 처리 중 상태 해제
+                      setProcessingOrders(prevOrders => {
+                        const updated = new Set(prevOrders)
+                        updated.delete(stockCode)
+                        return updated
+                      })
+                      return prev
+                    }
+                    const updated = new Set(prev).add(orderNumber)
+                    
+                    // 모의투자 환경에서는 주문 내역 조회 API가 실패하므로, 로컬 상태에 직접 추가
+                    const orderTimestamp = Date.now() // 주문 접수 시점 기록
+                    const newOrder: OrderLog = {
+                      id: Date.now(), // 고유 ID 생성
+                      date: new Date().toLocaleDateString('ko-KR'),
+                      time: new Date().toLocaleTimeString('ko-KR'),
+                      type: 'buy',
+                      stockName: stock.name,
+                      stockCode: stockCode,
+                      quantity: quantity,
+                      price: orderPrice,
+                      status: '접수', // 주문 접수 상태
+                      orderNumber: orderNumber,
+                      orderTimestamp, // 주문 접수 시점 기록
+                      isMarketOrder: isMarketOrderValue, // 시장가 주문 여부
+                    }
+                    
+                    // 주문 내역에 추가 (중복 체크: 주문번호 및 ID 기준)
+                    setOrderLogs(prevLogs => {
+                      // 이미 같은 주문번호가 있으면 추가하지 않음
+                      const existingOrder = prevLogs.find(o => o.orderNumber === newOrder.orderNumber)
+                      if (existingOrder) {
+                        console.log(`[주문 내역] 중복 주문 감지 - ${stock.name} (주문번호: ${newOrder.orderNumber}) 이미 존재함, 건너뜀`)
+                        return prevLogs
+                      }
+                      // 같은 ID가 있으면 추가하지 않음 (추가 안전장치)
+                      const existingById = prevLogs.find(o => o.id === newOrder.id)
+                      if (existingById) {
+                        console.log(`[주문 내역] 중복 ID 감지 - ${stock.name} (ID: ${newOrder.id}) 이미 존재함, 건너뜀`)
+                        return prevLogs
+                      }
+                      const updatedLogs = [newOrder, ...prevLogs]
+                      console.log(`[주문 내역] 로컬 상태에 주문 추가 완료 - 총 주문 개수: ${updatedLogs.length}`, newOrder)
+                      
+                      // C# 코드와 동일: 매수 주문 성공 시 매수주문했거나보유중인종목에 추가
+                      setOrderedOrHoldingStocks(prev => new Set(prev).add(stockCode))
+                      console.log(`[보유 종목 관리] ${stock.name} (${stockCode}): 매수 주문 성공 - 매수주문했거나보유중인종목에 추가`)
+                      return updatedLogs
+                    })
+                    
+                    // 주문한 종목을 검색된 종목에서 제거 (중복 제거 방지)
+                    setDetectedStocks(prevStocks => {
+                      // 이미 제거되었는지 확인
+                      const exists = prevStocks.some(s => s.code === stockCode)
+                      if (!exists) {
+                        console.log(`[검색된 종목] 이미 제거됨 - ${stock.name} (${stockCode}), 건너뜀`)
+                        return prevStocks
+                      }
+                      const filtered = prevStocks.filter(s => s.code !== stockCode)
+                      console.log(`[검색된 종목] 주문한 종목 제거 - ${stock.name} (${stockCode}) 제거됨, 남은 종목: ${filtered.length}개`)
+                      return filtered
+                    })
+                    
+                    // 주문 처리 중 상태 해제
+                    setProcessingOrders(prevOrders => {
+                      const updated = new Set(prevOrders)
+                      updated.delete(stockCode)
+                      return updated
+                    })
+                    
+                    return updated
+                  })
+                  
+                  // 시장가 매수 주문은 즉시 체결되어야 하므로, 주문 후 즉시 보유종목 조회하여 체결 확인
+                  if (isMarketOrderValue) {
+                    console.log(`[시장가 매수] ${stock.name}: 즉시 체결 확인을 위한 보유종목 조회 실행 (주문번호: ${orderNumber})`)
+                    // 시장가 매수는 즉시 체결되므로 여러 번 보유종목 조회 (체결 확인을 위해)
+                    // 1초, 2초, 3초 후 각각 조회하여 체결 여부 확인
+                    const checkExecution = async (delay: number, attempt: number) => {
+                      setTimeout(async () => {
+                        try {
+                          console.log(`[시장가 매수] ${stock.name}: 보유종목 조회 시도 ${attempt}회 (${delay}ms 후)`)
+                          const result = await refetchBalance()
+                          console.log(`[시장가 매수] ${stock.name}: 보유종목 조회 완료 ${attempt}회 - 체결 여부 확인됨`, result)
+                        } catch (error) {
+                          console.error(`[시장가 매수] ${stock.name}: 보유종목 조회 실패 ${attempt}회`, error)
+                        }
+                      }, delay)
+                    }
+                    
+                    // 여러 번 조회하여 체결 확인 (1초, 2초, 3초 후)
+                    checkExecution(1000, 1)
+                    checkExecution(2000, 2)
+                    checkExecution(3000, 3)
+                  } else {
+                    // 지정가 주문은 체결까지 시간이 걸릴 수 있으므로 주기적 조회에 의존
+                    console.log(`[지정가 매수] ${stock.name}: 주기적 보유종목 조회에 의존 (주문번호: ${orderNumber})`)
+                  }
+                  
+                  // 모의투자 환경에서는 주문 내역 조회 API가 실패하므로 refetch 호출하지 않음
+                  // (refetch하면 빈 배열이 반환되어 기존 주문이 사라질 수 있음)
+                  // 실전 환경에서는 아래 주석을 해제하여 주문 내역 조회
+                  // setTimeout(() => {
+                  //   refetchOrders()
+                  //   queryClient.invalidateQueries(['orders', selectedAccount])
+                  // }, 1000)
+                }
 
                 // 매매 횟수 업데이트
                 setStockTradeCounts(prev => {
@@ -2708,22 +3596,29 @@ const AutoTrading = () => {
                   setDailyTradeCount(prev => prev + 1)
                 }
 
-                addLog(`[자동매수] ${stock.name} ${quantity}주 매수 주문 (${orderPrice.toLocaleString()}원, 매매횟수: ${tradeCount + 1}/${tradeLimitPerStock})`, 'success')
+                const priceTypeText = buyPriceSettings.종목별매수가격설정실행 
+                  ? (buyPriceSettings.매수가격옵션 === '시장가' ? '시장가' : `지정가(${orderPrice.toLocaleString()}원)`)
+                  : `지정가(${orderPrice.toLocaleString()}원)`
+                addLog(`[자동매수] ${stock.name} ${quantity}주 매수 주문 (${priceTypeText}, 주문번호: ${orderResult?.orderNumber || 'N/A'}, 매매횟수: ${tradeCount + 1}/${tradeLimitPerStock})`, 'success')
                 
                 // API 호출 제한을 위한 딜레이
                 await new Promise(resolve => setTimeout(resolve, 500))
               } catch (error: any) {
                 // 모의투자 환경 제한 에러인 경우 경고로 처리
-                if (error.response?.data?.isMockApiLimit || error.message?.includes('모의투자 환경 제한')) {
-                  addLog(`[자동매수 건너뜀] ${stock.name}: 모의투자 환경에서 주문 제한됨`, 'warning')
+                const errorMessage = error.message || error.response?.data?.detail || '알 수 없는 오류'
+                if (error.response?.data?.isMockApiLimit || 
+                    error.message?.includes('모의투자 환경 제한') ||
+                    error.message?.includes('매매제한 종목') ||
+                    error.message?.includes('RC4007')) {
+                  // 매매제한 종목으로 판단된 경우 Set에 추가하여 재시도 방지
+                  setRestrictedStocks(prev => new Set(prev).add(stock.code))
+                  addLog(`[자동매수 건너뜀] ${stock.name}: 모의투자 매매 제한 종목 (재시도 안 함)`, 'warning')
                 } else {
-                  addLog(`[자동매수 실패] ${stock.name}: ${error.message}`, 'error')
+                  addLog(`[자동매수 실패] ${stock.name}: ${errorMessage}`, 'error')
                 }
               }
             }
           }
-        }
-      }
 
       // 3. 보유 종목 매도 조건 확인 및 실행
       for (const holding of holdingStocks) {
@@ -2771,8 +3666,17 @@ const AutoTrading = () => {
               continue
             }
 
+            // 주문 API 요청 제한 방지: 마지막 주문 시간 확인
+            const timeSinceLastOrder = Date.now() - lastOrderTimeRef.current
+            if (timeSinceLastOrder < minOrderInterval) {
+              const waitTime = minOrderInterval - timeSinceLastOrder
+              console.log(`[주문 제한] 마지막 주문 후 ${timeSinceLastOrder}ms 경과, ${waitTime}ms 대기 후 주문 진행`)
+              addLog(`[주문 제한] API 요청 제한 방지를 위해 ${Math.ceil(waitTime / 1000)}초 대기`, 'info')
+              await new Promise(resolve => setTimeout(resolve, waitTime))
+            }
+
             // 매도 주문 실행
-            await kiwoomApi.placeOrder({
+            const sellOrderResult = await kiwoomApi.placeOrder({
               code: stockCode,
               quantity: holding.quantity,
               price: sellPrice,
@@ -2781,6 +3685,57 @@ const AutoTrading = () => {
               accountNo,
               accountProductCode,
             })
+            
+            // 주문 성공 시 마지막 주문 시간 업데이트 (API 요청 제한 방지)
+            lastOrderTimeRef.current = Date.now()
+
+            // 주문 내역 즉시 갱신
+            if (sellOrderResult?.orderNumber) {
+              // 모의투자 환경에서는 주문 내역 조회 API가 실패하므로, 로컬 상태에 직접 추가
+              const orderTimestamp = Date.now() // 주문 접수 시점 기록
+              const isMarketOrder = orderOption === '03' // 시장가 주문 여부
+              const newOrder: OrderLog = {
+                id: Date.now(),
+                date: new Date().toLocaleDateString('ko-KR'),
+                time: new Date().toLocaleTimeString('ko-KR'),
+                type: 'sell',
+                stockName: holding.name,
+                stockCode: stockCode,
+                quantity: holding.quantity,
+                price: sellPrice,
+                status: '접수',
+                orderNumber: sellOrderResult.orderNumber,
+                orderTimestamp, // 주문 접수 시점 기록
+                isMarketOrder, // 시장가 주문 여부
+              }
+              
+              setOrderLogs(prev => {
+                const updated = [newOrder, ...prev]
+                console.log(`[주문 내역] 로컬 상태에 매도 주문 추가 완료 - 총 주문 개수: ${updated.length}`, newOrder)
+                return updated
+              })
+              
+              // C# 코드와 동일: 매도 주문 성공 시 매수주문했거나보유중인종목에서 제거
+              // (실제로는 계좌 조회 시 보유 수량이 0이 되면 자동으로 제거되지만, 명시적으로 제거)
+              setDetectedStocks(prev => prev.map(stock => 
+                stock.code === stockCode
+                  ? { ...stock, isHolding: false }
+                  : stock
+              ))
+              
+              // 매도 주문 성공 시 orderedOrHoldingStocks에서 제거 (보유 수량이 0이 되면 제거)
+              setOrderedOrHoldingStocks(prev => {
+                const updated = new Set(prev)
+                updated.delete(stockCode)
+                return updated
+              })
+              
+              // 모의투자 환경에서는 주문 내역 조회 API가 실패하므로 refetch 호출하지 않음
+              // setTimeout(() => {
+              //   refetchOrders()
+              //   queryClient.invalidateQueries(['orders', selectedAccount])
+              // }, 1000)
+            }
 
             const priceType = sellPrice === 0 ? '시장가' : `지정가(${sellPrice.toLocaleString()}원)`
             addLog(`[자동매도] ${holding.name} ${holding.quantity}주 매도 주문 (${priceType}, 수익률: ${holding.profitPercent.toFixed(2)}%)`, 'success')
@@ -2789,10 +3744,14 @@ const AutoTrading = () => {
             await new Promise(resolve => setTimeout(resolve, 500))
           } catch (error: any) {
             // 모의투자 환경 제한 에러인 경우 경고로 처리
-            if (error.response?.data?.isMockApiLimit || error.message?.includes('모의투자 환경 제한')) {
-              addLog(`[자동매도 건너뜀] ${holding.name}: 모의투자 환경에서 주문 제한됨`, 'warning')
+            const errorMessage = error.message || error.response?.data?.detail || '알 수 없는 오류'
+            if (error.response?.data?.isMockApiLimit || 
+                error.message?.includes('모의투자 환경 제한') ||
+                error.message?.includes('매매제한 종목') ||
+                error.message?.includes('RC4007')) {
+              addLog(`[자동매도 건너뜀] ${holding.name}: 모의투자 매매 제한 종목`, 'warning')
             } else {
-              addLog(`[자동매도 실패] ${holding.name}: ${error.message}`, 'error')
+              addLog(`[자동매도 실패] ${holding.name}: ${errorMessage}`, 'error')
             }
           }
         }
@@ -2818,10 +3777,11 @@ const AutoTrading = () => {
     const timeoutId = window.setTimeout(() => {
       executeAutoTrading()
       
-      // 이후 10초마다 실행 (조건식 검색 + 매수/매도 체크)
+      // 이후 30초마다 실행 (조건식 검색 + 매수/매도 체크)
+      // API 제한을 고려하여 주기를 늘림 (10초 -> 30초)
       intervalId = window.setInterval(() => {
         executeAutoTrading()
-      }, 10000) // 10초마다
+      }, 30000) // 30초마다
     }, 2000) // 첫 실행은 2초 후
 
     return () => {
@@ -2843,6 +3803,7 @@ const AutoTrading = () => {
         setStockTradeCounts(new Map())
         setDailyTradedStocks(new Set())
         setDailyTradeCount(0)
+        setRestrictedStocks(new Set()) // 매매제한 종목 목록도 초기화
         localStorage.setItem('lastTradeDate', today)
         addLog('새로운 거래일 시작 - 매매 통계 초기화', 'info')
       }
@@ -2884,7 +3845,16 @@ const AutoTrading = () => {
           const accountNo = accountParts[0] || selectedAccount
           const accountProductCode = accountParts[1] || '01'
 
-          await kiwoomApi.placeOrder({
+          // 주문 API 요청 제한 방지: 마지막 주문 시간 확인
+          const timeSinceLastOrder = Date.now() - lastOrderTimeRef.current
+          if (timeSinceLastOrder < minOrderInterval) {
+            const waitTime = minOrderInterval - timeSinceLastOrder
+            console.log(`[주문 제한] 마지막 주문 후 ${timeSinceLastOrder}ms 경과, ${waitTime}ms 대기 후 주문 진행`)
+            addLog(`[주문 제한] API 요청 제한 방지를 위해 ${Math.ceil(waitTime / 1000)}초 대기`, 'info')
+            await new Promise(resolve => setTimeout(resolve, waitTime))
+          }
+
+          const sellAllOrderResult = await kiwoomApi.placeOrder({
             code: stockCode,
             quantity: stock.quantity,
             price: 0, // 시장가
@@ -2893,16 +3863,70 @@ const AutoTrading = () => {
             accountNo,
             accountProductCode,
           })
+          
+          // 주문 성공 시 마지막 주문 시간 업데이트 (API 요청 제한 방지)
+          lastOrderTimeRef.current = Date.now()
+
+          // 주문 내역 즉시 갱신
+          if (sellAllOrderResult?.orderNumber) {
+            // 모의투자 환경에서는 주문 내역 조회 API가 실패하므로, 로컬 상태에 직접 추가
+            const orderTimestamp = Date.now() // 주문 접수 시점 기록
+            const isMarketOrder = true // 전량매도는 항상 시장가
+            const newOrder: OrderLog = {
+              id: Date.now(),
+              date: new Date().toLocaleDateString('ko-KR'),
+              time: new Date().toLocaleTimeString('ko-KR'),
+              type: 'sell',
+              stockName: stock.name,
+              stockCode: stockCode,
+              quantity: stock.quantity,
+              price: 0, // 시장가
+              status: '접수',
+              orderNumber: sellAllOrderResult.orderNumber,
+              orderTimestamp, // 주문 접수 시점 기록
+              isMarketOrder, // 시장가 주문 여부
+            }
+            
+            setOrderLogs(prev => {
+              const updated = [newOrder, ...prev]
+              console.log(`[주문 내역] 로컬 상태에 전량매도 주문 추가 완료 - 총 주문 개수: ${updated.length}`, newOrder)
+              return updated
+            })
+            
+            // C# 코드와 동일: 전량매도 주문 성공 시 매수주문했거나보유중인종목에서 제거
+            setDetectedStocks(prev => prev.map(s => 
+              s.code === stockCode
+                ? { ...s, isHolding: false }
+                : s
+            ))
+            
+            // 전량매도 주문 성공 시 orderedOrHoldingStocks에서 제거
+            setOrderedOrHoldingStocks(prev => {
+              const updated = new Set(prev)
+              updated.delete(stockCode)
+              return updated
+            })
+            
+            // 모의투자 환경에서는 주문 내역 조회 API가 실패하므로 refetch 호출하지 않음
+            // setTimeout(() => {
+            //   refetchOrders()
+            //   queryClient.invalidateQueries(['orders', selectedAccount])
+            // }, 1000)
+          }
 
           successCount++
           addLog(`${stock.name} 전량매도 주문 전송`, 'success')
           await new Promise(resolve => setTimeout(resolve, 100))
         } catch (error: any) {
           // 모의투자 환경 제한 에러인 경우 경고로 처리
-          if (error.response?.data?.isMockApiLimit || error.message?.includes('모의투자 환경 제한')) {
-            addLog(`${stock.name} 전량매도 건너뜀: 모의투자 환경에서 주문 제한됨`, 'warning')
+          const errorMessage = error.message || error.response?.data?.detail || '알 수 없는 오류'
+          if (error.response?.data?.isMockApiLimit || 
+              error.message?.includes('모의투자 환경 제한') ||
+              error.message?.includes('매매제한 종목') ||
+              error.message?.includes('RC4007')) {
+            addLog(`${stock.name} 전량매도 건너뜀: 모의투자 매매 제한 종목`, 'warning')
           } else {
-            addLog(`${stock.name} 매도 실패: ${error.message}`, 'error')
+            addLog(`${stock.name} 매도 실패: ${errorMessage}`, 'error')
           }
         }
       }
@@ -2930,6 +3954,129 @@ const AutoTrading = () => {
       addLog(`미체결 주문 취소 실패: ${error.message}`, 'error')
     }
   }
+
+  // 주문 접수 후 20초가 지난 미체결 주문 자동 취소
+  useEffect(() => {
+    if (!isRunning) {
+      return
+    }
+
+    // 5초마다 미체결 주문 확인
+    const checkInterval = setInterval(() => {
+      const now = Date.now()
+      const timeoutMs = 30000 // 30초로 연장 (체결 확인 시간 확보)
+
+      setOrderLogs(prev => {
+        const ordersToCancel = prev.filter(order => {
+          // 미체결 주문이고, 주문 접수 시점이 30초 이상 지난 경우
+          if (!order.orderTimestamp) {
+            return false // orderTimestamp가 없으면 취소 대상에서 제외
+          }
+          
+          const isUnfilled = order.status === '접수' || order.status === '확인' || order.status === '미체결'
+          const elapsedTime = now - order.orderTimestamp
+          const shouldCancel = isUnfilled && elapsedTime >= timeoutMs
+
+          if (shouldCancel) {
+            console.log(`[자동 취소] ${order.stockName} 주문 취소 (경과 시간: ${Math.floor(elapsedTime / 1000)}초)`)
+            addLog(`[자동 취소] ${order.stockName} ${order.quantity}주 ${order.type === 'buy' ? '매수' : '매도'} 주문 취소 (${Math.floor(elapsedTime / 1000)}초 경과)`, 'warning')
+          }
+
+          return shouldCancel
+        })
+
+        if (ordersToCancel.length === 0) {
+          return prev // 취소할 주문이 없으면 변경 없음
+        }
+
+        // 취소할 주문들의 상태를 '취소'로 변경하고 취소 시점 기록
+        const cancelTimestamp = Date.now()
+        const updated = prev.map(order => {
+          const shouldCancel = ordersToCancel.some(cancelOrder => cancelOrder.id === order.id)
+          if (shouldCancel) {
+            return {
+              ...order,
+              status: '취소',
+              type: 'cancel' as const,
+              cancelTimestamp, // 취소 시점 기록
+            }
+          }
+          return order
+        })
+
+        console.log(`[자동 취소] ${ordersToCancel.length}건의 미체결 주문 취소 처리 완료`)
+        return updated
+      })
+    }, 5000) // 5초마다 확인
+
+    return () => {
+      clearInterval(checkInterval)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRunning]) // isRunning만 의존성으로 사용 (함수형 업데이트로 최신 상태 참조)
+
+  // 취소된 주문을 20초 후 자동 삭제
+  useEffect(() => {
+    if (!isRunning) {
+      return
+    }
+
+    // 5초마다 취소된 주문 확인
+    const deleteInterval = setInterval(() => {
+      const now = Date.now()
+      const deleteTimeoutMs = 20000 // 20초
+
+      setOrderLogs(prev => {
+        const ordersToDelete = prev.filter(order => {
+          // 취소된 주문이고, 취소 시점이 20초 이상 지난 경우
+          if (order.status !== '취소' && order.type !== 'cancel') {
+            return false // 취소된 주문이 아니면 삭제 대상에서 제외
+          }
+          
+          if (!order.cancelTimestamp) {
+            // cancelTimestamp가 없으면 orderTimestamp를 기준으로 판단 (하위 호환성)
+            if (!order.orderTimestamp) {
+              return false
+            }
+            // 취소 시점을 알 수 없으므로, 주문 접수 시점 기준으로 40초 경과 시 삭제 (취소까지 20초 + 삭제까지 20초)
+            const elapsedTime = now - order.orderTimestamp
+            return elapsedTime >= 40000
+          }
+          
+          const elapsedTime = now - order.cancelTimestamp
+          const shouldDelete = elapsedTime >= deleteTimeoutMs
+
+          if (shouldDelete) {
+            console.log(`[자동 삭제] ${order.stockName} 취소 주문 삭제 (취소 후 경과 시간: ${Math.floor(elapsedTime / 1000)}초)`)
+          }
+
+          return shouldDelete
+        })
+
+        if (ordersToDelete.length === 0) {
+          return prev // 삭제할 주문이 없으면 변경 없음
+        }
+
+        // 취소된 주문 삭제
+        const updated = prev.filter(order => {
+          const shouldDelete = ordersToDelete.some(deleteOrder => deleteOrder.id === order.id)
+          return !shouldDelete
+        })
+
+        console.log(`[자동 삭제] ${ordersToDelete.length}건의 취소 주문 삭제 완료`)
+        return updated
+      })
+    }, 5000) // 5초마다 확인
+
+    return () => {
+      clearInterval(deleteInterval)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRunning]) // isRunning만 의존성으로 사용 (함수형 업데이트로 최신 상태 참조)
+
+  // 시장가 주문 자동 체결 처리 제거 - 실제 보유 종목 조회를 통해서만 체결 확인
+  // 시장가 주문도 실제로 보유 종목에 나타날 때만 체결로 처리하도록 변경
+  // (이전의 자동 체결 처리는 제거하고 보유 종목 조회 로직만 사용)
 
   // 계좌 갱신
   const handleRefreshAccount = async () => {
@@ -3052,8 +4199,141 @@ const AutoTrading = () => {
           setFeePercent(parsed)
         }
       }
+      
+      // 종목별 매수가격 설정 로드 (priceSettings 우선, 없으면 tradingConditions에서)
+      const savedPriceSettings = localStorage.getItem('priceSettings')
+      if (savedPriceSettings) {
+        try {
+          const parsed = JSON.parse(savedPriceSettings)
+          if (parsed.종목별매수가격설정실행 !== undefined) {
+            setBuyPriceSettings({
+              종목별매수가격설정실행: parsed.종목별매수가격설정실행 ?? true,
+              매수가격옵션: parsed.매수가격옵션 === '시장가' ? '시장가' : '지정가',
+              매수호가: parsed.매수호가 ?? 0,
+            })
+          }
+        } catch (e) {
+          console.error('종목별 매수가격 설정 파싱 오류:', e)
+        }
+      } else {
+        // priceSettings가 없으면 tradingConditions에서 로드 (하위 호환성)
+        const savedTradingConditions = localStorage.getItem('tradingConditions')
+        if (savedTradingConditions) {
+          try {
+            const parsed = JSON.parse(savedTradingConditions)
+            if (parsed.종목별매수가격설정실행 !== undefined) {
+              setBuyPriceSettings({
+                종목별매수가격설정실행: parsed.종목별매수가격설정실행 ?? true,
+                매수가격옵션: parsed.매수가격옵션 === '시장가' ? '시장가' : '지정가',
+                매수호가: parsed.매수호가 ?? 0,
+              })
+            }
+          } catch (e) {
+            console.error('종목별 매수가격 설정 파싱 오류:', e)
+          }
+        }
+      }
+      
+      // 매매시간 설정 로드
+      const savedTradingTime = localStorage.getItem('tradingTime')
+      if (savedTradingTime) {
+        try {
+          const parsed = JSON.parse(savedTradingTime)
+          if (parsed.시작시 !== undefined) setStartHour(parsed.시작시)
+          if (parsed.시작분 !== undefined) setStartMinute(parsed.시작분)
+          if (parsed.종료시 !== undefined) setEndHour(parsed.종료시)
+          if (parsed.종료분 !== undefined) setEndMinute(parsed.종료분)
+          if (parsed.종료초 !== undefined) setEndSecond(parsed.종료초)
+          if (parsed.목표시간도달시보유종목전량매도 !== undefined) setDropSellTime(parsed.목표시간도달시보유종목전량매도)
+          if (parsed.목표시 !== undefined) setDropSellStartHour(parsed.목표시)
+          if (parsed.목표분 !== undefined) setDropSellStartMinute(parsed.목표분)
+          if (parsed.목표초 !== undefined) setDropSellEndSecond(parsed.목표초)
+        } catch (e) {
+          console.error('매매시간 설정 파싱 오류:', e)
+        }
+      }
+      
+      // 매도 가격지정 설정 로드
+      const savedSellPriceSettings = localStorage.getItem('sellPriceSettings')
+      if (savedSellPriceSettings) {
+        try {
+          const parsed = JSON.parse(savedSellPriceSettings)
+          if (parsed.익절목표수익률 !== undefined) setProfitTarget(parsed.익절목표수익률)
+          if (parsed.익절주문옵션 !== undefined) setProfitType(parsed.익절주문옵션 === 'market' ? 'market' : 'limit')
+          if (parsed.손절기준손실률 !== undefined) setLossLimit(parsed.손절기준손실률)
+          if (parsed.손절주문옵션 !== undefined) setLossType(parsed.손절주문옵션 === 'market' ? 'market' : 'limit')
+          if (parsed.매도호가 !== undefined) setLossPriceOffset(parsed.매도호가)
+        } catch (e) {
+          console.error('매도 가격지정 설정 파싱 오류:', e)
+        }
+      }
+      
+      // 기타조건 설정 로드
+      const savedOtherConditions = localStorage.getItem('otherConditions')
+      if (savedOtherConditions) {
+        try {
+          const parsed = JSON.parse(savedOtherConditions)
+          if (parsed.프로그램실행시자동시작 !== undefined) setAutoStart(parsed.프로그램실행시자동시작)
+          if (parsed.Trailing매도조건설정실행 !== undefined) setTrailingStop(parsed.Trailing매도조건설정실행)
+          if (parsed.매도감시기준수익률 !== undefined) setTrailingProfitThreshold(parsed.매도감시기준수익률)
+          if (parsed.최고수익률대비하락률 !== undefined) setTrailingDropThreshold(parsed.최고수익률대비하락률)
+        } catch (e) {
+          console.error('기타조건 설정 파싱 오류:', e)
+        }
+      }
     } catch (error) {
       console.error('매매설정 로드 오류:', error)
+    }
+  }, [])
+  
+  // TradingSettings에서 설정이 변경될 때 실시간으로 반영
+  useEffect(() => {
+    const handleStorageChange = () => {
+      // priceSettings 우선 확인
+      const savedPriceSettings = localStorage.getItem('priceSettings')
+      if (savedPriceSettings) {
+        try {
+          const parsed = JSON.parse(savedPriceSettings)
+          if (parsed.종목별매수가격설정실행 !== undefined) {
+            setBuyPriceSettings({
+              종목별매수가격설정실행: parsed.종목별매수가격설정실행 ?? true,
+              매수가격옵션: parsed.매수가격옵션 === '시장가' ? '시장가' : '지정가',
+              매수호가: parsed.매수호가 ?? 0,
+            })
+            return
+          }
+        } catch (e) {
+          console.error('종목별 매수가격 설정 파싱 오류:', e)
+        }
+      }
+      
+      // priceSettings가 없으면 tradingConditions에서 확인 (하위 호환성)
+      const savedTradingConditions = localStorage.getItem('tradingConditions')
+      if (savedTradingConditions) {
+        try {
+          const parsed = JSON.parse(savedTradingConditions)
+          if (parsed.종목별매수가격설정실행 !== undefined) {
+            setBuyPriceSettings({
+              종목별매수가격설정실행: parsed.종목별매수가격설정실행 ?? true,
+              매수가격옵션: parsed.매수가격옵션 === '시장가' ? '시장가' : '지정가',
+              매수호가: parsed.매수호가 ?? 0,
+            })
+          }
+        } catch (e) {
+          console.error('종목별 매수가격 설정 파싱 오류:', e)
+        }
+      }
+    }
+    
+    // storage 이벤트 리스너 등록 (다른 탭에서 변경 시)
+    window.addEventListener('storage', handleStorageChange)
+    
+    // 주기적으로 확인 (같은 탭에서 변경 시)
+    const interval = setInterval(handleStorageChange, 1000)
+    
+    return () => {
+      window.removeEventListener('storage', handleStorageChange)
+      clearInterval(interval)
     }
   }, [])
 
@@ -3065,10 +4345,56 @@ const AutoTrading = () => {
       localStorage.setItem('tradeLimitPerStock', tradeLimitPerStock.toString())
       localStorage.setItem('maxDailyStocks', maxDailyStocks.toString())
       localStorage.setItem('feePercent', feePercent.toString())
+      
+      // 종목별 매수가격 설정 저장
+      const priceSettings = {
+        종목별매수가격설정실행: buyPriceSettings.종목별매수가격설정실행,
+        매수가격옵션: buyPriceSettings.매수가격옵션,
+        매수호가: buyPriceSettings.매수호가,
+      }
+      localStorage.setItem('priceSettings', JSON.stringify(priceSettings))
+      
+      // 매매시간 설정 저장
+      const tradingTime = {
+        시작시: startHour,
+        시작분: startMinute,
+        종료시: endHour,
+        종료분: endMinute,
+        종료초: endSecond,
+        목표시간도달시보유종목전량매도: dropSellTime,
+        목표시: dropSellStartHour,
+        목표분: dropSellStartMinute,
+        목표초: dropSellEndSecond,
+      }
+      localStorage.setItem('tradingTime', JSON.stringify(tradingTime))
+      
+      // 매도 가격지정 설정 저장
+      const sellPriceSettings = {
+        익절목표수익률: profitTarget,
+        익절주문옵션: profitType,
+        손절기준손실률: lossLimit,
+        손절주문옵션: lossType,
+        매도호가: lossPriceOffset,
+      }
+      localStorage.setItem('sellPriceSettings', JSON.stringify(sellPriceSettings))
+      
+      // 기타조건 설정 저장
+      const otherConditions = {
+        프로그램실행시자동시작: autoStart,
+        Trailing매도조건설정실행: trailingStop,
+        매도감시기준수익률: trailingProfitThreshold,
+        최고수익률대비하락률: trailingDropThreshold,
+      }
+      localStorage.setItem('otherConditions', JSON.stringify(otherConditions))
     } catch (error) {
       console.error('매매설정 저장 오류:', error)
     }
-  }, [amountPerStock, maxSimultaneousBuy, tradeLimitPerStock, maxDailyStocks, feePercent])
+  }, [
+    amountPerStock, maxSimultaneousBuy, tradeLimitPerStock, maxDailyStocks, feePercent, buyPriceSettings,
+    startHour, startMinute, endHour, endMinute, endSecond, dropSellTime, dropSellStartHour, dropSellStartMinute, dropSellEndSecond,
+    profitTarget, profitType, lossLimit, lossType, lossPriceOffset,
+    autoStart, trailingStop, trailingProfitThreshold, trailingDropThreshold
+  ])
 
   // 알고리즘 설정값 localStorage에서 로드
   useEffect(() => {
@@ -3770,46 +5096,53 @@ const AutoTrading = () => {
                     </tr>
                   </thead>
                   <tbody>
-                    {orderLogs.length > 0 ? (
-                      orderLogs.map((order) => (
-                        <tr
-                          key={order.id} 
-                          style={{ cursor: 'pointer', backgroundColor: theme === 'dark' ? '#1f2937' : 'white' }}
-                          onMouseEnter={(e) => {
-                            e.currentTarget.style.backgroundColor = theme === 'dark' ? '#374151' : '#f9fafb'
-                          }}
-                          onMouseLeave={(e) => {
-                            e.currentTarget.style.backgroundColor = theme === 'dark' ? '#1f2937' : 'white'
-                          }}
-                        >
-                          <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{order.time}</td>
-                          <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{order.stockName}</td>
-                          <td style={{ 
+                    {(() => {
+                      // 취소된 주문 제외 (구분이 '취소'인 주문 필터링)
+                      const filteredOrders = orderLogs.filter(order => 
+                        order.type !== 'cancel' && order.status !== '취소'
+                      )
+                      
+                      return filteredOrders.length > 0 ? (
+                        filteredOrders.map((order) => (
+                          <tr
+                            key={order.id} 
+                            style={{ cursor: 'pointer', backgroundColor: theme === 'dark' ? '#1f2937' : 'white' }}
+                            onMouseEnter={(e) => {
+                              e.currentTarget.style.backgroundColor = theme === 'dark' ? '#374151' : '#f9fafb'
+                            }}
+                            onMouseLeave={(e) => {
+                              e.currentTarget.style.backgroundColor = theme === 'dark' ? '#1f2937' : 'white'
+                            }}
+                          >
+                            <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{order.time}</td>
+                            <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{order.stockName}</td>
+                            <td style={{ 
+                              border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
+                              padding: '4px 8px', 
+                              textAlign: 'center',
+                              color: order.type === 'buy' ? '#dc2626' : '#2563eb'
+                            }}>
+                              {order.type === 'buy' ? '매수' : order.type === 'sell' ? '매도' : '취소'}
+                            </td>
+                            <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{order.quantity.toLocaleString()}</td>
+                            <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{order.price.toLocaleString()}</td>
+                            <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'center', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{order.status}</td>
+                          </tr>
+                        ))
+                      ) : (
+                        <tr>
+                          <td colSpan={6} style={{ 
                             border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
-                            padding: '4px 8px', 
-                            textAlign: 'center',
-                            color: order.type === 'buy' ? '#dc2626' : '#2563eb'
+                            padding: '16px', 
+                            textAlign: 'center', 
+                            color: theme === 'dark' ? '#9ca3af' : '#6b7280', 
+                            backgroundColor: theme === 'dark' ? '#1f2937' : '#f9fafb' 
                           }}>
-                            {order.type === 'buy' ? '매수' : order.type === 'sell' ? '매도' : '취소'}
+                            주문 내역이 없습니다
                           </td>
-                          <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{order.quantity.toLocaleString()}</td>
-                          <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{order.price.toLocaleString()}</td>
-                          <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'center', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{order.status}</td>
                         </tr>
-                      ))
-                    ) : (
-                      <tr>
-                        <td colSpan={6} style={{ 
-                          border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
-                          padding: '16px', 
-                          textAlign: 'center', 
-                          color: theme === 'dark' ? '#9ca3af' : '#6b7280', 
-                          backgroundColor: theme === 'dark' ? '#1f2937' : '#f9fafb' 
-                        }}>
-                          주문 내역이 없습니다
-                        </td>
-                      </tr>
-                    )}
+                      )
+                    })()}
                   </tbody>
                 </table>
               </div>
@@ -4627,6 +5960,56 @@ const AutoTrading = () => {
                         WebkitTextFillColor: 'transparent',
                         backgroundClip: 'text',
                         color: theme === 'dark' ? '#f3f4f6' : '#111827',
+                        width: `${columnWidths.algorithm}px`,
+                        position: 'relative',
+                        userSelect: 'none'
+                      }}>
+                        알고리즘
+                        <div
+                          onMouseDown={(e) => handleResizeStart('algorithm', e)}
+                          style={{
+                            position: 'absolute',
+                            right: '-3px',
+                            top: 0,
+                            bottom: 0,
+                            width: '6px',
+                            cursor: 'col-resize',
+                            backgroundColor: resizingColumn === 'algorithm' 
+                              ? '#3b82f6' 
+                              : theme === 'dark' 
+                                ? 'rgba(255, 255, 255, 0.2)' 
+                                : 'rgba(0, 0, 0, 0.1)',
+                            zIndex: 1,
+                            transition: 'background-color 0.2s'
+                          }}
+                          onMouseEnter={(e) => {
+                            if (resizingColumn !== 'algorithm') {
+                              (e.currentTarget as HTMLElement).style.backgroundColor = theme === 'dark' 
+                                ? 'rgba(59, 130, 246, 0.5)' 
+                                : 'rgba(59, 130, 246, 0.3)'
+                            }
+                          }}
+                          onMouseLeave={(e) => {
+                            if (resizingColumn !== 'algorithm') {
+                              (e.currentTarget as HTMLElement).style.backgroundColor = theme === 'dark' 
+                                ? 'rgba(255, 255, 255, 0.2)' 
+                                : 'rgba(0, 0, 0, 0.1)'
+                            }
+                          }}
+                        />
+                      </th>
+                      <th style={{ 
+                        border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
+                        padding: '2px 6px', 
+                        textAlign: 'left', 
+                        fontWeight: 'normal',
+                        backgroundImage: theme === 'dark' 
+                          ? 'linear-gradient(135deg, #f3f4f6 0%, #d1d5db 100%)'
+                          : 'linear-gradient(135deg, #111827 0%, #374151 100%)',
+                        WebkitBackgroundClip: 'text',
+                        WebkitTextFillColor: 'transparent',
+                        backgroundClip: 'text',
+                        color: theme === 'dark' ? '#f3f4f6' : '#111827',
                         width: `${columnWidths.detectedTime}px`,
                         position: 'relative',
                         userSelect: 'none'
@@ -4829,6 +6212,20 @@ const AutoTrading = () => {
                             overflow: 'hidden',
                             textOverflow: 'ellipsis',
                             lineHeight: '1.2',
+                            fontSize: '12px',
+                            color: theme === 'dark' ? '#a78bfa' : '#7c3aed',
+                            width: `${columnWidths.algorithm}px`,
+                            fontWeight: 500
+                          }} title={stock.detectedCondition}>
+                            {stock.detectedCondition || '-'}
+                          </td>
+                          <td style={{ 
+                            border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
+                            padding: '2px 6px',
+                            whiteSpace: 'nowrap',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            lineHeight: '1.2',
                             fontSize: '13px',
                             color: theme === 'dark' ? '#ffffff' : '#111827',
                             width: `${columnWidths.detectedTime}px`
@@ -4838,7 +6235,7 @@ const AutoTrading = () => {
                       })
                     ) : (
                       <tr>
-                        <td colSpan={9} style={{ 
+                        <td colSpan={10} style={{ 
                           border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
                           padding: '32px', 
                           textAlign: 'center',
@@ -5505,6 +6902,170 @@ const AutoTrading = () => {
                     </tr>
                   </tbody>
                 </table>
+              </div>
+
+              {/* 종목별 매수가격 설정 */}
+              <div style={{ 
+                border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999', 
+                backgroundColor: theme === 'dark' ? '#1f2937' : 'white', 
+                padding: '8px',
+                borderRadius: '8px',
+                marginTop: '8px'
+              }}>
+                <div style={{ 
+                  display: 'flex',
+                  alignItems: 'center',
+                  marginBottom: '6px',
+                  gap: '6px'
+                }}>
+                  <input
+                    type="checkbox"
+                    checked={buyPriceSettings.종목별매수가격설정실행}
+                    onChange={(e) => setBuyPriceSettings({
+                      ...buyPriceSettings,
+                      종목별매수가격설정실행: e.target.checked
+                    })}
+                    style={{
+                      width: '16px',
+                      height: '16px',
+                      cursor: 'pointer'
+                    }}
+                  />
+                  <div style={{ 
+                    backgroundImage: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
+                    color: 'white', 
+                    padding: '3px 6px', 
+                    fontSize: '12px', 
+                    fontWeight: 'bold',
+                    borderRadius: '6px',
+                    flex: 1
+                  }}>
+                    종목별 매수가격 설정
+                  </div>
+                </div>
+                
+                {buyPriceSettings.종목별매수가격설정실행 && (
+                  <div style={{ marginTop: '8px' }}>
+                    {/* 매수가격 옵션 선택 */}
+                    <div style={{ marginBottom: '8px' }}>
+                      <div style={{ 
+                        fontSize: '11px', 
+                        marginBottom: '4px',
+                        color: theme === 'dark' ? '#d1d5db' : '#374151',
+                        fontWeight: '500'
+                      }}>
+                        매수가격 옵션
+                      </div>
+                      <div style={{ display: 'flex', gap: '4px' }}>
+                        <button
+                          onClick={() => setBuyPriceSettings({
+                            ...buyPriceSettings,
+                            매수가격옵션: '시장가'
+                          })}
+                          style={{
+                            flex: 1,
+                            padding: '4px 8px',
+                            backgroundColor: buyPriceSettings.매수가격옵션 === '시장가'
+                              ? '#3b82f6'
+                              : (theme === 'dark' ? '#374151' : '#e5e7eb'),
+                            color: buyPriceSettings.매수가격옵션 === '시장가'
+                              ? 'white'
+                              : (theme === 'dark' ? '#d1d5db' : '#374151'),
+                            border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
+                            borderRadius: '6px',
+                            fontSize: '11px',
+                            fontWeight: buyPriceSettings.매수가격옵션 === '시장가' ? 'bold' : 'normal',
+                            cursor: 'pointer',
+                            transition: 'all 0.2s'
+                          }}
+                        >
+                          시장가
+                        </button>
+                        <button
+                          onClick={() => setBuyPriceSettings({
+                            ...buyPriceSettings,
+                            매수가격옵션: '지정가'
+                          })}
+                          style={{
+                            flex: 1,
+                            padding: '4px 8px',
+                            backgroundColor: buyPriceSettings.매수가격옵션 === '지정가'
+                              ? '#3b82f6'
+                              : (theme === 'dark' ? '#374151' : '#e5e7eb'),
+                            color: buyPriceSettings.매수가격옵션 === '지정가'
+                              ? 'white'
+                              : (theme === 'dark' ? '#d1d5db' : '#374151'),
+                            border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
+                            borderRadius: '6px',
+                            fontSize: '11px',
+                            fontWeight: buyPriceSettings.매수가격옵션 === '지정가' ? 'bold' : 'normal',
+                            cursor: 'pointer',
+                            transition: 'all 0.2s'
+                          }}
+                        >
+                          지정가
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* 매수호가 입력 (지정가일 때만 표시) */}
+                    {buyPriceSettings.매수가격옵션 === '지정가' && (
+                      <div>
+                        <div style={{ 
+                          fontSize: '11px', 
+                          marginBottom: '4px',
+                          color: theme === 'dark' ? '#d1d5db' : '#374151',
+                          fontWeight: '500'
+                        }}>
+                          매수호가 (-10 ~ 0 ~ +10)
+                        </div>
+                        <input
+                          type="number"
+                          min="-10"
+                          max="10"
+                          value={buyPriceSettings.매수호가}
+                          onChange={(e) => {
+                            const value = parseInt(e.target.value) || 0
+                            if (value >= -10 && value <= 10) {
+                              setBuyPriceSettings({
+                                ...buyPriceSettings,
+                                매수호가: value
+                              })
+                            }
+                          }}
+                          onBlur={(e) => {
+                            const value = parseInt(e.target.value) || 0
+                            let clampedValue = value
+                            if (value < -10) clampedValue = -10
+                            if (value > 10) clampedValue = 10
+                            setBuyPriceSettings({
+                              ...buyPriceSettings,
+                              매수호가: clampedValue
+                            })
+                          }}
+                          style={{ 
+                            width: '100%', 
+                            padding: '4px 8px', 
+                            border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999', 
+                            backgroundColor: theme === 'dark' ? '#374151' : 'white',
+                            color: theme === 'dark' ? '#f3f4f6' : '#111827',
+                            textAlign: 'center', 
+                            fontSize: '11px',
+                            borderRadius: '6px'
+                          }}
+                        />
+                        <div style={{ 
+                          fontSize: '9px', 
+                          color: theme === 'dark' ? '#9ca3af' : '#999', 
+                          marginTop: '4px',
+                          textAlign: 'center'
+                        }}>
+                          현재: {buyPriceSettings.매수호가} (범위: -10 ~ +10)
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* 매매시간 설정 */}
