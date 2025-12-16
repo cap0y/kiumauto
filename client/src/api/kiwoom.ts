@@ -140,12 +140,23 @@ export const kiwoomApi = {
 
   // 주문 내역 조회
   getOrderHistory: async (accountNo?: string) => {
-    const response = await apiClient.get('/orders/history', {
-      params: {
-        accountNo: accountNo || '',
+    console.log(`[주문 내역 조회] 요청 시작 - 계좌번호: ${accountNo}`)
+    try {
+      const response = await apiClient.get('/orders/history', {
+        params: {
+          accountNo: accountNo || '',
+        }
+      })
+      const orders = response.data.orders || []
+      console.log(`[주문 내역 조회] 응답 수신 - 주문 개수: ${orders.length}`)
+      if (orders.length > 0) {
+        console.log(`[주문 내역 조회] 첫 번째 주문:`, orders[0])
       }
-    })
-    return response.data.orders || []
+      return orders
+    } catch (error: any) {
+      console.error(`[주문 내역 조회] 에러 발생:`, error.response?.data || error.message)
+      throw error
+    }
   },
 
   // 여러 종목의 현재가 일괄 조회

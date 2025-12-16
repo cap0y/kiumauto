@@ -36,6 +36,8 @@ export class KiwoomService {
   private cachedAccountList: string[] | null = null // 계좌 목록 캐시
   private accountListCacheTime: number = 0 // 캐시 시간
   private webSocketService: KiwoomWebSocketService | null = null
+  private lastChartRequestTime: number = 0 // 마지막 차트 API 요청 시간 (요청 제한 방지용)
+  private chartRequestDelay: number = 1000 // 차트 API 요청 간 최소 지연 시간 (ms) - 200ms에서 1000ms로 증가 (API 제한 방지)
 
   private constructor() {}
 
@@ -247,7 +249,19 @@ export class KiwoomService {
             ;(error as any).isRateLimit = true // 요청 제한 에러 플래그
             throw error
           }
-          throw new Error(response.data.return_msg || 'API 오류 발생')
+          // return_code가 0이 아닌 경우에도 응답 데이터를 포함하여 에러 던지기
+          const errorMsg = response.data.return_msg || 'API 오류 발생'
+          const error = new Error(errorMsg)
+          ;(error as any).response = { 
+            data: response.data, 
+            status: response.status || (response.data.return_code === 2000 ? 400 : 500)
+          }
+          ;(error as any).return_code = response.data.return_code
+          // 에러 메시지에 return_code 포함 (로그에서 확인 가능하도록)
+          if (response.data.return_code !== 5) {
+            console.error(`API 요청 오류 [${trId}]: [${response.data.return_code}]${errorMsg}`)
+          }
+          throw error
         }
       }
       
@@ -564,6 +578,21 @@ export class KiwoomService {
     console.log(`[차트 API] 엔드포인트: ${endpoint}, TR_ID: ${trId}, 메서드: ${requestMethod}`)
     console.log(`[차트 API] 요청 파라미터:`, JSON.stringify(params, null, 2))
 
+    // 차트 API 요청 제한 방지를 위한 지연 처리
+    // ka10080 (주식분봉차트조회요청)은 요청 제한이 엄격하므로 요청 간 지연 필요
+    if (trId === 'ka10080' || trId === 'ka10081' || trId === 'ka10079') {
+      const now = Date.now()
+      const timeSinceLastRequest = now - this.lastChartRequestTime
+      
+      if (timeSinceLastRequest < this.chartRequestDelay) {
+        const delay = this.chartRequestDelay - timeSinceLastRequest
+        console.log(`[차트 API] 요청 제한 방지를 위한 지연: ${delay}ms`)
+        await new Promise(resolve => setTimeout(resolve, delay))
+      }
+      
+      this.lastChartRequestTime = Date.now()
+    }
+
     try {
       const response = await this.request(endpoint, trId, params, requestMethod)
       
@@ -699,10 +728,11 @@ export class KiwoomService {
             if (index === 0) {
               console.log(`[차트 API] 모의투자 - 파싱 시도 결과:`, { 
                 date, open, high, low, close, volume,
-                'item.dt': item.dt,
-                'item.open_prc': item.open_prc,
-                'item.cls_prc': item.cls_prc,
-                'item.volume': item.volume,
+                'item.cntr_tm': item.cntr_tm,
+                'item.open_pric': item.open_pric,
+                'item.cur_prc': item.cur_prc,
+                'item.trde_qty': item.trde_qty,
+                '파싱된 값': { date, open, high, low, close, volume },
                 '모든 필드': Object.keys(item)
               })
             }
@@ -1289,9 +1319,21 @@ export class KiwoomService {
     accountNo?: string,
     accountProductCode?: string
   ): Promise<any> {
-    const endpoint = '/uapi/domestic-stock/v1/trading/order-cash'
-    // TTTC0802U: 현금매수주문, TTTC0801U: 현금매도주문
-    const trId = order.order_type === 'buy' ? 'TTTC0802U' : 'TTTC0801U'
+    // 모의투자 환경 감지
+    const isMockApi = this.config?.host?.includes('mockapi.kiwoom.com')
+    
+    // 모의투자 환경에서는 다른 엔드포인트 사용
+    // 키움증권 모의투자 API 문서: /api/dostk/ordr
+    const endpoint = isMockApi 
+      ? '/api/dostk/ordr'  // 모의투자 환경 주문 API
+      : '/uapi/domestic-stock/v1/trading/order-cash'  // 실전 환경 주문 API
+    
+    // TR_ID 설정
+    // 모의투자: kt10000 (매수), kt10001 (매도)
+    // 실전: TTTC0802U (매수), TTTC0801U (매도)
+    const trId = isMockApi
+      ? (order.order_type === 'buy' ? 'kt10000' : 'kt10001')
+      : (order.order_type === 'buy' ? 'TTTC0802U' : 'TTTC0801U')
     
     // 종목코드 검증: 6자리 숫자만 허용 (ELW, ETF 등 비표준 종목코드 제외)
     const stockCode = order.code.trim()
@@ -1299,14 +1341,15 @@ export class KiwoomService {
       throw new Error(`지원하지 않는 종목코드 형식입니다: ${stockCode} (6자리 숫자만 지원)`)
     }
     
-    // 계좌번호 검증
-    if (!accountNo || accountNo.trim().length === 0) {
-      throw new Error('계좌번호가 필요합니다')
-    }
-    
-    // 계좌상품코드 검증
-    if (!accountProductCode || accountProductCode.trim().length === 0) {
-      throw new Error('계좌상품코드가 필요합니다')
+    // 계좌번호 검증 (실전 환경에서만 필요)
+    if (!isMockApi) {
+      if (!accountNo || accountNo.trim().length === 0) {
+        throw new Error('계좌번호가 필요합니다')
+      }
+      
+      if (!accountProductCode || accountProductCode.trim().length === 0) {
+        throw new Error('계좌상품코드가 필요합니다')
+      }
     }
     
     // 주문 수량 검증
@@ -1319,9 +1362,24 @@ export class KiwoomService {
       throw new Error('지정가 주문 시 주문 가격이 필요합니다')
     }
     
-    const data = {
-      CANO: accountNo.trim(), // 계좌번호 (8자리)
-      ACNT_PRDT_CD: accountProductCode.trim(), // 계좌상품코드 (2자리)
+    // 주문구분 매핑
+    // order_option: 00=지정가, 01/03=시장가
+    // 모의투자 trde_tp: 0=보통(지정가), 3=시장가
+    const trdeTp = order.order_option === '00' ? '0' : '3'
+    
+    // 모의투자 환경 파라미터 형식 (키움증권 모의투자 API 문서 참조)
+    const data = isMockApi ? {
+      dmst_stex_tp: 'KRX', // 국내거래소구분 (KRX, NXT, SOR) - 모의투자는 KRX만 지원
+      stk_cd: stockCode, // 종목코드
+      ord_qty: order.quantity.toString(), // 주문수량
+      // 주문단가: 지정가일 경우만 전송, 시장가일 경우는 "0" 또는 생략
+      ...(order.order_option === '00' ? { ord_uv: Math.floor(order.price).toString() } : {}),
+      trde_tp: trdeTp, // 매매구분 (0:보통/지정가, 3:시장가)
+      // cond_uv는 조건부지정가일 때만 필요하므로 생략
+    } : {
+      // 실전 환경 파라미터 형식
+      CANO: accountNo!.trim(), // 계좌번호 (8자리)
+      ACNT_PRDT_CD: accountProductCode!.trim(), // 계좌상품코드 (2자리)
       PDNO: stockCode, // 종목코드 (6자리 숫자)
       ORD_DVSN: order.order_option, // 주문구분 (00: 지정가, 01: 시장가, 03: 시장가)
       ORD_QTY: order.quantity.toString(), // 주문수량
@@ -1329,46 +1387,103 @@ export class KiwoomService {
     }
 
     try {
+      console.log(`[주문 전송] 모의투자: ${isMockApi ? '예' : '아니오'}, 엔드포인트: ${endpoint}`)
+      console.log(`[주문 전송] 종목코드: ${stockCode}, 주문구분: ${order.order_option}, 수량: ${order.quantity}, 가격: ${order.price || '시장가'}`)
+      console.log(`[주문 전송] 요청 데이터:`, JSON.stringify(data, null, 2))
+      
       const response = await this.request(endpoint, trId, data, 'POST')
+      
+      console.log(`[주문 전송] 응답 수신:`, JSON.stringify(response, null, 2))
+      
+      // 주문 응답 구조 확인
+      // 모의투자와 실전 환경의 응답 형식이 다를 수 있음
+      const returnCode = response.return_code
+      const returnMsg = response.return_msg || response.메시지 || ''
+      
+      // 주문번호 추출 (모의투자와 실전 환경 모두 지원)
+      const orderNumber = isMockApi
+        ? (response.ord_no || response.주문번호 || '')  // 모의투자: ord_no
+        : (response.ODNO || response.주문번호 || '')    // 실전: ODNO
+      
+      // 주문시간 추출
+      const orderTime = isMockApi
+        ? (response.ord_tm || response.주문시간 || '')
+        : (response.ORD_TMD || response.주문시간 || '')
+      
+      if (orderNumber) {
+        console.log(`[주문 전송] 성공 - 주문번호: ${orderNumber}, 주문시간: ${orderTime}`)
+        return {
+          orderNumber,
+          orderTime,
+          success: true,
+          message: returnMsg || '주문이 접수되었습니다',
+          returnCode
+        }
+      }
+      
+      // return_code가 0이 아니고 주문번호도 없는 경우
+      if (returnCode !== 0 && returnCode !== undefined) {
+        console.error(`[주문 전송] 실패 - return_code: ${returnCode}, 메시지: ${returnMsg}`)
+        throw new Error(returnMsg || `주문 전송 실패 (코드: ${returnCode})`)
+      }
       
       // 주문 응답 구조
       return {
-        orderNumber: response.ODNO || response.주문번호 || '',
-        orderTime: response.ORD_TMD || response.주문시간 || '',
-        success: response.return_code === 0,
-        message: response.return_msg || response.메시지 || '',
+        orderNumber,
+        orderTime,
+        success: returnCode === 0 || returnCode === undefined,
+        message: returnMsg || '주문 처리 완료',
+        returnCode
       }
     } catch (error: any) {
       // 에러 응답에서 상세 정보 추출
       const errorResponse = error.response?.data
       const errorMessage = errorResponse?.message || errorResponse?.return_msg || error.message || '주문 전송 실패'
       const errorStatus = error.response?.status || 500
+      const returnCode = errorResponse?.return_code || (error as any).return_code
       
-      // 500 에러인 경우 모의투자 환경 제한사항으로 처리
+      // 모의투자 매매 제한 종목 체크 (RC4007)
+      const isTradingRestricted = errorMessage.includes('RC4007') || errorMessage.includes('매매제한 종목')
+      
+      // 상세 에러 로깅
+      console.error(`[주문 전송 오류] 종목코드: ${stockCode}`, {
+        상태코드: errorStatus,
+        return_code: returnCode,
+        에러메시지: errorMessage,
+        주문구분: order.order_option,
+        수량: order.quantity,
+        가격: order.price,
+        매매제한종목: isTradingRestricted,
+        전체응답: errorResponse
+      })
+      
+      // 모의투자 매매 제한 종목인 경우 특별 처리
+      if (isTradingRestricted) {
+        const restrictedError = new Error(`모의투자 매매 제한 종목: ${stockCode} (${errorMessage})`)
+        ;(restrictedError as any).isTradingRestricted = true
+        ;(restrictedError as any).stockCode = stockCode
+        ;(restrictedError as any).returnCode = returnCode
+        throw restrictedError
+      }
+      
+      // return_code가 있는 경우 (키움 API 응답)
+      if (returnCode !== undefined) {
+        // return_code가 0이 아닌 경우 실제 에러 메시지 사용
+        throw new Error(errorMessage)
+      }
+      
+      // 500 에러인 경우 모의투자 환경에서도 재시도 가능하도록 처리
       if (errorStatus === 500) {
-        // 모의투자 환경에서는 일부 종목에 대해 주문이 제한될 수 있음
-        // 이는 정상적인 제한사항이므로 조용히 처리
         const isMockApi = this.config?.host?.includes('mockapi.kiwoom.com')
         if (isMockApi) {
-          // 모의투자 환경에서는 500 에러를 특별한 에러 타입으로 처리
-          const mockError = new Error(`모의투자 환경 제한: ${errorMessage}`)
-          ;(mockError as any).isMockApiLimit = true
-          ;(mockError as any).stockCode = stockCode
-          ;(mockError as any).status = 500
-          throw mockError
+          // 모의투자 환경에서는 500 에러도 실제 에러 메시지와 함께 전달
+          // 일부 종목은 주문이 제한될 수 있지만, 대부분의 종목은 정상 작동
+          throw new Error(`모의투자 환경: ${errorMessage}`)
         }
         
-        console.error('주문 전송 오류 (500):', {
-          종목코드: stockCode,
-          주문구분: order.order_option,
-          수량: order.quantity,
-          가격: order.price,
-          API응답: errorResponse
-        })
         throw new Error(`주문 전송 실패: ${errorMessage} (종목코드: ${stockCode})`)
       }
       
-      console.error('주문 전송 오류:', errorMessage)
       throw new Error(errorMessage)
     }
   }
@@ -1406,9 +1521,11 @@ export class KiwoomService {
     try {
       const response = await this.request(endpoint, trId, data, 'GET')
       
+      console.log(`[주문 내역 조회] 응답 구조:`, JSON.stringify(response, null, 2).substring(0, 500))
+      
       // 응답 데이터 파싱
       if (response.output && Array.isArray(response.output)) {
-        return response.output.map((item: any, index: number) => ({
+        const orders = response.output.map((item: any, index: number) => ({
           id: index + 1,
           date: item.ORD_DT || item.주문일자 || new Date().toLocaleDateString('ko-KR'),
           time: item.ORD_TMD || item.주문시간 || new Date().toLocaleTimeString('ko-KR'),
@@ -1422,24 +1539,30 @@ export class KiwoomService {
                   item.ORD_STAT_CD === '30' ? '취소' : '미체결',
           orderNumber: item.ODNO || item.주문번호 || '',
         }))
+        console.log(`[주문 내역 조회] 파싱된 주문 개수: ${orders.length}`)
+        return orders
       }
       
       // 키움 REST API 응답이 예상과 다른 경우 빈 배열 반환
       // 모의투자 환경에서는 조용히 처리
+      console.log(`[주문 내역 조회] 응답에 output 배열이 없음. 응답 키:`, Object.keys(response))
       return []
     } catch (error: any) {
       // 모의투자 환경에서 500 에러는 정상적인 제한사항일 수 있음
       const status = error.response?.status || error.status
       const errorMessage = error.response?.data?.error || error.response?.data?.message || error.message || ''
       
+      console.log(`[주문 내역 조회] 에러 발생 - 상태: ${status}, 메시지: ${errorMessage.substring(0, 200)}`)
+      
       // 500 에러나 서버 에러는 조용히 처리 (모의투자 환경 제한)
       if (status === 500 || errorMessage.includes('INTERNAL_SERVER_ERROR')) {
-        // 조용히 빈 배열 반환 (로그 출력 안 함)
+        // 모의투자 환경에서는 주문 내역 조회가 제한될 수 있음
+        console.log(`[주문 내역 조회] 모의투자 환경 제한으로 빈 배열 반환`)
         return []
       }
       
-      // 다른 에러는 가끔만 로그 출력 (너무 많은 로그 방지)
-      // console.error('주문 내역 조회 오류:', errorMessage)
+      // 다른 에러는 로그 출력
+      console.error('[주문 내역 조회] 오류:', errorMessage)
       
       // 오류 발생 시 빈 배열 반환
       return []
@@ -1629,21 +1752,36 @@ export class KiwoomService {
         'ka10020': { // 호가잔량상위
           sort_tp: '1', // 1:순매수잔량순, 2:순매도잔량순, 3:매수비율순, 4:매도비율순
         },
+        'ka10021': { // 호가잔량급증
+          sort_tp: '1', // 정렬구분
+          trde_tp: '1', // 거래유형: 1=일반거래 (필수 파라미터)
+        },
+        'ka10022': { // 잔량율급증
+          sort_tp: '1', // 정렬구분
+          rt_tp: '1', // 비율유형: 1=매수비율 (필수 파라미터)
+        },
+        'ka10023': { // 거래량급증
+          sort_tp: '1', // 거래량급증 정렬
+          tm_tp: '1', // 시간유형: 1=당일 (필수 파라미터)
+          pric_tp: '0', // 가격유형: 0=전체 (필수 파라미터)
+        },
         'ka10027': { // 전일대비등락률상위
           sort_tp: '1', // 등락률 정렬 (실제 값은 API 문서 확인 필요)
         },
         'ka10030': { // 당일거래량상위
           sort_tp: '1', // 거래량 정렬
           mang_stk_incls: '0', // 관리종목 포함 (필수 파라미터)
+          crd_tp: '0', // 신용유형: 0=전체 (필수 파라미터)
+          pric_tp: '0', // 가격유형: 0=전체 (필수 파라미터)
         },
         'ka10031': { // 전일거래량상위
           sort_tp: '1', // 전일거래량 정렬
+          qry_tp: '1', // 조회유형: 1=전일 (필수 파라미터)
+          rank_strt: '1', // 순위시작: 1=1위부터 (필수 파라미터)
         },
         'ka10032': { // 거래대금상위
           sort_tp: '1', // 거래대금 정렬
-        },
-        'ka10023': { // 거래량급증
-          sort_tp: '1', // 거래량급증 정렬
+          qry_tp: '1', // 조회유형: 1=당일 (필수 파라미터)
         },
       }
       
@@ -1848,8 +1986,29 @@ export class KiwoomService {
       return
     }
 
-    // 주식체결 실시간 시세 등록 (type: '00')
-    this.webSocketService.registerRealTime(codes, ['00'], '1', '1')
+    // WebSocket 실시간 시세 등록 제한: 그룹당 최대 100개
+    // 100개 이상인 경우 여러 그룹으로 나눠서 등록
+    const MAX_ITEMS_PER_GROUP = 100
+    const totalCodes = codes.length
+    
+    if (totalCodes <= MAX_ITEMS_PER_GROUP) {
+      // 100개 이하인 경우 기존 방식대로 등록
+      this.webSocketService.registerRealTime(codes, ['00'], '1', '1')
+    } else {
+      // 100개 초과인 경우 여러 그룹으로 나눠서 등록
+      console.log(`[WebSocket] ${totalCodes}개 종목을 ${MAX_ITEMS_PER_GROUP}개씩 나눠서 등록합니다`)
+      
+      for (let i = 0; i < totalCodes; i += MAX_ITEMS_PER_GROUP) {
+        const groupCodes = codes.slice(i, i + MAX_ITEMS_PER_GROUP)
+        const groupNo = String(Math.floor(i / MAX_ITEMS_PER_GROUP) + 1) // 그룹번호: 1, 2, 3, ...
+        const refresh = i === 0 ? '1' : '0' // 첫 그룹만 refresh='1', 나머지는 '0'
+        
+        // 각 그룹 등록 시 약간의 딜레이 추가 (API 제한 방지)
+        setTimeout(() => {
+          this.webSocketService.registerRealTime(groupCodes, ['00'], groupNo, refresh)
+        }, i * 100) // 100ms 간격으로 등록
+      }
+    }
   }
 
   /**

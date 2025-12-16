@@ -177,7 +177,7 @@ const Dashboard = () => {
                 종목 조회
               </Link>
               <Link
-                to="/settings"
+                to="/"
                 className="block px-4 py-2 bg-green-50 text-green-600 rounded-lg hover:bg-green-100"
               >
                 매매 설정
