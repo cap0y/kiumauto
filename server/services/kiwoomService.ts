@@ -188,6 +188,13 @@ export class KiwoomService {
   }
 
   /**
+   * 모의투자 환경 확인
+   */
+  isMockApi(): boolean {
+    return this.config?.host?.includes('mockapi.kiwoom.com') || false
+  }
+
+  /**
    * 키움증권 API 연결 해제
    */
   async disconnect(): Promise<void> {
@@ -1368,14 +1375,16 @@ export class KiwoomService {
     const trdeTp = order.order_option === '00' ? '0' : '3'
     
     // 모의투자 환경 파라미터 형식 (키움증권 모의투자 API 문서 참조)
+    // 사용자 제공 키움 API 문서에 따라 ord_uv와 cond_uv를 명시적으로 전송
     const data = isMockApi ? {
       dmst_stex_tp: 'KRX', // 국내거래소구분 (KRX, NXT, SOR) - 모의투자는 KRX만 지원
       stk_cd: stockCode, // 종목코드
       ord_qty: order.quantity.toString(), // 주문수량
-      // 주문단가: 지정가일 경우만 전송, 시장가일 경우는 "0" 또는 생략
-      ...(order.order_option === '00' ? { ord_uv: Math.floor(order.price).toString() } : {}),
+      // 주문단가: 지정가일 경우 가격 전송, 시장가일 경우 빈 문자열('')로 명시적으로 전송
+      ord_uv: order.order_option === '00' ? Math.floor(order.price).toString() : '',
       trde_tp: trdeTp, // 매매구분 (0:보통/지정가, 3:시장가)
-      // cond_uv는 조건부지정가일 때만 필요하므로 생략
+      // 조건단가: 조건부지정가가 아닌 경우 빈 문자열('')로 명시적으로 전송
+      cond_uv: '',
     } : {
       // 실전 환경 파라미터 형식
       CANO: accountNo!.trim(), // 계좌번호 (8자리)

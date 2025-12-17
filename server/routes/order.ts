@@ -24,7 +24,9 @@ router.post('/', async (req: Request, res: Response) => {
       })
     }
 
-    if (!accountNo || !accountProductCode) {
+    // 모의투자 환경에서는 accountNo와 accountProductCode가 없을 수 있음
+    const isMockApi = kiwoomService.isMockApi()
+    if (!isMockApi && (!accountNo || !accountProductCode)) {
       return res.status(400).json({
         error: 'accountNo, accountProductCode가 필요합니다'
       })
@@ -67,7 +69,22 @@ router.post('/', async (req: Request, res: Response) => {
 
     res.json(result)
   } catch (error: any) {
-    console.error('주문 전송 오류:', error)
+    // 상세 에러 로깅
+    console.error('[주문 전송 오류]', {
+      종목코드: req.body.code,
+      수량: req.body.quantity,
+      가격: req.body.price,
+      주문구분: req.body.order_type,
+      주문옵션: req.body.order_option,
+      에러메시지: error.message,
+      에러스택: error.stack,
+      응답상태: error.response?.status,
+      응답데이터: error.response?.data,
+      isMockApiLimit: error.isMockApiLimit,
+      isTradingRestricted: error.isTradingRestricted,
+      returnCode: error.returnCode,
+      stockCode: error.stockCode
+    })
     
     // 클라이언트 에러 (400번대)는 그대로 전달
     if (error.message && error.message.includes('지원하지 않는 종목코드')) {
@@ -91,10 +108,14 @@ router.post('/', async (req: Request, res: Response) => {
     
     // 서버 에러 (500번대)는 상세 정보 포함
     const statusCode = error.response?.status || error.status || 500
+    const errorMessage = error.message || '알 수 없는 오류가 발생했습니다'
+    const errorDetail = error.response?.data?.detail || error.response?.data?.message || errorMessage
+    
     res.status(statusCode).json({
       error: '주문 전송 실패',
-      detail: error.message || '알 수 없는 오류가 발생했습니다',
-      code: error.stockCode || req.body.code || '알 수 없음' // 실패한 종목코드 포함
+      detail: errorDetail,
+      code: error.stockCode || req.body.code || '알 수 없음', // 실패한 종목코드 포함
+      returnCode: error.returnCode || error.response?.data?.return_code
     })
   }
 })
