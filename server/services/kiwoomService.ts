@@ -35,6 +35,8 @@ export class KiwoomService {
   private connected: boolean = false
   private cachedAccountList: string[] | null = null // 계좌 목록 캐시
   private accountListCacheTime: number = 0 // 캐시 시간
+  private cachedDeposit: number | null = null // 예수금 캐시 (API 제한 에러 발생 시 사용)
+  private cachedDepositTime: number = 0 // 예수금 캐시 시간
   private webSocketService: KiwoomWebSocketService | null = null
   private lastChartRequestTime: number = 0 // 마지막 차트 API 요청 시간 (요청 제한 방지용)
   private chartRequestDelay: number = 1000 // 차트 API 요청 간 최소 지연 시간 (ms) - 200ms에서 1000ms로 증가 (API 제한 방지)
@@ -209,11 +211,39 @@ export class KiwoomService {
    * 키움증권 API 요청
    * 키움 REST API는 TR_ID를 헤더에 포함
    */
+  /**
+   * 지연 함수 (재시도 대기용)
+   */
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms))
+  }
+
+  /**
+   * 재시도 가능한 에러인지 확인
+   */
+  private isRetryableError(error: any): boolean {
+    const status = error.response?.status
+    const errorCode = error.response?.data?.error
+    
+    // 500 에러 또는 INTERNAL_SERVER_ERROR는 재시도 가능
+    if (status === 500 || errorCode === 'INTERNAL_SERVER_ERROR') {
+      return true
+    }
+    
+    // 네트워크 에러나 타임아웃도 재시도 가능
+    if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.code === 'ENOTFOUND') {
+      return true
+    }
+    
+    return false
+  }
+
   private async request(
     endpoint: string,
     trId: string,
     data?: any,
-    method: 'GET' | 'POST' = 'GET'
+    method: 'GET' | 'POST' = 'GET',
+    maxRetries: number = 3
   ): Promise<any> {
     if (!this.axiosInstance) {
       throw new Error('키움증권 API에 연결되지 않았습니다')
@@ -241,47 +271,85 @@ export class KiwoomService {
       config.params = data
     }
 
-    try {
-      const response = await this.axiosInstance.request(config)
-      
-      // 키움 API 응답 구조 확인
-      if (response.data.return_code !== undefined) {
-        if (response.data.return_code !== 0) {
-          // 요청 제한 에러(5)는 특별 처리
-          if (response.data.return_code === 5) {
-            const errorMsg = response.data.return_msg || 'API 요청 제한 초과'
-            // 요청 제한 에러는 조용히 처리 (너무 많은 로그 방지)
+    let lastError: any = null
+    
+    // 재시도 로직
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await this.axiosInstance.request(config)
+        
+        // 키움 API 응답 구조 확인
+        if (response.data.return_code !== undefined) {
+          if (response.data.return_code !== 0) {
+            // 요청 제한 에러(5)는 특별 처리 (재시도 불가)
+            if (response.data.return_code === 5) {
+              const errorMsg = response.data.return_msg || 'API 요청 제한 초과'
+              const error = new Error(errorMsg)
+              ;(error as any).response = { data: response.data, status: 429 }
+              ;(error as any).isRateLimit = true
+              throw error
+            }
+            
+            // return_code가 0이 아닌 경우에도 응답 데이터를 포함하여 에러 던지기
+            const errorMsg = response.data.return_msg || 'API 오류 발생'
             const error = new Error(errorMsg)
-            ;(error as any).response = { data: response.data, status: 429 }
-            ;(error as any).isRateLimit = true // 요청 제한 에러 플래그
+            ;(error as any).response = { 
+              data: response.data, 
+              status: response.status || (response.data.return_code === 2000 ? 400 : 500)
+            }
+            ;(error as any).return_code = response.data.return_code
+            
+            // 재시도 가능한 에러인지 확인
+            if (this.isRetryableError(error) && attempt < maxRetries) {
+              lastError = error
+              // Exponential backoff: 1초, 2초, 4초
+              const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000)
+              await this.delay(delayMs)
+              continue
+            }
+            
+            // 에러 메시지에 return_code 포함 (로그에서 확인 가능하도록)
+            if (response.data.return_code !== 5) {
+              console.error(`API 요청 오류 [${trId}]: [${response.data.return_code}]${errorMsg}`)
+            }
             throw error
           }
-          // return_code가 0이 아닌 경우에도 응답 데이터를 포함하여 에러 던지기
-          const errorMsg = response.data.return_msg || 'API 오류 발생'
-          const error = new Error(errorMsg)
-          ;(error as any).response = { 
-            data: response.data, 
-            status: response.status || (response.data.return_code === 2000 ? 400 : 500)
-          }
-          ;(error as any).return_code = response.data.return_code
-          // 에러 메시지에 return_code 포함 (로그에서 확인 가능하도록)
-          if (response.data.return_code !== 5) {
-            console.error(`API 요청 오류 [${trId}]: [${response.data.return_code}]${errorMsg}`)
+        }
+        
+        return response.data
+      } catch (error: any) {
+        lastError = error
+        
+        // 재시도 불가능한 에러는 즉시 throw
+        if (!this.isRetryableError(error)) {
+          const errorData = error.response?.data || error.message
+          // 500 에러와 429(요청 제한) 에러는 조용히 처리
+          if (error.response?.status !== 500 && error.response?.status !== 429 && errorData?.error !== 'INTERNAL_SERVER_ERROR') {
+            console.error(`API 요청 오류 [${trId}]:`, errorData)
           }
           throw error
         }
+        
+        // 마지막 시도인 경우 에러 throw
+        if (attempt === maxRetries) {
+          // 500 에러는 조용히 처리 (너무 많은 로그 방지)
+          if (error.response?.status === 500 || error.response?.data?.error === 'INTERNAL_SERVER_ERROR') {
+            // 재시도 실패 로그는 최소화
+          } else {
+            const errorData = error.response?.data || error.message
+            console.error(`API 요청 오류 [${trId}] (재시도 ${maxRetries}회 실패):`, errorData)
+          }
+          throw error
+        }
+        
+        // 재시도 대기 (exponential backoff)
+        const delayMs = Math.min(1000 * Math.pow(2, attempt), 4000)
+        await this.delay(delayMs)
       }
-      
-      return response.data
-    } catch (error: any) {
-      // 키움증권 API 오류 로그 (상위 호출자에서 처리할 수 있도록)
-      const errorData = error.response?.data || error.message
-      // 500 에러와 429(요청 제한) 에러는 조용히 처리
-      if (error.response?.status !== 500 && error.response?.status !== 429 && errorData?.error !== 'INTERNAL_SERVER_ERROR') {
-        console.error(`API 요청 오류 [${trId}]:`, errorData)
-      }
-      throw error
     }
+    
+    // 이 코드는 실행되지 않아야 하지만 타입 안정성을 위해
+    throw lastError || new Error('알 수 없는 오류가 발생했습니다')
   }
 
   /**
@@ -355,7 +423,8 @@ export class KiwoomService {
     }
 
     try {
-      const response = await this.request(endpoint, trId, params, 'GET')
+      // 재시도 로직이 포함된 request 호출 (최대 3회 재시도)
+      const response = await this.request(endpoint, trId, params, 'GET', 3)
       
       if (response.output && response.output[0]) {
         const item = response.output[0]
@@ -376,14 +445,26 @@ export class KiwoomService {
       
       return {}
     } catch (error: any) {
-      // 500 에러는 서버 측 문제이므로 조용히 처리
+      // 500 에러는 서버 측 문제이므로 조용히 처리하고 빈 객체 반환
+      // 재시도 로직에서 이미 처리했으므로 여기서는 빈 객체를 반환하여 앱이 계속 동작하도록 함
       const status = error.response?.status || error.status
-      if (status !== 500) {
-        // 500이 아닌 에러만 로그 출력 (요청 제한 등)
-        const errorMessage = error.response?.data?.message || error.message || ''
-        if (!errorMessage.includes('허용된 요청 개수를 초과')) {
-          // console.error('현재가 조회 오류:', errorMessage)
-        }
+      const isRateLimit = error.isRateLimit || false
+      
+      // 요청 제한 에러는 상위로 전파 (클라이언트에서 처리 필요)
+      if (isRateLimit) {
+        throw error
+      }
+      
+      // 500 에러나 INTERNAL_SERVER_ERROR는 빈 객체 반환 (앱이 계속 동작하도록)
+      if (status === 500 || error.response?.data?.error === 'INTERNAL_SERVER_ERROR') {
+        // 조용히 빈 객체 반환 (재시도 실패 시)
+        return {}
+      }
+      
+      // 다른 에러는 상위로 전파
+      const errorMessage = error.response?.data?.message || error.message || ''
+      if (!errorMessage.includes('허용된 요청 개수를 초과')) {
+        // console.error('현재가 조회 오류:', errorMessage)
       }
       throw error
     }
@@ -1059,8 +1140,9 @@ export class KiwoomService {
       
       // kt00001 응답 구조에 따라 데이터 추출
       if (response.entr !== undefined) {
-        // entr: 입금가능금액 (예수금) - 문자열로 오므로 숫자로 변환
-        deposit = parseFloat(String(response.entr).trim()) || 0
+        // entr: 입금가능금액 (예수금) - 문자열로 오므로 숫자로 변환 (쉼표, 공백 제거)
+        const entrStr = String(response.entr).trim().replace(/[,\s]/g, '')
+        deposit = parseFloat(entrStr) || 0
         // pymn_alow_amt: 지급가능금액
         const pymnAlowAmt = parseFloat(String(response.pymn_alow_amt || '0').trim()) || 0
         // ord_alow_amt: 주문가능금액
@@ -1075,8 +1157,9 @@ export class KiwoomService {
         buyWght = 0
         dayBalRt = response.stk_entr_prst || [] // 보유 종목 리스트
       } else if (response.dbst_bal !== undefined) {
-        // 기존 dbst_bal 필드가 있는 경우 (다른 API 응답 구조)
-        deposit = parseFloat(String(response.dbst_bal)) || 0
+        // 기존 dbst_bal 필드가 있는 경우 (다른 API 응답 구조) - 쉼표, 공백 제거
+        const dbstBalStr = String(response.dbst_bal).trim().replace(/[,\s]/g, '')
+        deposit = parseFloat(dbstBalStr) || 0
         totBuyAmt = parseFloat(String(response.tot_buy_amt || '0')) || 0
         totEvltAmt = parseFloat(String(response.tot_evlt_amt || '0')) || 0
         totEvltvPrft = parseFloat(String(response.tot_evltv_prft || '0')) || 0
@@ -1087,7 +1170,8 @@ export class KiwoomService {
       } else if (response.output) {
         // output 객체에 있는 경우
         if (typeof response.output === 'object' && !Array.isArray(response.output)) {
-          deposit = parseFloat(String(response.output.entr || response.output.dbst_bal || '0')) || 0
+          const outputDepositStr = String(response.output.entr || response.output.dbst_bal || '0').trim().replace(/[,\s]/g, '')
+          deposit = parseFloat(outputDepositStr) || 0
           totBuyAmt = parseFloat(String(response.output.tot_buy_amt || '0')) || 0
           totEvltAmt = parseFloat(String(response.output.tot_evlt_amt || '0')) || 0
           totEvltvPrft = parseFloat(String(response.output.tot_evltv_prft || '0')) || 0
@@ -1098,7 +1182,8 @@ export class KiwoomService {
         } else if (Array.isArray(response.output) && response.output.length > 0) {
           // 배열인 경우 첫 번째 요소 사용
           const firstItem = response.output[0]
-          deposit = parseFloat(String(firstItem.entr || firstItem.dbst_bal || '0')) || 0
+          const firstItemDepositStr = String(firstItem.entr || firstItem.dbst_bal || '0').trim().replace(/[,\s]/g, '')
+          deposit = parseFloat(firstItemDepositStr) || 0
           totBuyAmt = parseFloat(String(firstItem.tot_buy_amt || '0')) || 0
           totEvltAmt = parseFloat(String(firstItem.tot_evlt_amt || '0')) || 0
           totEvltvPrft = parseFloat(String(firstItem.tot_evltv_prft || '0')) || 0
@@ -1109,7 +1194,8 @@ export class KiwoomService {
         }
       } else if (response.output2) {
         // output2 객체에 있는 경우
-        deposit = parseFloat(String(response.output2.entr || response.output2.dbst_bal || '0')) || 0
+        const output2DepositStr = String(response.output2.entr || response.output2.dbst_bal || '0').trim().replace(/[,\s]/g, '')
+        deposit = parseFloat(output2DepositStr) || 0
         totBuyAmt = parseFloat(String(response.output2.tot_buy_amt || '0')) || 0
         totEvltAmt = parseFloat(String(response.output2.tot_evlt_amt || '0')) || 0
         totEvltvPrft = parseFloat(String(response.output2.tot_evltv_prft || '0')) || 0
@@ -1120,6 +1206,12 @@ export class KiwoomService {
       }
       
       console.log('[예수금 조회] 파싱된 예수금 (entr):', deposit)
+      
+      // 예수금 캐시 업데이트 (성공한 경우만)
+      if (deposit > 0) {
+        this.cachedDeposit = deposit
+        this.cachedDepositTime = Date.now()
+      }
       
       return {
         deposit: deposit,
@@ -1138,9 +1230,30 @@ export class KiwoomService {
                          (error.response?.data?.return_code === 5)
       
       if (isRateLimit) {
+        // 캐시된 예수금이 있고 5분 이내라면 캐시된 값 사용 (API 제한 에러 발생 시에도 예수금 정보 유지)
+        const cacheAge = Date.now() - this.cachedDepositTime
+        const CACHE_VALID_TIME = 5 * 60 * 1000 // 5분
+        
+        if (this.cachedDeposit !== null && cacheAge < CACHE_VALID_TIME) {
+          console.log(`[예수금 조회] API 제한 에러 발생, 캐시된 예수금 사용: ${this.cachedDeposit}원 (캐시 시간: ${Math.floor(cacheAge / 1000)}초 전)`)
+          return { 
+            deposit: this.cachedDeposit,
+            qryDt: qryDt,
+            totBuyAmt: 0,
+            totEvltAmt: 0,
+            totEvltvPrft: 0,
+            totPrftRt: 0,
+            dayStkAsst: 0,
+            buyWght: 0,
+            dayBalRt: [],
+            warning: 'API 요청 제한 초과로 캐시된 예수금 정보를 사용합니다'
+          }
+        }
+        
         return { 
-          deposit: 0,
-          error: 'API 요청 제한 초과 (잠시 후 다시 시도해주세요)'
+          deposit: this.cachedDeposit || 0, // 캐시가 있으면 사용, 없으면 0
+          error: 'API 요청 제한 초과 (잠시 후 다시 시도해주세요)',
+          warning: this.cachedDeposit !== null ? '캐시된 예수금 정보를 사용합니다' : undefined
         }
       }
       
@@ -1179,17 +1292,39 @@ export class KiwoomService {
       if (!depositInfo.error) {
         // kt00001이 성공하면 이를 사용
         console.log('[계좌 정보] kt00001 성공, 예수금:', depositInfo.deposit)
+        console.log('[계좌 정보] dayBalRt 보유 종목 수:', depositInfo.dayBalRt?.length || 0)
         return {
           output1: depositInfo.dayBalRt || [],
+          dayBalRt: depositInfo.dayBalRt || [], // 보유 종목 정보 (getBalance에서 사용)
+          stk_entr_prst: depositInfo.dayBalRt || [], // 보유 종목 정보 (다른 형식)
           output2: {
             DNCA_TOT_AMT: depositInfo.deposit, // 예수금
             TOT_EVAL_AMT: depositInfo.totEvltAmt, // 총평가금액
             EVAL_PNLS_AMT: depositInfo.totEvltvPrft, // 총평가손익
             EVAL_PNLS_RT: depositInfo.totPrftRt, // 총수익률
-          }
+          },
+          deposit: depositInfo.deposit, // 직접 deposit 필드도 포함
+          warning: depositInfo.warning // 경고 메시지 전달
         }
       } else {
         console.log('[계좌 정보] kt00001 에러:', depositInfo.error)
+        // API 제한 에러이고 캐시된 예수금이 있으면 캐시된 값 사용
+        if (depositInfo.warning && this.cachedDeposit !== null) {
+          console.log(`[계좌 정보] API 제한 에러 발생, 캐시된 예수금 사용: ${this.cachedDeposit}원`)
+          return {
+            output1: [],
+            dayBalRt: [],
+            stk_entr_prst: [],
+            output2: {
+              DNCA_TOT_AMT: this.cachedDeposit, // 캐시된 예수금 사용
+              TOT_EVAL_AMT: 0,
+              EVAL_PNLS_AMT: 0,
+              EVAL_PNLS_RT: 0,
+            },
+            deposit: this.cachedDeposit, // 직접 deposit 필드도 포함
+            warning: depositInfo.warning || 'API 요청 제한 초과로 캐시된 예수금 정보를 사용합니다'
+          }
+        }
       }
     } catch (error: any) {
       // kt00001 실패 시 기존 API 사용
@@ -1278,24 +1413,309 @@ export class KiwoomService {
 
   /**
    * 보유 종목 조회
-   * ka01690 API는 일별잔고수익률만 제공하므로 보유 종목 리스트는 제공하지 않음
-   * 계좌 요약 정보만 반환
+   * getAccountInfo에서 받은 일별잔고수익률(dayBalRt) 또는 output1에서 보유 종목 정보 추출
+   * 모의투자 환경에서는 kt00001이 보유 종목을 제공하지 않을 수 있으므로 ka01690 API를 직접 호출
    */
   async getBalance(accountNo?: string, accountProductCode?: string): Promise<any> {
     try {
+      // 먼저 getAccountInfo로 시도
       const accountInfo = await this.getAccountInfo(accountNo, accountProductCode)
       
+      // 보유 종목 정보 추출
+      const stocks: any[] = []
+      
+      // 1. output1에서 보유 종목 추출 (일별잔고수익률)
+      if (accountInfo.output1 && Array.isArray(accountInfo.output1)) {
+        console.log(`[보유 종목 조회] output1에서 ${accountInfo.output1.length}개 항목 확인 중`)
+        accountInfo.output1.forEach((item: any, index: number) => {
+          // 첫 번째 항목의 구조 확인 (디버깅용)
+          if (index === 0) {
+            console.log(`[보유 종목 조회] output1 첫 번째 항목 구조:`, Object.keys(item))
+            console.log(`[보유 종목 조회] output1 첫 번째 항목 샘플:`, JSON.stringify(item).substring(0, 500))
+          }
+          
+          // 보유 수량이 0보다 큰 종목만 추가
+          const quantity = parseFloat(item.HLDG_QTY || item.보유수량 || item.hldg_qty || item.quantity || '0') || 0
+          if (quantity > 0) {
+            stocks.push({
+              code: item.PDNO || item.종목코드 || item.stk_cd || item.code || '',
+              name: item.PRNT_KOR_ISNM || item.종목명 || item.stk_nm || item.name || '',
+              quantity: quantity,
+              purchasePrice: parseFloat(item.PCHS_AVG_PRIC || item.매입가 || item.pchs_avg_pric || item.purchasePrice || '0') || 0,
+              currentPrice: parseFloat(item.OVRS_NXST_PRPR || item.현재가 || item.cur_prc || item.PRICE || item.currentPrice || '0') || 0,
+              profit: parseFloat(item.EVLU_PFLS_AMT || item.평가손익 || item.evlu_pfls_amt || item.profit || '0') || 0,
+              profitPercent: parseFloat(item.EVLU_PFLS_RT || item.수익률 || item.evlu_pfls_rt || item.profitPercent || '0') || 0,
+              maxProfitPercent: 0, // 최고 수익률은 별도 추적 필요
+            })
+          }
+        })
+      }
+      
+      // 2. dayBalRt에서 보유 종목 추출 (kt00001 응답)
+      if (accountInfo.dayBalRt && Array.isArray(accountInfo.dayBalRt) && accountInfo.dayBalRt.length > 0) {
+        console.log(`[보유 종목 조회] dayBalRt에서 ${accountInfo.dayBalRt.length}개 항목 확인 중`)
+        accountInfo.dayBalRt.forEach((item: any, index: number) => {
+          // 첫 번째 항목의 구조 확인 (디버깅용)
+          if (index === 0) {
+            console.log(`[보유 종목 조회] dayBalRt 첫 번째 항목 구조:`, Object.keys(item))
+            console.log(`[보유 종목 조회] dayBalRt 첫 번째 항목 샘플:`, JSON.stringify(item).substring(0, 500))
+          }
+          
+          // 보유 수량이 0보다 큰 종목만 추가
+          const quantity = parseFloat(item.hldg_qty || item.HLDG_QTY || item.보유수량 || item.quantity || '0') || 0
+          if (quantity > 0) {
+            // 이미 추가된 종목인지 확인 (중복 제거)
+            const exists = stocks.find(s => s.code === (item.stk_cd || item.종목코드 || item.PDNO || item.code || ''))
+            if (!exists) {
+              stocks.push({
+                code: item.stk_cd || item.종목코드 || item.PDNO || item.code || '',
+                name: item.stk_nm || item.종목명 || item.PRNT_KOR_ISNM || item.name || '',
+                quantity: quantity,
+                purchasePrice: parseFloat(item.pchs_avg_pric || item.매입가 || item.PCHS_AVG_PRIC || item.purchasePrice || '0') || 0,
+                currentPrice: parseFloat(item.cur_prc || item.현재가 || item.CUR_PRC || item.PRICE || item.currentPrice || '0') || 0,
+                profit: parseFloat(item.evlu_pfls_amt || item.평가손익 || item.EVLU_PFLS_AMT || item.profit || '0') || 0,
+                profitPercent: parseFloat(item.evlu_pfls_rt || item.수익률 || item.EVLU_PFLS_RT || item.profitPercent || '0') || 0,
+                maxProfitPercent: 0, // 최고 수익률은 별도 추적 필요
+              })
+            }
+          }
+        })
+      }
+      
+      // 3. stk_entr_prst에서 보유 종목 추출 (kt00001 응답의 다른 형식)
+      if (accountInfo.stk_entr_prst && Array.isArray(accountInfo.stk_entr_prst) && accountInfo.stk_entr_prst.length > 0) {
+        console.log(`[보유 종목 조회] stk_entr_prst에서 ${accountInfo.stk_entr_prst.length}개 항목 확인 중`)
+        accountInfo.stk_entr_prst.forEach((item: any, index: number) => {
+          // 첫 번째 항목의 구조 확인 (디버깅용)
+          if (index === 0) {
+            console.log(`[보유 종목 조회] stk_entr_prst 첫 번째 항목 구조:`, Object.keys(item))
+            console.log(`[보유 종목 조회] stk_entr_prst 첫 번째 항목 샘플:`, JSON.stringify(item).substring(0, 500))
+          }
+          
+          const quantity = parseFloat(item.hldg_qty || item.HLDG_QTY || item.보유수량 || item.quantity || '0') || 0
+          if (quantity > 0) {
+            const exists = stocks.find(s => s.code === (item.stk_cd || item.종목코드 || item.code || ''))
+            if (!exists) {
+              stocks.push({
+                code: item.stk_cd || item.종목코드 || item.code || '',
+                name: item.stk_nm || item.종목명 || item.name || '',
+                quantity: quantity,
+                purchasePrice: parseFloat(item.pchs_avg_pric || item.매입가 || item.purchasePrice || '0') || 0,
+                currentPrice: parseFloat(item.cur_prc || item.현재가 || item.currentPrice || '0') || 0,
+                profit: parseFloat(item.evlu_pfls_amt || item.평가손익 || item.profit || '0') || 0,
+                profitPercent: parseFloat(item.evlu_pfls_rt || item.수익률 || item.profitPercent || '0') || 0,
+                maxProfitPercent: 0,
+              })
+            }
+          }
+        })
+      }
+      
+      // 4. 보유 종목이 없으면 ka01690 API를 직접 호출하여 시도
+      if (stocks.length === 0 && !accountInfo.error) {
+        console.log(`[보유 종목 조회] kt00001에서 보유 종목을 찾지 못함, ka01690 API 직접 호출 시도`)
+        
+        try {
+          const endpoint = '/api/dostk/acnt'
+          const trId = 'ka01690' // 일별잔고수익률 TR_ID
+          
+          // 오늘 날짜로 조회 (YYYYMMDD 형식)
+          const today = new Date()
+          const year = today.getFullYear()
+          const month = String(today.getMonth() + 1).padStart(2, '0')
+          const day = String(today.getDate()).padStart(2, '0')
+          const qryDt = `${year}${month}${day}`
+          
+          const data = {
+            qry_dt: qryDt // 조회일자
+          }
+          
+          const response = await this.request(endpoint, trId, data, 'POST')
+          
+          console.log(`[보유 종목 조회] ka01690 응답 구조:`, Object.keys(response))
+          console.log(`[보유 종목 조회] ka01690 응답 샘플:`, JSON.stringify(response).substring(0, 1000))
+          
+          // ka01690 응답에서 보유 종목 추출
+          if (response.output && Array.isArray(response.output)) {
+            console.log(`[보유 종목 조회] ka01690 output에서 ${response.output.length}개 항목 확인 중`)
+            response.output.forEach((item: any, index: number) => {
+              if (index === 0) {
+                console.log(`[보유 종목 조회] ka01690 output 첫 번째 항목 구조:`, Object.keys(item))
+                console.log(`[보유 종목 조회] ka01690 output 첫 번째 항목 샘플:`, JSON.stringify(item).substring(0, 500))
+              }
+              
+              // 보유 수량이 0보다 큰 종목만 추가
+              const quantity = parseFloat(item.HLDG_QTY || item.보유수량 || item.hldg_qty || item.quantity || '0') || 0
+              if (quantity > 0) {
+                const exists = stocks.find(s => s.code === (item.PDNO || item.종목코드 || item.stk_cd || item.code || ''))
+                if (!exists) {
+                  stocks.push({
+                    code: item.PDNO || item.종목코드 || item.stk_cd || item.code || '',
+                    name: item.PRNT_KOR_ISNM || item.종목명 || item.stk_nm || item.name || '',
+                    quantity: quantity,
+                    purchasePrice: parseFloat(item.PCHS_AVG_PRIC || item.매입가 || item.pchs_avg_pric || item.purchasePrice || '0') || 0,
+                    currentPrice: parseFloat(item.OVRS_NXST_PRPR || item.현재가 || item.cur_prc || item.PRICE || item.currentPrice || '0') || 0,
+                    profit: parseFloat(item.EVLU_PFLS_AMT || item.평가손익 || item.evlu_pfls_amt || item.profit || '0') || 0,
+                    profitPercent: parseFloat(item.EVLU_PFLS_RT || item.수익률 || item.evlu_pfls_rt || item.profitPercent || '0') || 0,
+                    maxProfitPercent: 0,
+                  })
+                }
+              }
+            })
+          }
+          
+          // output1, output2 등 다른 필드도 확인
+          const possibleFields = ['output1', 'output2', 'stocks', 'holdings', 'balance']
+          for (const field of possibleFields) {
+            if (response[field] && Array.isArray(response[field]) && response[field].length > 0) {
+              console.log(`[보유 종목 조회] ka01690 ${field}에서 ${response[field].length}개 항목 발견`)
+              response[field].forEach((item: any) => {
+                const quantity = parseFloat(item.HLDG_QTY || item.보유수량 || item.hldg_qty || item.quantity || '0') || 0
+                if (quantity > 0) {
+                  const exists = stocks.find(s => s.code === (item.PDNO || item.종목코드 || item.stk_cd || item.code || ''))
+                  if (!exists) {
+                    stocks.push({
+                      code: item.PDNO || item.종목코드 || item.stk_cd || item.code || '',
+                      name: item.PRNT_KOR_ISNM || item.종목명 || item.stk_nm || item.name || '',
+                      quantity: quantity,
+                      purchasePrice: parseFloat(item.PCHS_AVG_PRIC || item.매입가 || item.pchs_avg_pric || item.purchasePrice || '0') || 0,
+                      currentPrice: parseFloat(item.OVRS_NXST_PRPR || item.현재가 || item.cur_prc || item.PRICE || item.currentPrice || '0') || 0,
+                      profit: parseFloat(item.EVLU_PFLS_AMT || item.평가손익 || item.evlu_pfls_amt || item.profit || '0') || 0,
+                      profitPercent: parseFloat(item.EVLU_PFLS_RT || item.수익률 || item.evlu_pfls_rt || item.profitPercent || '0') || 0,
+                      maxProfitPercent: 0,
+                    })
+                  }
+                }
+              })
+            }
+          }
+        } catch (ka01690Error: any) {
+          console.log(`[보유 종목 조회] ka01690 직접 호출 실패:`, ka01690Error.message)
+        }
+      }
+      
+      // 5. 보유 종목이 여전히 없으면 주문 내역을 기반으로 보유 종목 계산
+      if (stocks.length === 0 && accountNo) {
+        console.log(`[보유 종목 조회] 주문 내역 기반 보유 종목 계산 시도`)
+        try {
+          const orderHistory = await this.getOrderHistory(accountNo)
+          
+          if (orderHistory && orderHistory.length > 0) {
+            // 체결된 주문만 필터링
+            const executedOrders = orderHistory.filter((order: any) => {
+              const status = order.status || ''
+              return status.includes('체결') || status === '완료' || status === '체결완료'
+            })
+            
+            console.log(`[보유 종목 조회] 주문 내역에서 체결된 주문 ${executedOrders.length}개 발견`)
+            
+            // 종목별로 매수/매도 수량 집계
+            const stockMap = new Map<string, {
+              code: string
+              name: string
+              buyQuantity: number
+              sellQuantity: number
+              buyOrders: any[]
+              sellOrders: any[]
+            }>()
+            
+            executedOrders.forEach((order: any) => {
+              const stockCode = order.stockCode || order.PDNO || ''
+              const stockName = order.stockName || ''
+              const quantity = parseInt(order.quantity || order.ORD_QTY || '0') || 0
+              
+              if (!stockCode) return
+              
+              if (!stockMap.has(stockCode)) {
+                stockMap.set(stockCode, {
+                  code: stockCode,
+                  name: stockName,
+                  buyQuantity: 0,
+                  sellQuantity: 0,
+                  buyOrders: [],
+                  sellOrders: []
+                })
+              }
+              
+              const stock = stockMap.get(stockCode)!
+              if (order.type === 'buy' || order.SLL_BUY_DVSN_CD === '02') {
+                stock.buyQuantity += quantity
+                stock.buyOrders.push(order)
+              } else if (order.type === 'sell' || order.SLL_BUY_DVSN_CD === '01') {
+                stock.sellQuantity += quantity
+                stock.sellOrders.push(order)
+              }
+            })
+            
+            // 보유 수량 계산 (매수 수량 - 매도 수량)
+            stockMap.forEach((stock, code) => {
+              const holdingQuantity = stock.buyQuantity - stock.sellQuantity
+              
+              if (holdingQuantity > 0) {
+                // 매수 주문의 평균 가격 계산
+                let totalBuyAmount = 0
+                let totalBuyQuantity = 0
+                stock.buyOrders.forEach((order: any) => {
+                  const qty = parseInt(order.quantity || order.ORD_QTY || '0') || 0
+                  const price = parseInt(order.price || order.ORD_UNPR || '0') || 0
+                  totalBuyAmount += qty * price
+                  totalBuyQuantity += qty
+                })
+                
+                // 매도 주문의 평균 가격 계산 (매도된 수량만큼 매입가 차감)
+                let totalSellAmount = 0
+                let totalSellQuantity = 0
+                stock.sellOrders.forEach((order: any) => {
+                  const qty = parseInt(order.quantity || order.ORD_QTY || '0') || 0
+                  const price = parseInt(order.price || order.ORD_UNPR || '0') || 0
+                  totalSellAmount += qty * price
+                  totalSellQuantity += qty
+                })
+                
+                // 평균 매입가 계산 (FIFO 방식으로 간단히 계산)
+                const avgPurchasePrice = totalBuyQuantity > 0 
+                  ? Math.round(totalBuyAmount / totalBuyQuantity)
+                  : 0
+                
+                // 가장 최근 매수 주문에서 현재가 추정 (실제로는 시세 조회 필요)
+                const latestBuyOrder = stock.buyOrders[stock.buyOrders.length - 1]
+                const estimatedCurrentPrice = latestBuyOrder 
+                  ? parseInt(latestBuyOrder.price || latestBuyOrder.ORD_UNPR || '0') || avgPurchasePrice
+                  : avgPurchasePrice
+                
+                stocks.push({
+                  code: code,
+                  name: stock.name || code,
+                  quantity: holdingQuantity,
+                  purchasePrice: avgPurchasePrice,
+                  currentPrice: estimatedCurrentPrice,
+                  profit: (estimatedCurrentPrice - avgPurchasePrice) * holdingQuantity,
+                  profitPercent: avgPurchasePrice > 0 
+                    ? ((estimatedCurrentPrice - avgPurchasePrice) / avgPurchasePrice) * 100 
+                    : 0,
+                  maxProfitPercent: 0,
+                })
+              }
+            })
+            
+            console.log(`[보유 종목 조회] 주문 내역 기반 계산 결과: ${stocks.length}개 종목 발견`)
+          }
+        } catch (orderHistoryError: any) {
+          console.log(`[보유 종목 조회] 주문 내역 기반 계산 실패:`, orderHistoryError.message)
+        }
+      }
+      
+      console.log(`[보유 종목 조회] 최종 ${stocks.length}개 종목 발견:`, stocks.length > 0 ? stocks.map(s => `${s.name}(${s.code})`).join(', ') : '없음')
+      
       // 에러가 있는 경우 에러 정보 포함하여 반환
-      if (accountInfo.error) {
+      if (accountInfo.error && stocks.length === 0) {
         return {
           error: accountInfo.error,
           stocks: []
         }
       }
       
-      // ka01690 API는 일별잔고수익률만 제공하므로 보유 종목 리스트는 없음
-      // 빈 배열 반환
-      return []
+      return stocks
     } catch (error: any) {
       let errorMessage = '보유 종목 조회에 실패했습니다.'
       if (error.response?.data?.message) {
@@ -1506,67 +1926,129 @@ export class KiwoomService {
       throw new Error('키움증권 API에 연결되지 않았습니다')
     }
 
-    const endpoint = '/uapi/domestic-stock/v1/trading/inquire-daily-ccld'
-    const trId = 'TTTC8001R' // 일자별체결내역조회 TR_ID
+    // 모의투자 환경 감지
+    const isMockApi = this.config?.host?.includes('mockapi.kiwoom.com')
+    
+    // 모의투자와 실전 환경의 엔드포인트 및 TR_ID 설정
+    const endpoint = isMockApi
+      ? '/api/dostk/ordr'  // 모의투자 환경 주문 내역 조회 API (추정)
+      : '/uapi/domestic-stock/v1/trading/inquire-daily-ccld'  // 실전 환경 주문 내역 조회 API
+    
+    const trId = isMockApi
+      ? 'kt10002'  // 모의투자 환경 주문 내역 조회 TR_ID (추정)
+      : 'TTTC8001R'  // 실전 환경 일자별체결내역조회 TR_ID
     
     // 계좌번호에서 계좌번호와 계좌상품코드 분리
     const accountParts = accountNo.split('-')
     const cano = accountParts[0] || accountNo
     const acntPrdtCd = accountParts[1] || '01'
 
-    const data = {
-      CANO: cano, // 계좌번호
-      ACNT_PRDT_CD: acntPrdtCd, // 계좌상품코드
-      INQR_STRT_DT: new Date().toISOString().split('T')[0].replace(/-/g, ''), // 조회시작일자 (YYYYMMDD)
-      INQR_END_DT: new Date().toISOString().split('T')[0].replace(/-/g, ''), // 조회종료일자 (YYYYMMDD)
-      SLL_BUY_DVSN_CD: '00', // 매도매수구분코드 (00: 전체, 01: 매도, 02: 매수)
-      INQR_DVSN: '00', // 조회구분 (00: 역순, 01: 정순)
-      PDNO: '', // 종목코드 (전체 조회 시 빈값)
-      CCLD_DVSN: '00', // 체결구분 (00: 전체, 01: 체결, 02: 미체결)
-      ORD_GNO_BRNO: '', // 주문채번지점번호 (전체 조회 시 빈값)
-      ODNO: '', // 주문번호 (전체 조회 시 빈값)
-    }
+    // 모의투자와 실전 환경의 요청 데이터 형식이 다를 수 있음
+    const data = isMockApi
+      ? {
+          // 모의투자 환경 요청 파라미터 (추정)
+          dt: new Date().toISOString().split('T')[0].replace(/-/g, ''), // 조회일자
+        }
+      : {
+          CANO: cano, // 계좌번호
+          ACNT_PRDT_CD: acntPrdtCd, // 계좌상품코드
+          INQR_STRT_DT: '20200101', // 조회시작일자 (YYYYMMDD) - 최근 5년치
+          INQR_END_DT: new Date().toISOString().split('T')[0].replace(/-/g, ''), // 조회종료일자 (YYYYMMDD)
+          SLL_BUY_DVSN_CD: '00', // 매도매수구분코드 (00: 전체, 01: 매도, 02: 매수)
+          INQR_DVSN: '00', // 조회구분 (00: 역순, 01: 정순)
+          PDNO: '', // 종목코드 (전체 조회 시 빈값)
+          CCLD_DVSN: '00', // 체결구분 (00: 전체, 01: 체결, 02: 미체결)
+          ORD_GNO_BRNO: '', // 주문채번지점번호 (전체 조회 시 빈값)
+          ODNO: '', // 주문번호 (전체 조회 시 빈값)
+        }
 
     try {
-      const response = await this.request(endpoint, trId, data, 'GET')
+      const method = isMockApi ? 'POST' : 'GET'
+      const response = await this.request(endpoint, trId, data, method)
       
-      console.log(`[주문 내역 조회] 응답 구조:`, JSON.stringify(response, null, 2).substring(0, 500))
+      // console.log(`[주문 내역 조회] 모의투자: ${isMockApi ? '예' : '아니오'}, 응답 구조:`, JSON.stringify(response, null, 2).substring(0, 500))
       
-      // 응답 데이터 파싱
+      // 응답 데이터 파싱 (모의투자와 실전 환경의 응답 형식이 다를 수 있음)
+      let ordersArray: any[] = []
+      
+      // output 필드 확인
       if (response.output && Array.isArray(response.output)) {
-        const orders = response.output.map((item: any, index: number) => ({
-          id: index + 1,
-          date: item.ORD_DT || item.주문일자 || new Date().toLocaleDateString('ko-KR'),
-          time: item.ORD_TMD || item.주문시간 || new Date().toLocaleTimeString('ko-KR'),
-          type: item.SLL_BUY_DVSN_CD === '01' ? 'sell' : 'buy', // 01: 매도, 02: 매수
-          stockName: item.PDNO || item.종목코드 || '',
-          stockCode: item.PDNO || item.종목코드 || '',
-          quantity: parseInt(item.ORD_QTY || item.주문수량 || '0'),
-          price: parseInt(item.ORD_UNPR || item.주문단가 || '0'),
-          status: item.ORD_STAT_CD === '10' ? '접수' : 
-                  item.ORD_STAT_CD === '20' ? '체결' : 
-                  item.ORD_STAT_CD === '30' ? '취소' : '미체결',
-          orderNumber: item.ODNO || item.주문번호 || '',
-        }))
-        console.log(`[주문 내역 조회] 파싱된 주문 개수: ${orders.length}`)
+        ordersArray = response.output
+      } else if (response.output1 && Array.isArray(response.output1)) {
+        ordersArray = response.output1
+      } else if (Array.isArray(response)) {
+        ordersArray = response
+      }
+      
+      if (ordersArray.length > 0) {
+        const orders = ordersArray.map((item: any, index: number) => {
+          // 모의투자와 실전 환경의 필드명이 다를 수 있음
+          const orderDate = item.ORD_DT || item.ord_dt || item.주문일자 || item.date || new Date().toLocaleDateString('ko-KR')
+          const orderTime = item.ORD_TMD || item.ord_tm || item.주문시간 || item.time || new Date().toLocaleTimeString('ko-KR')
+          const sllBuyDvsnCd = item.SLL_BUY_DVSN_CD || item.sll_buy_dvsn_cd || item.주문구분 || item.type || ''
+          const stockCode = item.PDNO || item.pdno || item.종목코드 || item.stockCode || item.stk_cd || ''
+          const stockName = item.PRNT_KOR_ISNM || item.prnt_kor_isnm || item.종목명 || item.stockName || item.stk_nm || ''
+          const quantity = parseInt(item.ORD_QTY || item.ord_qty || item.주문수량 || item.quantity || item.qty || '0') || 0
+          const price = parseInt(item.ORD_UNPR || item.ord_unpr || item.주문단가 || item.price || item.prc || '0') || 0
+          const unfilledQuantity = parseInt(item.ORD_REM_QTY || item.ord_rem_qty || item.미체결수량 || item.unfilledQuantity || '0') || 0
+          const orderStatus = item.ORD_STAT_CD || item.ord_stat_cd || item.주문상태 || item.status || ''
+          const orderNumber = item.ODNO || item.odno || item.주문번호 || item.orderNumber || item.ord_no || ''
+          
+          // 주문 타입 판단 (01: 매도, 02: 매수)
+          let orderType = 'buy'
+          if (sllBuyDvsnCd === '01' || sllBuyDvsnCd === '매도' || sllBuyDvsnCd === 'sell') {
+            orderType = 'sell'
+          }
+          
+          // 주문 상태 판단
+          let status = '미체결'
+          if (orderStatus === '10' || orderStatus === '접수') {
+            status = '접수'
+          } else if (orderStatus === '20' || orderStatus === '체결' || orderStatus === '완료' || orderStatus === '체결완료') {
+            status = '체결'
+          } else if (orderStatus === '30' || orderStatus === '취소') {
+            status = '취소'
+          } else if (orderStatus === '부분체결') {
+            status = '부분체결'
+          }
+          
+          return {
+            id: index + 1,
+            date: orderDate,
+            time: orderTime,
+            type: orderType,
+            stockName: stockName || stockCode,
+            stockCode: stockCode,
+            quantity: quantity,
+            price: price,
+            unfilledQuantity: unfilledQuantity,
+            status: status,
+            orderNumber: orderNumber,
+            SLL_BUY_DVSN_CD: sllBuyDvsnCd, // 원본 필드도 유지 (보유 종목 계산 시 사용)
+            ORD_QTY: quantity.toString(), // 원본 필드도 유지
+            ORD_UNPR: price.toString(), // 원본 필드도 유지
+          }
+        })
+        
+        // console.log(`[주문 내역 조회] 파싱된 주문 개수: ${orders.length}`)
         return orders
       }
       
       // 키움 REST API 응답이 예상과 다른 경우 빈 배열 반환
       // 모의투자 환경에서는 조용히 처리
-      console.log(`[주문 내역 조회] 응답에 output 배열이 없음. 응답 키:`, Object.keys(response))
+      // console.log(`[주문 내역 조회] 응답에 output 배열이 없음. 응답 키:`, Object.keys(response))
       return []
     } catch (error: any) {
       // 모의투자 환경에서 500 에러는 정상적인 제한사항일 수 있음
       const status = error.response?.status || error.status
       const errorMessage = error.response?.data?.error || error.response?.data?.message || error.message || ''
       
-      console.log(`[주문 내역 조회] 에러 발생 - 상태: ${status}, 메시지: ${errorMessage.substring(0, 200)}`)
+      // console.log(`[주문 내역 조회] 에러 발생 - 상태: ${status}, 메시지: ${errorMessage.substring(0, 200)}`)
       
       // 500 에러나 서버 에러는 조용히 처리 (모의투자 환경 제한)
       if (status === 500 || errorMessage.includes('INTERNAL_SERVER_ERROR')) {
         // 모의투자 환경에서는 주문 내역 조회가 제한될 수 있음
-        console.log(`[주문 내역 조회] 모의투자 환경 제한으로 빈 배열 반환`)
+        // console.log(`[주문 내역 조회] 모의투자 환경 제한으로 빈 배열 반환`)
         return []
       }
       
@@ -2014,7 +2496,7 @@ export class KiwoomService {
         
         // 각 그룹 등록 시 약간의 딜레이 추가 (API 제한 방지)
         setTimeout(() => {
-          this.webSocketService.registerRealTime(groupCodes, ['00'], groupNo, refresh)
+          this.webSocketService?.registerRealTime(groupCodes, ['00'], groupNo, refresh)
         }, i * 100) // 100ms 간격으로 등록
       }
     }

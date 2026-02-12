@@ -11,7 +11,7 @@ interface BeforeInstallPromptEvent extends Event {
   prompt(): Promise<void>;
 }
 
-export default function PWAInstaller() {
+export default function PWAInstallPrompt() {
   const [deferredPrompt, setDeferredPrompt] =
     useState<BeforeInstallPromptEvent | null>(null);
   const [showInstallPrompt, setShowInstallPrompt] = useState(false);
@@ -19,15 +19,16 @@ export default function PWAInstaller() {
 
   useEffect(() => {
     const handleBeforeInstallPrompt = (e: Event) => {
+      console.log('🚀 PWA 설치 프롬프트 감지됨');
       e.preventDefault();
       setDeferredPrompt(e as BeforeInstallPromptEvent);
       setShowInstallPrompt(true);
     };
 
     const handleAppInstalled = () => {
+      console.log('✅ PWA가 설치되었습니다');
       setDeferredPrompt(null);
       setShowInstallPrompt(false);
-      console.log("PWA가 설치되었습니다");
     };
 
     // 이벤트 리스너 등록
@@ -52,18 +53,24 @@ export default function PWAInstaller() {
 
   const handleInstallClick = async () => {
     if (!deferredPrompt) return;
+    
+    console.log('📱 PWA 설치 시작');
     deferredPrompt.prompt();
+    
     const { outcome } = await deferredPrompt.userChoice;
+    
     if (outcome === "accepted") {
-      console.log("사용자가 PWA 설치를 수락했습니다");
+      console.log("✅ 사용자가 PWA 설치를 승인했습니다");
     } else {
-      console.log("사용자가 PWA 설치를 거부했습니다");
+      console.log("❌ 사용자가 PWA 설치를 거부했습니다");
     }
+    
     setDeferredPrompt(null);
     setShowInstallPrompt(false);
   };
 
   const handleDismissInstall = () => {
+    console.log('🚫 PWA 설치 프롬프트 닫기');
     setShowInstallPrompt(false);
   };
 
@@ -116,8 +123,6 @@ export default function PWAInstaller() {
           </div>
         </div>
       )}
-
-      {/* 수동 가이드는 제거 (간단 동작 유지) */}
 
       {/* 업데이트 알림 */}
       {showUpdateAvailable && (
