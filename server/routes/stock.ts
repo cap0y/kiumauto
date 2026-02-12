@@ -39,10 +39,34 @@ router.get('/:code/price', async (req: Request, res: Response) => {
 
     const { code } = req.params
     const priceData = await kiwoomService.getCurrentPrice(code)
-    res.json(priceData)
+    
+    // 빈 객체가 아닌 경우에만 정상 응답
+    if (priceData && Object.keys(priceData).length > 0) {
+      res.json(priceData)
+    } else {
+      // 빈 객체인 경우에도 200 응답 (클라이언트에서 처리할 수 있도록)
+      // 500 에러로 인한 재시도 실패 시 빈 객체가 반환됨
+      res.json(priceData || {})
+    }
   } catch (error: any) {
+    // 요청 제한 에러는 특별 처리
+    if (error.isRateLimit) {
+      return res.status(429).json({
+        error: 'API 요청 제한 초과',
+        detail: error.message,
+        isRateLimit: true
+      })
+    }
+    
+    // 500 에러는 이미 서비스에서 빈 객체로 처리되므로 여기서는 다른 에러만 처리
+    const status = error.response?.status || 500
+    if (status === 500 || error.response?.data?.error === 'INTERNAL_SERVER_ERROR') {
+      // 500 에러는 빈 객체 반환 (서비스에서 이미 처리됨)
+      return res.json({})
+    }
+    
     console.error('현재가 조회 오류:', error)
-    res.status(500).json({
+    res.status(status).json({
       error: '현재가 조회 실패',
       detail: error.message
     })

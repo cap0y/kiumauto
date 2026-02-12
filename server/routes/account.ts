@@ -34,24 +34,46 @@ router.get('/', async (req: Request, res: Response) => {
     if (accountNo) {
       const accountInfo = await kiwoomService.getAccountInfo(accountNo, accountProductCode)
       
-      // 에러가 있는 경우 에러 정보 포함 (200 OK로 반환하여 클라이언트에서 처리)
+      // 에러가 있는 경우에도 캐시된 예수금이 있으면 사용
       if (accountInfo.error) {
+        // 예수금 추출: output2.DNCA_TOT_AMT 또는 직접 deposit 필드 확인
+        const deposit = accountInfo.output2?.DNCA_TOT_AMT || 
+                        accountInfo.output2?.예수금총액 || 
+                        accountInfo.deposit || 
+                        0
+        
+        // 예수금이 문자열인 경우 숫자로 변환
+        const depositValue = typeof deposit === 'string' 
+          ? parseFloat(deposit.replace(/[,\s]/g, '')) || 0 
+          : (typeof deposit === 'number' ? deposit : 0)
+        
         return res.status(200).json({
           accounts: accountList.length > 0 ? accountList : [accountNo],
           accountNumber: accountNo,
-          deposit: 0,
-          totalAsset: 0,
-          totalProfit: 0,
-          totalProfitRate: 0,
+          deposit: depositValue, // 캐시된 예수금이 있으면 사용, 없으면 0
+          totalAsset: accountInfo.output2?.TOT_EVAL_AMT || accountInfo.output2?.총평가금액 || 0,
+          totalProfit: accountInfo.output2?.EVAL_PNLS_AMT || accountInfo.output2?.총평가손익 || 0,
+          totalProfitRate: accountInfo.output2?.EVAL_PNLS_RT || accountInfo.output2?.총수익률 || 0,
           error: accountInfo.error,
-          warning: true
+          warning: accountInfo.warning || true // 경고 메시지도 전달
         })
       }
+      
+      // 예수금 추출: output2.DNCA_TOT_AMT를 우선 사용하고, 없으면 직접 deposit 필드 확인
+      const deposit = accountInfo.output2?.DNCA_TOT_AMT || 
+                      accountInfo.output2?.예수금총액 || 
+                      accountInfo.deposit || 
+                      0
+      
+      // 예수금이 문자열인 경우 숫자로 변환
+      const depositValue = typeof deposit === 'string' 
+        ? parseFloat(deposit.replace(/[,\s]/g, '')) || 0 
+        : (typeof deposit === 'number' ? deposit : 0)
       
       res.json({
         accounts: accountList.length > 0 ? accountList : [accountNo],
         accountNumber: accountNo,
-        deposit: accountInfo.output2?.DNCA_TOT_AMT || accountInfo.output2?.예수금총액 || 0,
+        deposit: depositValue,
         totalAsset: accountInfo.output2?.TOT_EVAL_AMT || accountInfo.output2?.총평가금액 || 0,
         totalProfit: accountInfo.output2?.EVAL_PNLS_AMT || accountInfo.output2?.총평가손익 || 0,
         totalProfitRate: accountInfo.output2?.EVAL_PNLS_RT || accountInfo.output2?.총수익률 || 0,

@@ -138,13 +138,43 @@ router.post('/search', async (req: Request, res: Response) => {
             '0'
           )
           
+          // 시가, 고가 파싱 (다양한 필드명 지원)
+          const openPrice = parseFloat(
+            stock.open_pric || 
+            stock.OPEN_PRIC || 
+            stock.open_price || 
+            stock.OPEN_PRICE || 
+            stock.open || 
+            stock.OPEN || 
+            stock.시가 || 
+            '0'
+          )
+          const highPrice = parseFloat(
+            stock.high_pric || 
+            stock.HIGH_PRIC || 
+            stock.high_price || 
+            stock.HIGH_PRICE || 
+            stock.high || 
+            stock.HIGH || 
+            stock.고가 || 
+            '0'
+          )
+          
+          // 전일대비 변동 금액 계산 (등락률과 현재가로 계산)
+          const change = changeRate !== 0 && price > 0 
+            ? (price * changeRate / 100) 
+            : parseFloat(stock.pred_pre || stock.PRED_PRE || stock.전일대비 || stock.DIFF || stock.diff || '0')
+          
           if (code && code !== '0000' && !stockMap.has(code)) {
             stockMap.set(code, {
               code: code.toString().padStart(6, '0'), // 6자리 종목코드로 정규화
               name: name || `종목${code}`,
               price: price || 0,
-              changeRate: changeRate || 0,
+              change: change, // 전일대비 변동 금액
+              changeRate: changeRate || 0, // 전일대비 등락률
               volume: volume || 0,
+              openPrice: openPrice || 0, // 시가
+              highPrice: highPrice || 0, // 고가
               marketCap: 0,
             })
           }
