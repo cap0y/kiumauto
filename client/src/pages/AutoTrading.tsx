@@ -6428,15 +6428,21 @@ const AutoTrading = () => {
         }
       `}</style>
       <div 
-        className={`w-full h-full overflow-hidden flex flex-col auto-trading-container ${
+        className={`auto-trading-container ${
           theme === 'dark' 
             ? 'bg-gradient-dark text-dark-text' 
             : 'bg-gray-50 text-gray-900'
         }`}
         style={{ 
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          display: 'flex',
+          flexDirection: 'column',
           fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-          margin: 0,
-          padding: 0
+          overflow: 'hidden'
         }}
       >
       {/* 상단 헤더 - 계좌 선택 */}
