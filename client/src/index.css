@@ -51,13 +51,11 @@ code {
 #root {
   min-height: 100vh;
   width: 100%;
-  margin: 0 auto;
+  margin: 0;
   padding: 0;
   overflow: hidden;
   position: relative;
   z-index: 1;
-  display: flex;
-  justify-content: center;
 }
 
 html, body {
@@ -66,8 +64,6 @@ html, body {
   width: 100%;
   height: 100%;
   overflow: hidden;
-  display: flex;
-  justify-content: center;
 }
 
 /* 화려한 버튼 스타일 */

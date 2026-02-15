@@ -25,11 +25,9 @@ const Layout = ({ children }: LayoutProps) => {
   }, [theme])
 
   return (
-    <div className="w-full h-screen overflow-hidden dark flex justify-center">
-      <div className="w-full max-w-[1920px] h-full">
-        {children}
-        <PWAInstaller />
-      </div>
+    <div className="w-full h-screen overflow-hidden dark">
+      {children}
+      <PWAInstaller />
     </div>
   )
 }
