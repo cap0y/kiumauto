@@ -6439,7 +6439,7 @@ const AutoTrading = () => {
           left: '50%',
           transform: 'translateX(-50%)',
           width: '100%',
-          maxWidth: '1280px',
+          maxWidth: '1024px',
           height: '100vh',
           display: 'flex',
           flexDirection: 'column',
