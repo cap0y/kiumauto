@@ -6396,15 +6396,15 @@ const AutoTrading = () => {
         }
         @media (max-width: 768px) {
           .auto-trading-container {
-            padding-left: 24px;
-            padding-right: 24px;
+            padding-left: 0;
+            padding-right: 0;
           }
           .trading-conditions-section {
-            border-radius: 8px;
-            margin-left: 8px;
-            margin-right: 8px;
-            margin-top: 8px;
-            margin-bottom: 8px;
+            border-radius: 0;
+            margin-left: 0;
+            margin-right: 0;
+            margin-top: 4px;
+            margin-bottom: 4px;
           }
           .bg-gradient-dark .trading-conditions-section {
             border: 1px solid #4b5563;
@@ -6413,11 +6413,11 @@ const AutoTrading = () => {
             border: 1px solid #d1d5db;
           }
           .account-summary-section {
-            border-radius: 8px;
-            margin-left: 8px;
-            margin-right: 8px;
-            margin-top: 8px;
-            margin-bottom: 8px;
+            border-radius: 0;
+            margin-left: 0;
+            margin-right: 0;
+            margin-top: 4px;
+            margin-bottom: 4px;
           }
           .bg-gradient-dark .account-summary-section {
             border: 1px solid #4b5563;
