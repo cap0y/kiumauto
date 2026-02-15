@@ -6428,7 +6428,7 @@ const AutoTrading = () => {
         }
       `}</style>
       <div 
-        className={`w-screen h-screen overflow-hidden flex flex-col auto-trading-container ${
+        className={`h-screen overflow-hidden flex flex-col auto-trading-container ${
           theme === 'dark' 
             ? 'bg-gradient-dark text-dark-text' 
             : 'bg-gray-50 text-gray-900'
@@ -6440,7 +6440,8 @@ const AutoTrading = () => {
           right: 0,
           bottom: 0,
           fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-          margin: 0,
+          maxWidth: '1920px',
+          margin: '0 auto',
           padding: 0
         }}
       >
