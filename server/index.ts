@@ -29,6 +29,15 @@ app.use(cors({
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 
+// Railway 헬스체크 엔드포인트
+app.get('/health', (_req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+  })
+})
+
 // API 라우터 설정
 app.use('/api', routes)
 
@@ -95,10 +104,11 @@ kiwoomService.onRealTimeData((data) => {
   })
 })
 
-// 서버 시작
-server.listen(PORT, () => {
+// 서버 시작 (Railway는 0.0.0.0 바인딩 필요)
+server.listen(Number(PORT), '0.0.0.0', () => {
   console.log(`서버가 포트 ${PORT}에서 실행 중입니다`)
   console.log(`환경: ${process.env.NODE_ENV || 'development'}`)
+  console.log(`Railway 배포: ${process.env.RAILWAY_ENVIRONMENT || 'local'}`)
 })
 
 export default app
