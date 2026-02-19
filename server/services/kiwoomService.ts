@@ -435,9 +435,9 @@ export class KiwoomService {
           change: parseFloat(item.DIFF || item.전일대비 || '0'),
           changePercent: parseFloat(item.RATE || item.등락률 || '0'),
           volume: parseFloat(item.VOLUME || item.거래량 || '0'),
-          시가: parseFloat(item.OPEN || item.시가 || '0'),
-          고가: parseFloat(item.HIGH || item.고가 || '0'),
-          저가: parseFloat(item.LOW || item.저가 || '0'),
+          시가: parseFloat(item.OPEN || item.open || item.OPEN_PRIC || item.open_pric || item.시가 || '0'),
+          고가: parseFloat(item.HIGH || item.high || item.HIGH_PRIC || item.high_pric || item.고가 || '0'),
+          저가: parseFloat(item.LOW || item.low || item.LOW_PRIC || item.low_pric || item.저가 || '0'),
           시가대비: parseFloat(item.시가대비 || '0'),
           고가대비: parseFloat(item.고가대비 || '0'),
         }
@@ -2329,18 +2329,19 @@ export class KiwoomService {
       const output = stocks.map((item: any) => {
         // 현재가 파싱 (문자열 형식 지원: "+65000" 등)
         const curPrcStr = item.cur_prc || item.PRICE || item.현재가 || item.prc || '0'
-        const price = parseFloat(curPrcStr.toString().replace(/[+\-]/g, '')) || 0
+        const price = parseFloat(curPrcStr.toString().replace(/,/g, '').replace(/[+\-]/g, '')) || 0
         
         // 전일대비 파싱
         const predPreStr = item.pred_pre || item.DIFF || item.전일대비 || item.diff || '0'
-        const change = parseFloat(predPreStr.toString().replace(/[+\-]/g, '')) || 0
+        const change = parseFloat(predPreStr.toString().replace(/,/g, '').replace(/[+\-]/g, '')) || 0
         
         // 등락률 파싱 (flu_rt 필드 지원)
         const fluRtStr = item.flu_rt || item.RATE || item.등락률 || item.prdy_chng_rt || '0'
-        const changePercent = parseFloat(fluRtStr.toString().replace(/[+\-%]/g, '')) || 0
+        const changePercent = parseFloat(fluRtStr.toString().replace(/,/g, '').replace(/[+\-%]/g, '')) || 0
         
         // 거래량 파싱
-        const volume = parseFloat(item.now_trde_qty || item.trde_qty || item.VOLUME || item.거래량 || item.acml_vol || '0') || 0
+        const volumeStr = (item.now_trde_qty || item.trde_qty || item.VOLUME || item.거래량 || item.acml_vol || '0').toString()
+        const volume = parseFloat(volumeStr.replace(/,/g, '')) || 0
         
         return {
           // 종목코드
