@@ -60,6 +60,7 @@ interface DetectedStock {
   isPatternBuy?: boolean // 패턴 매수 여부
   openPrice?: number // 당일 시가 (저장 및 복원 필요)
   highPrice?: number // 당일 고가 (저장 및 복원 필요)
+  lowPrice?: number // 당일 저가 (추가)
   prevClosePrice?: number // 전일 종가 (전일 대비 값 계산용)
 }
 
@@ -702,6 +703,7 @@ const AutoTrading = () => {
   })
   const [strategyBasicBuy, setStrategyBasicBuy] = useState<boolean>(true) // 기본매수설정
   
+
   // 오늘의 실현손익 총합 (매도 체결 완료 시 누적)
   const [todayTotalRealizedProfit, setTodayTotalRealizedProfit] = useState<number>(() => {
     const saved = localStorage.getItem('today_realized_profit')
@@ -2395,6 +2397,7 @@ const AutoTrading = () => {
   const displayedStockCountRef = useRef<number>(20)
   const detectedStocksLengthRef = useRef<number>(0)
   const detectedStocksRef = useRef<DetectedStock[]>([])
+  const watchlistStocksRef = useRef<DetectedStock[]>([])
   
   // 매매설정 값들을 ref로 관리하여 클로저 문제 해결 (자동매매 실행 시 최신 값 참조)
   const amountPerStockRef = useRef<number>(5000000)
@@ -2416,6 +2419,151 @@ const AutoTrading = () => {
     detectedStocksLengthRef.current = detectedStocks.length
     detectedStocksRef.current = detectedStocks // 최신 detectedStocks를 ref에 저장
   }, [detectedStocks])
+
+  useEffect(() => {
+    watchlistStocksRef.current = watchlistStocks
+  }, [watchlistStocks])
+
+  // 장 시작 시 시가/고가 정보 강제 업데이트 (10초마다 체크)
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      const now = new Date()
+      const hours = now.getHours()
+      const minutes = now.getMinutes()
+      
+      // 장 중(09:00 ~ 15:30)에만 실행
+      // 특히 09:00 ~ 09:30 사이에는 시가/고가 형성이 중요하므로 집중 체크
+      if (hours < 9 || hours > 15) return
+      if (hours === 15 && minutes > 30) return
+      
+      // 업데이트 대상 종목 수집 (시가 또는 고가가 0인 종목)
+      const targetCodes = new Set<string>()
+      
+      // 1. 감지된 종목 중 시가/고가 없는 것
+      detectedStocksRef.current.forEach(stock => {
+        if (!stock.openPrice || !stock.highPrice || stock.openPrice === 0 || stock.highPrice === 0) {
+          targetCodes.add(stock.code)
+        }
+      })
+      
+      // 2. 관심 종목 중 시가/고가 없는 것
+      watchlistStocksRef.current.forEach(stock => {
+        if (!stock.openPrice || !stock.highPrice || stock.openPrice === 0 || stock.highPrice === 0) {
+          targetCodes.add(stock.code)
+        }
+      })
+      
+      if (targetCodes.size === 0) return
+      
+      // API 호출하여 정보 업데이트
+      try {
+        const codes = Array.from(targetCodes)
+        const batchSize = 10
+        for (let i = 0; i < codes.length; i += batchSize) {
+          const batchCodes = codes.slice(i, i + batchSize)
+          const prices = await kiwoomApi.getMultipleStockPrices(batchCodes)
+          
+          // 상태 업데이트
+          if (prices && prices.length > 0) {
+            let hasUpdate = false
+            
+            // detectedStocks 업데이트
+            setDetectedStocks(prev => {
+              const next = prev.map(stock => {
+                const priceInfo = prices.find((p: any) => p.code === stock.code)
+                if (priceInfo && (priceInfo.시가 > 0 || priceInfo.고가 > 0)) {
+                  let hasChange = false
+                  
+                  // 가격 정보 추출 및 보정
+                  const currentPrice = priceInfo.price > 0 ? priceInfo.price : stock.price
+                  const changePercent = priceInfo.changePercent !== 0 ? priceInfo.changePercent : stock.changePercent
+                  let change = priceInfo.change !== 0 ? priceInfo.change : stock.change
+                  
+                  // 전일대비 보정 (등락률 기반 역산)
+                  if (currentPrice > 0 && changePercent !== 0) {
+                     const calculatedPrevClose = currentPrice / (1 + changePercent / 100)
+                     const calculatedChange = Math.round(currentPrice - calculatedPrevClose)
+                     
+                     // 서버 값과 계산 값이 너무 다르거나(10% 이상), 서버 값이 0이면 계산 값 사용
+                     if (change === 0 || Math.abs(change - calculatedChange) > Math.abs(calculatedChange * 0.1)) {
+                       change = calculatedChange
+                     }
+                  }
+
+                  if (stock.openPrice !== priceInfo.시가 || stock.highPrice !== priceInfo.고가 || stock.change !== change) {
+                    hasUpdate = true
+                    return {
+                      ...stock,
+                      openPrice: priceInfo.시가 || stock.openPrice,
+                      highPrice: priceInfo.고가 || stock.highPrice,
+                      lowPrice: priceInfo.저가 || stock.lowPrice,
+                      price: currentPrice,
+                      change: change,
+                      changePercent: changePercent,
+                      volume: priceInfo.volume > 0 ? priceInfo.volume : stock.volume,
+                    }
+                  }
+                }
+                return stock
+              })
+              return hasUpdate ? next : prev
+            })
+            
+            // watchlistStocks 업데이트
+            setWatchlistStocks(prev => {
+              let hasWatchlistUpdate = false
+              const next = prev.map(stock => {
+                const priceInfo = prices.find((p: any) => p.code === stock.code)
+                if (priceInfo && (priceInfo.시가 > 0 || priceInfo.고가 > 0)) {
+                  
+                  // 가격 정보 추출 및 보정
+                  const currentPrice = priceInfo.price > 0 ? priceInfo.price : stock.price
+                  const changePercent = priceInfo.changePercent !== 0 ? priceInfo.changePercent : stock.changePercent
+                  let change = priceInfo.change !== 0 ? priceInfo.change : stock.change
+                  
+                  // 전일대비 보정 (등락률 기반 역산)
+                  if (currentPrice > 0 && changePercent !== 0) {
+                     const calculatedPrevClose = currentPrice / (1 + changePercent / 100)
+                     const calculatedChange = Math.round(currentPrice - calculatedPrevClose)
+                     
+                     // 서버 값과 계산 값이 너무 다르거나(10% 이상), 서버 값이 0이면 계산 값 사용
+                     if (change === 0 || Math.abs(change - calculatedChange) > Math.abs(calculatedChange * 0.1)) {
+                       change = calculatedChange
+                     }
+                  }
+
+                  if (stock.openPrice !== priceInfo.시가 || stock.highPrice !== priceInfo.고가 || stock.change !== change) {
+                    hasWatchlistUpdate = true
+                    return {
+                      ...stock,
+                      openPrice: priceInfo.시가 || stock.openPrice,
+                      highPrice: priceInfo.고가 || stock.highPrice,
+                      lowPrice: priceInfo.저가 || stock.lowPrice,
+                      price: currentPrice,
+                      change: change,
+                      changePercent: changePercent,
+                      volume: priceInfo.volume > 0 ? priceInfo.volume : stock.volume,
+                    }
+                  }
+                }
+                return stock
+              })
+              return hasWatchlistUpdate ? next : prev
+            })
+          }
+          
+          if (i + batchSize < codes.length) {
+            await new Promise(resolve => setTimeout(resolve, 500))
+          }
+        }
+      } catch (error) {
+        console.error('시가/고가 정보 업데이트 실패:', error)
+      }
+      
+    }, 10000) // 10초마다 실행
+    
+    return () => clearInterval(interval)
+  }, [])
   
   // 매매설정 값들을 ref에 저장 (최신 값 유지)
   useEffect(() => {
@@ -2516,25 +2664,25 @@ const AutoTrading = () => {
                   // '10': 현재가, '11': 전일대비, '12': 등락률, '13': 누적거래량
                   // '27': 시가, '28': 고가, '29': 저가 (키움증권 실시간 시세 FID 코드)
                   // '251': 전일종가 (전일 종가 가격)
-                  const currentPrice = parseFloat(values['10'] || '0')
-                  // 전일대비 값 파싱 (부호 포함 문자열일 수 있으므로 처리)
-                  const changeStr = (values['11'] || '0').toString().replace(/[+\s]/g, '')
+                  const currentPrice = parseFloat((values['10'] || '0').replace(/,/g, ''))
+                  // 전일대비 값 파싱 (부호, 쉼표 포함 문자열일 수 있으므로 처리)
+                  const changeStr = (values['11'] || '0').toString().replace(/,/g, '').replace(/[+\s]/g, '')
                   const change = parseFloat(changeStr) || 0
-                  // 등락률 값 파싱 (부호 포함 문자열일 수 있으므로 처리)
-                  const changePercentStr = (values['12'] || '0').toString().replace(/[+\s]/g, '')
+                  // 등락률 값 파싱 (부호, 쉼표 포함 문자열일 수 있으므로 처리)
+                  const changePercentStr = (values['12'] || '0').toString().replace(/,/g, '').replace(/[+\s]/g, '')
                   const changePercent = parseFloat(changePercentStr) || 0
-                  const volume = parseFloat(values['13'] || '0')
-                  const openPrice = parseFloat(values['27'] || values['16'] || '0') // 시가 (FID 27 또는 16)
-                  const highPrice = parseFloat(values['28'] || values['17'] || '0') // 고가 (FID 28 또는 17)
-                  const prevClosePriceFromRealtime = parseFloat(values['251'] || '0') // 전일 종가 (FID 251)
+                  const volume = parseFloat((values['13'] || '0').replace(/,/g, ''))
+                  const openPrice = parseFloat((values['27'] || values['16'] || '0').replace(/,/g, '')) // 시가 (FID 27 또는 16)
+                  const highPrice = parseFloat((values['28'] || values['17'] || '0').replace(/,/g, '')) // 고가 (FID 28 또는 17)
+                  const prevClosePriceFromRealtime = parseFloat((values['251'] || '0').replace(/,/g, '')) // 전일 종가 (FID 251)
                   
                   // 체결 정보 파싱 (주문 체결 확인용)
                   // '900': 주문수량, '901': 체결수량, '902': 미체결수량, '903': 체결가격, '905': 매수/매도 구분, '906': 주문구분
-                  const orderQuantity = parseInt(values['900'] || '0')
-                  const filledQuantity = parseInt(values['901'] || '0') // 체결수량
-                  const unfilledQuantity = parseInt(values['902'] || '0')
+                  const orderQuantity = parseInt((values['900'] || '0').replace(/,/g, ''))
+                  const filledQuantity = parseInt((values['901'] || '0').replace(/,/g, '')) // 체결수량
+                  const unfilledQuantity = parseInt((values['902'] || '0').replace(/,/g, ''))
                   // 체결가격 파싱: 문자열에서 + 기호 제거 및 숫자 변환
-                  const executedPriceStr = (values['903'] || '0').toString().replace(/[+\s]/g, '')
+                  const executedPriceStr = (values['903'] || '0').toString().replace(/,/g, '').replace(/[+\s]/g, '')
                   const executedPrice = parseFloat(executedPriceStr) || 0
                   const orderType = values['905'] || '' // "+매수" 또는 "-매도"
                   const orderOption = values['906'] || '' // "시장가", "지정가" 등
@@ -2561,10 +2709,10 @@ const AutoTrading = () => {
                             ? prevClosePriceFromRealtime 
                             : stock.prevClosePrice || 0
                           
-                          // 전일 종가가 없으면 전일 대비 값으로 역산
-                          if (finalPrevClosePrice === 0 && changePercent !== 0 && currentPrice > 0) {
+                          // 전일 종가가 없으면 전일 대비 값으로 역산 (등락률 우선)
+                          if ((!finalPrevClosePrice || finalPrevClosePrice === 0) && changePercent !== 0 && currentPrice > 0) {
                             finalPrevClosePrice = currentPrice / (1 + changePercent / 100)
-                          } else if (finalPrevClosePrice === 0 && change !== 0 && currentPrice > 0) {
+                          } else if ((!finalPrevClosePrice || finalPrevClosePrice === 0) && change !== 0 && currentPrice > 0) {
                             finalPrevClosePrice = currentPrice - change
                           }
                           
@@ -2575,17 +2723,26 @@ const AutoTrading = () => {
                           
                           if (finalPrevClosePrice > 0) {
                             // 전일 종가가 있으면 항상 전일 종가 기준으로 전일 대비 값 재계산 (전일 종가 대비 총 변화)
-                            finalChange = currentPrice - finalPrevClosePrice
+                            // 가격 변화는 정수여야 함
+                            finalChange = Math.round(currentPrice - finalPrevClosePrice)
                             finalChangePercent = ((currentPrice - finalPrevClosePrice) / finalPrevClosePrice) * 100
                           } else if (stock.prevClosePrice && stock.prevClosePrice > 0) {
                             // 전일 종가가 없지만 기존 저장된 전일 종가가 있으면 그것을 사용
-                            finalChange = currentPrice - stock.prevClosePrice
+                            finalChange = Math.round(currentPrice - stock.prevClosePrice)
                             finalChangePercent = ((currentPrice - stock.prevClosePrice) / stock.prevClosePrice) * 100
                             finalPrevClosePrice = stock.prevClosePrice
                           } else if (change !== 0 || changePercent !== 0) {
                             // 전일 종가가 없지만 실시간 시세에서 전일 대비 값이 있으면 사용
-                            finalChange = change
-                            finalChangePercent = changePercent
+                            // 단, change 값이 비정상적(소수점 등)이면 changePercent로 역산 시도
+                            if (change % 1 !== 0 && changePercent !== 0) {
+                               const estPrev = currentPrice / (1 + changePercent / 100)
+                               finalChange = Math.round(currentPrice - estPrev)
+                               finalChangePercent = changePercent
+                               finalPrevClosePrice = estPrev
+                            } else {
+                               finalChange = Math.round(change)
+                               finalChangePercent = changePercent
+                            }
                           } else if (stock.price > 0) {
                             // 실시간 시세의 전일 대비 값이 없고, 기존 가격이 있으면 기존 값 유지
                             // (전일 대비 값은 변하지 않으므로)
@@ -2619,10 +2776,10 @@ const AutoTrading = () => {
                             ? prevClosePriceFromRealtime 
                             : stock.prevClosePrice || 0
                           
-                          // 전일 종가가 없으면 전일 대비 값으로 역산
-                          if (finalPrevClosePrice === 0 && changePercent !== 0 && currentPrice > 0) {
+                          // 전일 종가가 없으면 전일 대비 값으로 역산 (등락률 우선)
+                          if ((!finalPrevClosePrice || finalPrevClosePrice === 0) && changePercent !== 0 && currentPrice > 0) {
                             finalPrevClosePrice = currentPrice / (1 + changePercent / 100)
-                          } else if (finalPrevClosePrice === 0 && change !== 0 && currentPrice > 0) {
+                          } else if ((!finalPrevClosePrice || finalPrevClosePrice === 0) && change !== 0 && currentPrice > 0) {
                             finalPrevClosePrice = currentPrice - change
                           }
                           
@@ -2633,17 +2790,25 @@ const AutoTrading = () => {
                           
                           if (finalPrevClosePrice > 0) {
                             // 전일 종가가 있으면 항상 전일 종가 기준으로 전일 대비 값 재계산 (전일 종가 대비 총 변화)
-                            finalChange = currentPrice - finalPrevClosePrice
+                            finalChange = Math.round(currentPrice - finalPrevClosePrice)
                             finalChangePercent = ((currentPrice - finalPrevClosePrice) / finalPrevClosePrice) * 100
                           } else if (stock.prevClosePrice && stock.prevClosePrice > 0) {
                             // 전일 종가가 없지만 기존 저장된 전일 종가가 있으면 그것을 사용
-                            finalChange = currentPrice - stock.prevClosePrice
+                            finalChange = Math.round(currentPrice - stock.prevClosePrice)
                             finalChangePercent = ((currentPrice - stock.prevClosePrice) / stock.prevClosePrice) * 100
                             finalPrevClosePrice = stock.prevClosePrice
                           } else if (change !== 0 || changePercent !== 0) {
                             // 전일 종가가 없지만 실시간 시세에서 전일 대비 값이 있으면 사용
-                            finalChange = change
-                            finalChangePercent = changePercent
+                            // 단, change 값이 비정상적(소수점 등)이면 changePercent로 역산 시도
+                            if (change % 1 !== 0 && changePercent !== 0) {
+                               const estPrev = currentPrice / (1 + changePercent / 100)
+                               finalChange = Math.round(currentPrice - estPrev)
+                               finalChangePercent = changePercent
+                               finalPrevClosePrice = estPrev
+                            } else {
+                               finalChange = Math.round(change)
+                               finalChangePercent = changePercent
+                            }
                           } else if (stock.price > 0) {
                             // 실시간 시세의 전일 대비 값이 없고, 기존 가격이 있으면 기존 값 유지
                             finalChange = stock.change
@@ -3660,31 +3825,50 @@ const AutoTrading = () => {
         // 검색된 종목 추가
         // 자동매매 시작 시점의 가격과 등락률을 저장
         const newStocks: DetectedStock[] = result.stocks.map((stock: any) => {
-          // 전일대비 변동 금액 계산 (조건 검색 결과에 change가 있으면 사용, 없으면 계산)
-          const change = stock.change !== undefined 
-            ? stock.change 
-            : (stock.price && stock.changeRate) 
-              ? stock.price * (stock.changeRate / 100) 
-              : 0
+          // 전일대비 등락률
+          const changePercent = stock.changeRate || stock.changePercent || 0
           
-          // 전일 종가 계산 (현재가와 전일대비로 역산)
-          const prevClosePrice = (stock.price && stock.changeRate) 
-            ? stock.price / (1 + stock.changeRate / 100)
-            : (stock.price && change) 
-              ? stock.price - change 
-              : 0
+          // 전일 종가 및 전일대비 재계산
+          let calculatedChange = 0
+          let calculatedPrevClose = 0
+          
+          if (stock.price && changePercent !== 0) {
+             calculatedPrevClose = stock.price / (1 + changePercent / 100)
+             // 전일대비는 정수여야 함
+             calculatedChange = Math.round(stock.price - calculatedPrevClose)
+          }
+          
+          // 서버에서 준 change 값이 유효하고 계산값과 비슷하면 사용, 아니면 계산값 사용
+          // (서버 값이 0이거나, 계산값과 10% 이상 차이나면 계산값 사용)
+          let finalChange = 0
+          if (stock.change && stock.change !== 0) {
+            // 서버 값이 있고 0이 아닐 때
+            if (calculatedChange !== 0 && Math.abs(stock.change - calculatedChange) > Math.abs(calculatedChange * 0.1)) {
+              // 차이가 크면 계산값 사용 (단, 계산값도 0이 아닐 때)
+              finalChange = calculatedChange
+            } else {
+               finalChange = stock.change
+            }
+          } else {
+             finalChange = calculatedChange
+          }
+
+          // 전일 종가 설정
+          const prevClosePrice = calculatedPrevClose > 0 
+            ? calculatedPrevClose 
+            : (stock.price - finalChange)
           
           return {
             code: stock.code,
             name: stock.name,
             price: stock.price,
-            change: change, // 전일대비 변동 금액 (전일 종가 대비 총 변화)
-            changePercent: stock.changeRate || 0, // 전일대비 등락률 (전일 종가 대비 총 변화)
+            change: finalChange, // 전일대비 변동 금액 (보정됨)
+            changePercent: changePercent, // 전일대비 등락률
             volume: stock.volume,
             detectedCondition: result.appliedConditions.join(', '),
             detectedTime: new Date().toLocaleTimeString(),
             startPrice: stock.price, // 자동매매 시작 시점의 가격 저장
-            detectedChangePercent: stock.changeRate || 0, // 조건 감지 시점의 등락률 저장 (매수 조건 비교용)
+            detectedChangePercent: changePercent, // 조건 감지 시점의 등락률 저장
             openPrice: stock.openPrice || stock.시가 || 0, // 시가 저장
             highPrice: stock.highPrice || stock.고가 || 0, // 고가 저장
             prevClosePrice: prevClosePrice > 0 ? prevClosePrice : undefined, // 전일 종가 저장
