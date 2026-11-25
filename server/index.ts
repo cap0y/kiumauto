@@ -222,7 +222,6 @@ export const sendToSession = (sessionKey: string, message: any) => {
   })
 }
 
-<<<<<<< HEAD
 // 키움증권 WebSocket 실시간 데이터를 '해당 세션'에게만 전달한다
 const bindRealtimeStream = (sessionKey: string, kiwoomService: KiwoomService) => {
   kiwoomService.onRealTimeData((data) => {
