@@ -1,4 +1,4 @@
-﻿**
+/**
  * 키움증권 REST API 서비스
  * 공식 가이드: https://openapi.kiwoom.com/guide/apiguide
  *
@@ -970,4 +970,4 @@ export class KiwoomService {
   isWebSocketConnected(): boolean {
     return this.webSocketService?.isConnected() || false
   }
-}in
+}
