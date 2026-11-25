@@ -100,6 +100,15 @@ app.use((req, _res, next) => {
   next()
 })
 
+// Railway 헬스체크 엔드포인트
+app.get('/health', (_req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+  })
+})
+
 // API 라우터 설정
 app.use('/api', routes)
 
@@ -213,6 +222,7 @@ export const sendToSession = (sessionKey: string, message: any) => {
   })
 }
 
+<<<<<<< HEAD
 // 키움증권 WebSocket 실시간 데이터를 '해당 세션'에게만 전달한다
 const bindRealtimeStream = (sessionKey: string, kiwoomService: KiwoomService) => {
   kiwoomService.onRealTimeData((data) => {
@@ -325,7 +335,8 @@ const start = async () => {
     console.error('[시작] 키 저장소 초기화 실패:', error.message)
   }
 
-  server.listen(PORT, () => {
+  // Railway는 0.0.0.0 바인딩이 필요하다 (기본 localhost면 헬스체크가 실패한다)
+  server.listen(Number(PORT), '0.0.0.0', () => {
     console.log(`서버가 포트 ${PORT}에서 실행 중입니다`)
     console.log(`환경: ${process.env.NODE_ENV || 'development'}`)
     console.log(`키 저장소: ${keyService.describeStore()}`)

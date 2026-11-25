@@ -25,7 +25,7 @@ const Layout = ({ children }: LayoutProps) => {
   }, [theme])
 
   return (
-    <div className="w-screen h-screen overflow-hidden dark">
+    <div className="w-full h-screen overflow-hidden dark">
       {children}
       <PWAInstaller />
     </div>

@@ -26,33 +26,69 @@ router.get('/', async (req: Request, res: Response) => {
 
     // 계좌번호는 토큰 기준으로 조회 (ka00001)
     const accountList = await kiwoomService.getAccountList()
-    const accountNo = (req.query.accountNo as string) || accountList[0]
 
-    if (!accountNo) {
-      return res.status(200).json({
-        accounts: [],
-        accountNumber: null,
+    
+    // 계좌 정보 조회 (첫 번째 계좌 기준)
+    const accountNo = req.query.accountNo as string
+    const accountProductCode = req.query.accountProductCode as string || '01'
+    
+    if (accountNo) {
+      const accountInfo = await kiwoomService.getAccountInfo(accountNo, accountProductCode)
+      
+      // 에러가 있는 경우에도 캐시된 예수금이 있으면 사용
+      if (accountInfo.error) {
+        // 예수금 추출: output2.DNCA_TOT_AMT 또는 직접 deposit 필드 확인
+        const deposit = accountInfo.output2?.DNCA_TOT_AMT || 
+                        accountInfo.output2?.예수금총액 || 
+                        accountInfo.deposit || 
+                        0
+        
+        // 예수금이 문자열인 경우 숫자로 변환
+        const depositValue = typeof deposit === 'string' 
+          ? parseFloat(deposit.replace(/[,\s]/g, '')) || 0 
+          : (typeof deposit === 'number' ? deposit : 0)
+        
+        return res.status(200).json({
+          accounts: accountList.length > 0 ? accountList : [accountNo],
+          accountNumber: accountNo,
+          deposit: depositValue, // 캐시된 예수금이 있으면 사용, 없으면 0
+          totalAsset: accountInfo.output2?.TOT_EVAL_AMT || accountInfo.output2?.총평가금액 || 0,
+          totalProfit: accountInfo.output2?.EVAL_PNLS_AMT || accountInfo.output2?.총평가손익 || 0,
+          totalProfitRate: accountInfo.output2?.EVAL_PNLS_RT || accountInfo.output2?.총수익률 || 0,
+          error: accountInfo.error,
+          warning: accountInfo.warning || true // 경고 메시지도 전달
+        })
+      }
+      
+      // 예수금 추출: output2.DNCA_TOT_AMT를 우선 사용하고, 없으면 직접 deposit 필드 확인
+      const deposit = accountInfo.output2?.DNCA_TOT_AMT || 
+                      accountInfo.output2?.예수금총액 || 
+                      accountInfo.deposit || 
+                      0
+      
+      // 예수금이 문자열인 경우 숫자로 변환
+      const depositValue = typeof deposit === 'string' 
+        ? parseFloat(deposit.replace(/[,\s]/g, '')) || 0 
+        : (typeof deposit === 'number' ? deposit : 0)
+      
+      res.json({
+        accounts: accountList.length > 0 ? accountList : [accountNo],
+        accountNumber: accountNo,
+        deposit: depositValue,
+        totalAsset: accountInfo.output2?.TOT_EVAL_AMT || accountInfo.output2?.총평가금액 || 0,
+        totalProfit: accountInfo.output2?.EVAL_PNLS_AMT || accountInfo.output2?.총평가손익 || 0,
+        totalProfitRate: accountInfo.output2?.EVAL_PNLS_RT || accountInfo.output2?.총수익률 || 0,
+      })
+    } else {
+      res.json({
+        accounts: accountList,
+        accountNumber: accountList.length > 0 ? accountList[0] : null,
         deposit: 0,
         totalAsset: 0,
         totalProfit: 0,
         totalProfitRate: 0,
-        error: '계좌번호를 조회할 수 없습니다',
-        warning: true
       })
     }
-
-    const accountInfo = await kiwoomService.getAccountInfo()
-
-    res.json({
-      accounts: accountList.length > 0 ? accountList : [accountNo],
-      accountNumber: accountNo,
-      deposit: accountInfo.output2?.DNCA_TOT_AMT || 0,
-      available: accountInfo.output2?.DNCA_TOT_AMT || 0,
-      totalAsset: accountInfo.output2?.TOT_EVAL_AMT || 0,
-      totalProfit: accountInfo.output2?.EVAL_PNLS_AMT || 0,
-      totalProfitRate: accountInfo.output2?.EVAL_PNLS_RT || 0,
-      error: accountInfo.error,
-    })
   } catch (error: any) {
     console.error('계좌 정보 조회 오류:', error.message)
     res.status(500).json({

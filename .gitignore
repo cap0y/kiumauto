@@ -19,10 +19,10 @@ logs-server.txt
 # Replit 로컬 상태 (에이전트 세션 바이너리, 배포와 무관)
 .local/
 
-# 압축 백업본 (저장소에 둘 필요 없음 — 6MB+)
+# 압축 백업본 (저장소에 둘 필요 없음)
 *.7z
 
-# 환경변수 (ADMIN_TOKEN, KIWOOM_APPKEY 등)
+# 환경변수 (ADMIN_TOKEN, DATABASE_URL 등)
 .env
 .env.local
 .env.*.local
