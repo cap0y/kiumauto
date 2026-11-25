@@ -1,12 +1,21 @@
 /**
- * 키 발급 및 관리 서비스
- * 관리자가 발급한 키를 관리하고 사용자의 키 검증을 처리합니다.
+ * 키 발급 및 관리 서비스 (PostgreSQL 저장)
+ *
+ * 저장소 이력:
+ *   1) data/license-keys.json — 파일 덮어쓰기 (다중 프로세스 공유 불가)
+ *   2) data/license-keys.db   — node:sqlite (로컬 다중 프로세스 공유)
+ *   3) PostgreSQL (현재)       — 여러 서버 인스턴스에서도 같은 데이터를 본다
+ *
+ * DATABASE_URL이 없으면 SQLite로 폴백해 로컬 개발이 막히지 않게 한다.
  */
 import * as fs from 'fs'
 import * as path from 'path'
 import * as crypto from 'crypto'
+import { createRequire } from 'node:module'
 
-interface LicenseKey {
+const nodeRequire = createRequire(import.meta.url)
+
+export interface LicenseKey {
   key: string // 발급된 키 값
   issuedAt: string // 발급일시 (ISO 8601)
   expiresAt: string // 만료일시 (ISO 8601)
@@ -18,24 +27,252 @@ interface LicenseKey {
   lastUsedAt?: string // 마지막 사용일시
 }
 
-interface KeyStore {
-  keys: LicenseKey[]
+interface CheckResult {
+  valid: boolean
+  licenseKey?: LicenseKey
+  message?: string
 }
+
+/** 두 저장소가 공통으로 구현해야 하는 동작 */
+interface KeyStore {
+  init(): Promise<void>
+  insert(key: LicenseKey): Promise<void>
+  findByKey(key: string): Promise<LicenseKey | null>
+  markUsed(key: string, at: string): Promise<void>
+  listAll(): Promise<LicenseKey[]>
+  setActive(key: string, isActive: boolean): Promise<boolean>
+  remove(key: string): Promise<boolean>
+  removeExpired(nowIso: string): Promise<number>
+  describe(): string
+}
+
+// ───────────────────────────── PostgreSQL ─────────────────────────────
+
+const CREATE_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS license_keys (
+    key         TEXT PRIMARY KEY,
+    issued_at   TIMESTAMPTZ NOT NULL,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    valid_days  INTEGER NOT NULL,
+    issued_by   TEXT NOT NULL,
+    description TEXT,
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    used_count  INTEGER NOT NULL DEFAULT 0,
+    last_used_at TIMESTAMPTZ
+  )
+`
+
+class PostgresKeyStore implements KeyStore {
+  private pool: any = null
+  private connectionString: string
+
+  constructor(connectionString: string) {
+    this.connectionString = connectionString
+  }
+
+  async init(): Promise<void> {
+    const { Pool } = nodeRequire('pg')
+    this.pool = new Pool({
+      connectionString: this.connectionString,
+      ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
+      max: 5,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000,
+    })
+    // 유휴 커넥션 오류로 프로세스가 죽지 않게 한다
+    this.pool.on('error', (error: any) => {
+      console.error('[키 저장소] PostgreSQL 커넥션 오류:', error.message)
+    })
+
+    await this.pool.query(CREATE_TABLE_SQL)
+    await this.pool.query(
+      'CREATE INDEX IF NOT EXISTS idx_license_expires ON license_keys(expires_at)'
+    )
+  }
+
+  private toKey(row: any): LicenseKey {
+    return {
+      key: row.key,
+      issuedAt: new Date(row.issued_at).toISOString(),
+      expiresAt: new Date(row.expires_at).toISOString(),
+      validDays: Number(row.valid_days),
+      issuedBy: row.issued_by,
+      description: row.description ?? undefined,
+      isActive: Boolean(row.is_active),
+      usedCount: Number(row.used_count),
+      lastUsedAt: row.last_used_at ? new Date(row.last_used_at).toISOString() : undefined,
+    }
+  }
+
+  async insert(key: LicenseKey): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO license_keys
+       (key, issued_at, expires_at, valid_days, issued_by, description, is_active, used_count, last_used_at)
+       VALUES ($1, $2, $3, $4, $5, $6, TRUE, 0, NULL)`,
+      [key.key, key.issuedAt, key.expiresAt, key.validDays, key.issuedBy, key.description ?? null]
+    )
+  }
+
+  async findByKey(key: string): Promise<LicenseKey | null> {
+    const result = await this.pool.query('SELECT * FROM license_keys WHERE key = $1', [key])
+    return result.rows.length > 0 ? this.toKey(result.rows[0]) : null
+  }
+
+  async markUsed(key: string, at: string): Promise<void> {
+    await this.pool.query(
+      'UPDATE license_keys SET used_count = used_count + 1, last_used_at = $1 WHERE key = $2',
+      [at, key]
+    )
+  }
+
+  async listAll(): Promise<LicenseKey[]> {
+    const result = await this.pool.query('SELECT * FROM license_keys ORDER BY issued_at DESC')
+    return result.rows.map((row: any) => this.toKey(row))
+  }
+
+  async setActive(key: string, isActive: boolean): Promise<boolean> {
+    const result = await this.pool.query('UPDATE license_keys SET is_active = $1 WHERE key = $2', [
+      isActive,
+      key,
+    ])
+    return (result.rowCount ?? 0) > 0
+  }
+
+  async remove(key: string): Promise<boolean> {
+    const result = await this.pool.query('DELETE FROM license_keys WHERE key = $1', [key])
+    return (result.rowCount ?? 0) > 0
+  }
+
+  async removeExpired(nowIso: string): Promise<number> {
+    const result = await this.pool.query('DELETE FROM license_keys WHERE expires_at < $1', [nowIso])
+    return result.rowCount ?? 0
+  }
+
+  describe(): string {
+    const host = (() => {
+      try {
+        return new URL(this.connectionString).host
+      } catch {
+        return 'unknown'
+      }
+    })()
+    return `PostgreSQL (${host})`
+  }
+}
+
+// ───────────────────────────── SQLite (폴백) ─────────────────────────────
+
+class SqliteKeyStore implements KeyStore {
+  private db: any = null
+  private dbPath: string
+
+  constructor(dbPath: string) {
+    this.dbPath = dbPath
+  }
+
+  async init(): Promise<void> {
+    const dir = path.dirname(this.dbPath)
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+
+    const { DatabaseSync } = nodeRequire('node:sqlite')
+    this.db = new DatabaseSync(this.dbPath)
+    this.db.exec('PRAGMA journal_mode = WAL')
+    this.db.exec('PRAGMA busy_timeout = 5000')
+    this.db.exec('PRAGMA synchronous = NORMAL')
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS license_keys (
+        key TEXT PRIMARY KEY,
+        issued_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        valid_days INTEGER NOT NULL,
+        issued_by TEXT NOT NULL,
+        description TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        used_count INTEGER NOT NULL DEFAULT 0,
+        last_used_at TEXT
+      )
+    `)
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_license_expires ON license_keys(expires_at)')
+  }
+
+  private toKey(row: any): LicenseKey {
+    return {
+      key: row.key,
+      issuedAt: row.issued_at,
+      expiresAt: row.expires_at,
+      validDays: Number(row.valid_days),
+      issuedBy: row.issued_by,
+      description: row.description ?? undefined,
+      isActive: Number(row.is_active) === 1,
+      usedCount: Number(row.used_count),
+      lastUsedAt: row.last_used_at ?? undefined,
+    }
+  }
+
+  async insert(key: LicenseKey): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO license_keys
+         (key, issued_at, expires_at, valid_days, issued_by, description, is_active, used_count, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, 0, NULL)`
+      )
+      .run(
+        key.key,
+        key.issuedAt,
+        key.expiresAt,
+        key.validDays,
+        key.issuedBy,
+        key.description ?? null
+      )
+  }
+
+  async findByKey(key: string): Promise<LicenseKey | null> {
+    const row = this.db.prepare('SELECT * FROM license_keys WHERE key = ?').get(key)
+    return row ? this.toKey(row) : null
+  }
+
+  async markUsed(key: string, at: string): Promise<void> {
+    this.db
+      .prepare('UPDATE license_keys SET used_count = used_count + 1, last_used_at = ? WHERE key = ?')
+      .run(at, key)
+  }
+
+  async listAll(): Promise<LicenseKey[]> {
+    const rows = this.db.prepare('SELECT * FROM license_keys ORDER BY issued_at DESC').all()
+    return rows.map((row: any) => this.toKey(row))
+  }
+
+  async setActive(key: string, isActive: boolean): Promise<boolean> {
+    const result = this.db
+      .prepare('UPDATE license_keys SET is_active = ? WHERE key = ?')
+      .run(isActive ? 1 : 0, key)
+    return Number(result?.changes) > 0
+  }
+
+  async remove(key: string): Promise<boolean> {
+    const result = this.db.prepare('DELETE FROM license_keys WHERE key = ?').run(key)
+    return Number(result?.changes) > 0
+  }
+
+  async removeExpired(nowIso: string): Promise<number> {
+    const result = this.db.prepare('DELETE FROM license_keys WHERE expires_at < ?').run(nowIso)
+    return Number(result?.changes) || 0
+  }
+
+  describe(): string {
+    return `SQLite (${this.dbPath})`
+  }
+}
+
+// ───────────────────────────── 서비스 ─────────────────────────────
 
 class KeyService {
   private static instance: KeyService
-  private keysFilePath: string
-  private keys: Map<string, LicenseKey> = new Map()
+  private store: KeyStore | null = null
+  private initPromise: Promise<void> | null = null
+  private ready = false
 
-  private constructor() {
-    // 키 저장 파일 경로 설정
-    const dataDir = path.join(process.cwd(), 'data')
-    if (!fs.existsSync(dataDir)) {
-      fs.mkdirSync(dataDir, { recursive: true })
-    }
-    this.keysFilePath = path.join(dataDir, 'license-keys.json')
-    this.loadKeys()
-  }
+  private constructor() {}
 
   public static getInstance(): KeyService {
     if (!KeyService.instance) {
@@ -44,195 +281,180 @@ class KeyService {
     return KeyService.instance
   }
 
-  /**
-   * 키 저장소에서 키 목록 로드
-   */
-  private loadKeys(): void {
-    try {
-      if (fs.existsSync(this.keysFilePath)) {
-        const fileContent = fs.readFileSync(this.keysFilePath, 'utf-8')
-        const keyStore: KeyStore = JSON.parse(fileContent)
-        this.keys.clear()
-        keyStore.keys.forEach(key => {
-          this.keys.set(key.key, key)
-        })
-      } else {
-        // 파일이 없으면 빈 저장소 생성
-        this.saveKeys()
+  /** 저장소 초기화 (최초 호출 시 1회) */
+  public async initialize(): Promise<void> {
+    if (this.ready) return
+    if (this.initPromise) return this.initPromise
+
+    this.initPromise = (async () => {
+      const databaseUrl = String(process.env.DATABASE_URL || '').trim()
+
+      if (databaseUrl) {
+        const store = new PostgresKeyStore(databaseUrl)
+        try {
+          await store.init()
+          this.store = store
+          console.log(`[키 저장소] ${store.describe()} 사용`)
+        } catch (error: any) {
+          console.error('[키 저장소] PostgreSQL 연결 실패, SQLite로 폴백:', error.message)
+        }
       }
-    } catch (error) {
-      console.error('키 로드 오류:', error)
-      this.keys.clear()
-    }
+
+      if (!this.store) {
+        const dbPath = path.join(process.cwd(), 'data', 'license-keys.db')
+        const store = new SqliteKeyStore(dbPath)
+        await store.init()
+        this.store = store
+        console.log(`[키 저장소] ${store.describe()} 사용 (DATABASE_URL 없음)`)
+      }
+
+      await this.migrateLegacySqlite()
+      this.ready = true
+    })()
+
+    return this.initPromise
   }
 
   /**
-   * 키 저장소에 키 목록 저장
+   * 로컬 SQLite에 남아 있는 키를 PostgreSQL로 한 번 이전한다.
+   * (Neon으로 옮기면서 기존 발급 키가 사라지지 않게)
    */
-  private saveKeys(): void {
+  private async migrateLegacySqlite(): Promise<void> {
+    const store = this.requireStore()
+    const dbPath = path.join(process.cwd(), 'data', 'license-keys.db')
+    if (!(store instanceof PostgresKeyStore)) return
+
+    const existing = await store.listAll().catch(() => [])
+    if (existing.length > 0) return
+    if (!fs.existsSync(dbPath)) return
+
     try {
-      const keyStore: KeyStore = {
-        keys: Array.from(this.keys.values())
+      const legacy = new SqliteKeyStore(dbPath)
+      await legacy.init()
+      const rows = await legacy.listAll()
+      if (rows.length === 0) return
+
+      for (const row of rows) {
+        await store.insert(row).catch(() => undefined)
       }
-      fs.writeFileSync(this.keysFilePath, JSON.stringify(keyStore, null, 2), 'utf-8')
-    } catch (error) {
-      console.error('키 저장 오류:', error)
+      console.log(`[키 저장소] SQLite → PostgreSQL 이전 시도 (${rows.length}개)`)
+    } catch (error: any) {
+      console.error('[키 저장소] SQLite 이전 실패:', error.message)
     }
   }
 
-  /**
-   * 새로운 키 발급 (관리자용)
-   */
-  public issueKey(
+  private requireStore(): KeyStore {
+    if (!this.store) throw new Error('키 저장소가 초기화되지 않았습니다 (initialize 미호출)')
+    return this.store
+  }
+
+  private generateKey(): string {
+    return crypto.randomBytes(16).toString('hex').toUpperCase()
+  }
+
+  /** 새로운 키 발급 (관리자용) */
+  public async issueKey(
     validDays: number,
     issuedBy: string = 'admin',
     description?: string
-  ): LicenseKey {
-    // 고유한 키 생성 (32자리 랜덤 문자열)
-    const key = this.generateKey()
-    
+  ): Promise<LicenseKey> {
+    await this.initialize()
+    const store = this.requireStore()
+
     const now = new Date()
     const expiresAt = new Date(now.getTime() + validDays * 24 * 60 * 60 * 1000)
 
-    const licenseKey: LicenseKey = {
-      key,
-      issuedAt: now.toISOString(),
-      expiresAt: expiresAt.toISOString(),
-      validDays,
-      issuedBy,
-      description,
-      isActive: true,
-      usedCount: 0
+    // 중복 시 재시도
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const licenseKey: LicenseKey = {
+        key: this.generateKey(),
+        issuedAt: now.toISOString(),
+        expiresAt: expiresAt.toISOString(),
+        validDays,
+        issuedBy,
+        description,
+        isActive: true,
+        usedCount: 0,
+      }
+      try {
+        await store.insert(licenseKey)
+        return licenseKey
+      } catch (error: any) {
+        // PRIMARY KEY 충돌만 재시도, 그 외는 즉시 실패
+        if (!/duplicate key|UNIQUE/i.test(error.message)) throw error
+      }
     }
-
-    this.keys.set(key, licenseKey)
-    this.saveKeys()
-
-    return licenseKey
+    throw new Error('키 생성 실패: 중복이 반복됩니다')
   }
 
   /**
-   * 고유한 키 생성
+   * 키 유효성만 확인한다 (사용 횟수 증가 없음).
+   * API 인증 미들웨어처럼 요청마다 호출되는 경로에서 쓴다.
    */
-  private generateKey(): string {
-    let key: string
-    do {
-      // 32자리 랜덤 문자열 생성 (대문자, 숫자)
-      key = crypto.randomBytes(16).toString('hex').toUpperCase()
-    } while (this.keys.has(key)) // 중복 체크
+  public async checkKey(key: string): Promise<CheckResult> {
+    await this.initialize()
+    const trimmed = String(key ?? '').trim()
+    if (!trimmed) return { valid: false, message: '유효하지 않은 키입니다' }
 
-    return key
-  }
-
-  /**
-   * 키 검증 및 정보 반환
-   */
-  public validateKey(key: string): { valid: boolean; licenseKey?: LicenseKey; message?: string } {
-    const licenseKey = this.keys.get(key)
-
-    if (!licenseKey) {
-      return { valid: false, message: '유효하지 않은 키입니다' }
-    }
-
-    if (!licenseKey.isActive) {
-      return { valid: false, message: '비활성화된 키입니다' }
-    }
-
-    const now = new Date()
-    const expiresAt = new Date(licenseKey.expiresAt)
-
-    if (now > expiresAt) {
+    const licenseKey = await this.requireStore().findByKey(trimmed)
+    if (!licenseKey) return { valid: false, message: '유효하지 않은 키입니다' }
+    if (!licenseKey.isActive) return { valid: false, message: '비활성화된 키입니다' }
+    if (new Date() > new Date(licenseKey.expiresAt)) {
       return { valid: false, message: '만료된 키입니다' }
     }
-
-    // 사용 횟수 증가 및 마지막 사용일시 업데이트
-    licenseKey.usedCount++
-    licenseKey.lastUsedAt = now.toISOString()
-    this.saveKeys()
-
     return { valid: true, licenseKey }
   }
 
-  /**
-   * 키 정보 조회 (키 값 없이)
-   */
-  public getKeyInfo(key: string): { success: boolean; info?: Partial<LicenseKey>; message?: string } {
-    const licenseKey = this.keys.get(key)
+  /** 키 검증 + 사용 횟수 증가 (로그인 시점 1회) */
+  public async validateKey(key: string): Promise<CheckResult> {
+    const result = await this.checkKey(key)
+    if (!result.valid || !result.licenseKey) return result
 
-    if (!licenseKey) {
-      return { success: false, message: '키를 찾을 수 없습니다' }
-    }
-
-    // 민감한 정보 제외하고 반환
-    const info: Partial<LicenseKey> = {
-      key: licenseKey.key,
-      issuedAt: licenseKey.issuedAt,
-      expiresAt: licenseKey.expiresAt,
-      validDays: licenseKey.validDays,
-      issuedBy: licenseKey.issuedBy,
-      description: licenseKey.description,
-      isActive: licenseKey.isActive,
-      usedCount: licenseKey.usedCount,
-      lastUsedAt: licenseKey.lastUsedAt
-    }
-
-    return { success: true, info }
+    const nowIso = new Date().toISOString()
+    await this.requireStore().markUsed(result.licenseKey.key, nowIso)
+    result.licenseKey.usedCount += 1
+    result.licenseKey.lastUsedAt = nowIso
+    return result
   }
 
-  /**
-   * 모든 키 목록 조회 (관리자용)
-   */
-  public getAllKeys(): LicenseKey[] {
-    return Array.from(this.keys.values())
+  /** 키 정보 조회 */
+  public async getKeyInfo(
+    key: string
+  ): Promise<{ success: boolean; info?: Partial<LicenseKey>; message?: string }> {
+    await this.initialize()
+    const licenseKey = await this.requireStore().findByKey(String(key ?? '').trim())
+    if (!licenseKey) return { success: false, message: '키를 찾을 수 없습니다' }
+    return { success: true, info: { ...licenseKey } }
   }
 
-  /**
-   * 키 활성화/비활성화
-   */
-  public toggleKey(key: string, isActive: boolean): boolean {
-    const licenseKey = this.keys.get(key)
-    if (!licenseKey) {
-      return false
-    }
-
-    licenseKey.isActive = isActive
-    this.saveKeys()
-    return true
+  /** 모든 키 목록 (최신 발급 순) */
+  public async getAllKeys(): Promise<LicenseKey[]> {
+    await this.initialize()
+    return this.requireStore().listAll()
   }
 
-  /**
-   * 키 삭제
-   */
-  public deleteKey(key: string): boolean {
-    if (this.keys.delete(key)) {
-      this.saveKeys()
-      return true
-    }
-    return false
+  /** 키 활성화/비활성화 */
+  public async toggleKey(key: string, isActive: boolean): Promise<boolean> {
+    await this.initialize()
+    return this.requireStore().setActive(key, isActive)
   }
 
-  /**
-   * 만료된 키 정리
-   */
-  public cleanupExpiredKeys(): number {
-    const now = new Date()
-    let cleanedCount = 0
+  /** 키 삭제 */
+  public async deleteKey(key: string): Promise<boolean> {
+    await this.initialize()
+    return this.requireStore().remove(key)
+  }
 
-    this.keys.forEach((licenseKey, key) => {
-      const expiresAt = new Date(licenseKey.expiresAt)
-      if (now > expiresAt) {
-        this.keys.delete(key)
-        cleanedCount++
-      }
-    })
+  /** 만료된 키 정리 */
+  public async cleanupExpiredKeys(): Promise<number> {
+    await this.initialize()
+    return this.requireStore().removeExpired(new Date().toISOString())
+  }
 
-    if (cleanedCount > 0) {
-      this.saveKeys()
-    }
-
-    return cleanedCount
+  /** 사용 중인 저장소 설명 (진단용) */
+  public describeStore(): string {
+    return this.store ? this.store.describe() : '초기화 전'
   }
 }
 
 export default KeyService.getInstance()
-

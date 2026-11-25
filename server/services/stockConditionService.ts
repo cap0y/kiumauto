@@ -73,7 +73,7 @@ export class StockConditionService {
       })
 
       if (response.data && Array.isArray(response.data)) {
-        return response.data.slice(0, 200).map((item: any) => ({
+        return response.data.slice(0, 50).map((item: any) => ({
           code: item.stockCode || item.itemCode,
           name: item.stockName || item.itemName,
           price: parseInt(item.closePrice || item.tradePrice || 0),
@@ -159,7 +159,7 @@ export class StockConditionService {
       }
     }
 
-    return filteredStocks.slice(0, 100) // 최대 100개 반환
+    return filteredStocks.slice(0, 50) // 최대 50개 반환
   }
 
   /**

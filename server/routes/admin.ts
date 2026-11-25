@@ -11,7 +11,7 @@ const router = Router()
  * 키 발급 (관리자용)
  * POST /api/admin/keys/issue
  */
-router.post('/keys/issue', (req: Request, res: Response) => {
+router.post('/keys/issue', async (req: Request, res: Response) => {
   try {
     const { validDays, issuedBy, description } = req.body
 
@@ -33,7 +33,7 @@ router.post('/keys/issue', (req: Request, res: Response) => {
     }
 
     // 키 발급
-    const licenseKey = keyService.issueKey(
+    const licenseKey = await keyService.issueKey(
       days,
       issuedBy || 'admin',
       description || undefined
@@ -59,9 +59,9 @@ router.post('/keys/issue', (req: Request, res: Response) => {
  * 키 목록 조회 (관리자용)
  * GET /api/admin/keys
  */
-router.get('/keys', (req: Request, res: Response) => {
+router.get('/keys', async (req: Request, res: Response) => {
   try {
-    const keys = keyService.getAllKeys()
+    const keys = await keyService.getAllKeys()
     
     // 민감한 정보 제외하고 반환
     const safeKeys = keys.map(key => ({
@@ -94,7 +94,7 @@ router.get('/keys', (req: Request, res: Response) => {
  * 키 활성화/비활성화 (관리자용)
  * PUT /api/admin/keys/:key/toggle
  */
-router.put('/keys/:key/toggle', (req: Request, res: Response) => {
+router.put('/keys/:key/toggle', async (req: Request, res: Response) => {
   try {
     const { key } = req.params
     const { isActive } = req.body
@@ -106,7 +106,7 @@ router.put('/keys/:key/toggle', (req: Request, res: Response) => {
       })
     }
 
-    const success = keyService.toggleKey(key, isActive)
+    const success = await keyService.toggleKey(key, isActive)
 
     if (!success) {
       return res.status(404).json({
@@ -132,11 +132,11 @@ router.put('/keys/:key/toggle', (req: Request, res: Response) => {
  * 키 삭제 (관리자용)
  * DELETE /api/admin/keys/:key
  */
-router.delete('/keys/:key', (req: Request, res: Response) => {
+router.delete('/keys/:key', async (req: Request, res: Response) => {
   try {
     const { key } = req.params
 
-    const success = keyService.deleteKey(key)
+    const success = await keyService.deleteKey(key)
 
     if (!success) {
       return res.status(404).json({

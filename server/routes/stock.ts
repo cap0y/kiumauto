@@ -1,15 +1,15 @@
-/**
+﻿/**
  * 종목 관련 라우터
  */
 import { Router, Request, Response } from 'express'
-import { KiwoomService } from '../services/kiwoomService'
+import { getKiwoom } from '../middleware/auth'
 
 const router = Router()
-const kiwoomService = KiwoomService.getInstance()
 
 // 종목 리스트 조회
 router.get('/', async (req: Request, res: Response) => {
   try {
+    const kiwoomService = getKiwoom(req)
     if (!kiwoomService.isConnected()) {
       return res.status(400).json({
         error: '키움증권 API에 연결되지 않았습니다'
@@ -28,9 +28,36 @@ router.get('/', async (req: Request, res: Response) => {
   }
 })
 
+// 종목 검색 (종목명 또는 종목코드)
+router.get('/search', async (req: Request, res: Response) => {
+  try {
+    const kiwoomService = getKiwoom(req)
+    if (!kiwoomService.isConnected()) {
+      return res.status(400).json({
+        error: '키움증권 API에 연결되지 않았습니다'
+      })
+    }
+
+    const keyword = String(req.query.q || '').trim()
+    if (!keyword) {
+      return res.json({ stocks: [] })
+    }
+
+    const stocks = await kiwoomService.searchStocks(keyword)
+    res.json({ stocks })
+  } catch (error: any) {
+    console.error('종목 검색 오류:', error)
+    res.status(500).json({
+      error: '종목 검색 실패',
+      detail: error.message
+    })
+  }
+})
+
 // 종목 현재가 조회
 router.get('/:code/price', async (req: Request, res: Response) => {
   try {
+    const kiwoomService = getKiwoom(req)
     if (!kiwoomService.isConnected()) {
       return res.status(400).json({
         error: '키움증권 API에 연결되지 않았습니다'
@@ -52,6 +79,7 @@ router.get('/:code/price', async (req: Request, res: Response) => {
 // 여러 종목의 현재가 일괄 조회
 router.post('/prices/batch', async (req: Request, res: Response) => {
   try {
+    const kiwoomService = getKiwoom(req)
     if (!kiwoomService.isConnected()) {
       return res.status(400).json({
         error: '키움증권 API에 연결되지 않았습니다'
@@ -66,8 +94,8 @@ router.post('/prices/batch', async (req: Request, res: Response) => {
       })
     }
 
-    // 최대 50개까지만 처리
-    const limitedCodes = codes.slice(0, 50)
+    // 최대 100개까지만 처리 (ka10095 배치로 종목당 지연 없음)
+    const limitedCodes = codes.slice(0, 100)
     const prices = await kiwoomService.getMultipleCurrentPrices(limitedCodes)
     
     res.json({ prices })
@@ -83,6 +111,7 @@ router.post('/prices/batch', async (req: Request, res: Response) => {
 // 차트 데이터 조회
 router.get('/:code/candle', async (req: Request, res: Response) => {
   try {
+    const kiwoomService = getKiwoom(req)
     if (!kiwoomService.isConnected()) {
       return res.status(400).json({
         error: '키움증권 API에 연결되지 않았습니다'
@@ -97,7 +126,14 @@ router.get('/:code/candle', async (req: Request, res: Response) => {
     const candles = await kiwoomService.getCandleData(code, period, start, end)
     res.json({ candles })
   } catch (error: any) {
-    console.error('차트 데이터 조회 오류:', error)
+    // 요청 한도 초과는 429로 그대로 알려야 클라이언트가 재시도/백오프를 판단할 수 있다
+    if (error.isRateLimit) {
+      return res.status(429).json({
+        error: 'API 요청 한도 초과',
+        detail: error.message,
+      })
+    }
+    console.error('차트 데이터 조회 오류:', error.message)
     res.status(500).json({
       error: '차트 데이터 조회 실패',
       detail: error.message

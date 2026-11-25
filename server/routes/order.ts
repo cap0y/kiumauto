@@ -1,15 +1,15 @@
-/**
+﻿/**
  * 주문 관련 라우터
  */
 import { Router, Request, Response } from 'express'
-import { KiwoomService } from '../services/kiwoomService'
+import { getKiwoom } from '../middleware/auth'
 
 const router = Router()
-const kiwoomService = KiwoomService.getInstance()
 
 // 주문 전송
 router.post('/', async (req: Request, res: Response) => {
   try {
+    const kiwoomService = getKiwoom(req)
     if (!kiwoomService.isConnected()) {
       return res.status(400).json({
         error: '키움증권 API에 연결되지 않았습니다'
@@ -24,13 +24,7 @@ router.post('/', async (req: Request, res: Response) => {
       })
     }
 
-    // 모의투자 환경에서는 accountNo와 accountProductCode가 없을 수 있음
-    const isMockApi = kiwoomService.isMockApi()
-    if (!isMockApi && (!accountNo || !accountProductCode)) {
-      return res.status(400).json({
-        error: 'accountNo, accountProductCode가 필요합니다'
-      })
-    }
+    // 키움 주문 API(kt10000/kt10001)는 계좌번호를 받지 않는다 (토큰 계좌 기준)
     
     // 종목코드 형식 검증 (6자리 숫자만 허용)
     const stockCode = String(code).trim()
@@ -107,15 +101,48 @@ router.post('/', async (req: Request, res: Response) => {
     }
     
     // 서버 에러 (500번대)는 상세 정보 포함
-    const statusCode = error.response?.status || error.status || 500
+    // 키움 비즈니스 오류는 400으로 전달해야 클라이언트가 "500"이 아닌 실제 사유를 보여줄 수 있다
+    const statusCode = error.response?.status || error.status || 400
     const errorMessage = error.message || '알 수 없는 오류가 발생했습니다'
     const errorDetail = error.response?.data?.detail || error.response?.data?.message || errorMessage
-    
-    res.status(statusCode).json({
+
+    res.status(statusCode >= 500 ? statusCode : 400).json({
       error: '주문 전송 실패',
       detail: errorDetail,
       code: error.stockCode || req.body.code || '알 수 없음', // 실패한 종목코드 포함
-      returnCode: error.returnCode || error.response?.data?.return_code
+      returnCode: error.returnCode || error.response?.data?.return_code,
+      returnMsg: error.response?.data?.return_msg,
+    })
+  }
+})
+
+// 주문 취소 (kt10003)
+router.post('/cancel', async (req: Request, res: Response) => {
+  try {
+    const kiwoomService = getKiwoom(req)
+    if (!kiwoomService.isConnected()) {
+      return res.status(400).json({ error: '키움증권 API에 연결되지 않았습니다' })
+    }
+
+    const { orderNumber, stockCode, quantity } = req.body
+    if (!orderNumber || !stockCode || !quantity) {
+      return res.status(400).json({ error: 'orderNumber, stockCode, quantity가 필요합니다' })
+    }
+
+    const result = await kiwoomService.cancelOrder(orderNumber, stockCode, quantity)
+    res.json(result)
+  } catch (error: any) {
+    console.error('[주문 취소 오류]', {
+      주문번호: req.body.orderNumber,
+      종목코드: req.body.stockCode,
+      에러메시지: error.message,
+      응답데이터: error.response?.data,
+    })
+    const statusCode = error.response?.status || 400
+    res.status(statusCode >= 500 ? statusCode : 400).json({
+      error: '주문 취소 실패',
+      detail: error.response?.data?.detail || error.response?.data?.return_msg || error.message,
+      returnCode: error.returnCode || error.response?.data?.return_code,
     })
   }
 })
@@ -123,6 +150,7 @@ router.post('/', async (req: Request, res: Response) => {
 // 주문 내역 조회
 router.get('/history', async (req: Request, res: Response) => {
   try {
+    const kiwoomService = getKiwoom(req)
     if (!kiwoomService.isConnected()) {
       return res.status(400).json({
         error: '키움증권 API에 연결되지 않았습니다'
@@ -130,38 +158,19 @@ router.get('/history', async (req: Request, res: Response) => {
     }
 
     const accountNo = req.query.accountNo as string
-    if (!accountNo) {
-      return res.status(400).json({
-        error: 'accountNo가 필요합니다'
-      })
-    }
 
-    // 키움증권 API를 통해 주문 내역 조회
-    // 실제 구현은 키움증권 API 문서에 따라 수정 필요
+    // 키움 kt00007: 토큰 계좌 기준 조회 (계좌번호 파라미터 없음)
     const orderHistory = await kiwoomService.getOrderHistory(accountNo)
 
     res.json({
       orders: orderHistory || []
     })
   } catch (error: any) {
-    // 모의투자 환경에서 500 에러는 정상적인 제한사항일 수 있음
-    const status = error.response?.status || error.status
-    const errorMessage = error.response?.data?.error || error.response?.data?.message || error.message || ''
-    
-    // 500 에러나 서버 에러는 조용히 처리 (모의투자 환경 제한)
-    if (status === 500 || errorMessage.includes('INTERNAL_SERVER_ERROR')) {
-      // 조용히 빈 배열 반환
-      return res.json({
-        orders: []
-      })
-    }
-    
-    // 다른 에러는 로그 출력
-    console.error('주문 내역 조회 오류:', errorMessage)
+    console.error('주문 내역 조회 오류:', error.message)
     res.status(500).json({
       error: '주문 내역 조회 실패',
-      detail: errorMessage,
-      orders: [] // 오류 시 빈 배열 반환
+      detail: error.message,
+      orders: []
     })
   }
 })

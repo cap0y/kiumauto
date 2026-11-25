@@ -24,41 +24,49 @@ interface RealTimeData {
 type RealTimeDataCallback = (data: RealTimeData) => void
 
 export class KiwoomWebSocketService {
-  private static instance: KiwoomWebSocketService
   private websocket: WebSocket | null = null
   private config: WebSocketConfig | null = null
   private connected: boolean = false
   private loggedIn: boolean = false
   private pingInterval: NodeJS.Timeout | null = null
   private reconnectAttempts: number = 0
-  private maxReconnectAttempts: number = 5
   private reconnectDelay: number = 3000
   private dataCallbacks: Set<RealTimeDataCallback> = new Set()
+  // 재연결 시 최신 토큰을 받아오기 위한 공급자 (만료된 토큰으로 재시도하면 영구 실패)
+  private tokenProvider: (() => Promise<string>) | null = null
+  // 등록된 실시간 항목을 기억한다. 연결이 끊겼다 돌아오면 이걸로 다시 등록해야
+  // 시세가 영구히 끊기지 않는다 (서버 재시작·네트워크 단절 후 복구용).
+  private registrations: Map<string, { items: Set<string>; types: Set<string> }> = new Map()
 
-  private constructor() {}
-
-  static getInstance(): KiwoomWebSocketService {
-    if (!KiwoomWebSocketService.instance) {
-      KiwoomWebSocketService.instance = new KiwoomWebSocketService()
-    }
-    return KiwoomWebSocketService.instance
-  }
+  // 사용자(계좌)별로 독립 인스턴스를 만든다. 계정이 다르면 시세 등록도 분리돼야 한다.
+  constructor() {}
 
   /**
    * WebSocket 연결
    */
-  async connect(socketUrl: string, accessToken: string): Promise<void> {
+  async connect(socketUrl: string, accessToken: string, tokenProvider?: () => Promise<string>): Promise<void> {
     if (this.websocket && this.connected) {
       console.log('[WebSocket] 이미 연결되어 있습니다.')
+      // 토큰 갱신 수단은 항상 최신 것으로 교체
+      if (tokenProvider) this.tokenProvider = tokenProvider
       return
     }
 
+    if (tokenProvider) this.tokenProvider = tokenProvider
     this.config = { socketUrl, accessToken }
 
     return new Promise((resolve, reject) => {
       try {
         console.log(`[WebSocket] 연결 시도: ${socketUrl}`)
         this.websocket = new WebSocket(socketUrl)
+
+        // 로그인 응답 전에는 등록 요청을 보낼 수 없으므로 LOGIN 응답에서 resolve
+        const settle = { done: false }
+        const failLogin = (message: string) => {
+          if (settle.done) return
+          settle.done = true
+          reject(new Error(message))
+        }
 
         // 연결 성공
         this.websocket.on('open', () => {
@@ -67,18 +75,11 @@ export class KiwoomWebSocketService {
           this.reconnectAttempts = 0
 
           // 로그인 패킷 전송
-          const loginPacket = {
-            trnm: 'LOGIN',
-            token: accessToken,
-          }
-
           console.log('[WebSocket] 로그인 패킷 전송')
-          this.sendMessage(loginPacket)
+          this.sendMessage({ trnm: 'LOGIN', token: accessToken })
 
           // PING 인터벌 시작 (30초마다)
           this.startPingInterval()
-
-          resolve()
         })
 
         // 에러 발생
@@ -86,7 +87,7 @@ export class KiwoomWebSocketService {
           console.error('[WebSocket] 연결 오류:', error)
           this.connected = false
           this.loggedIn = false
-          reject(error)
+          settle.done ? undefined : failLogin((error as any)?.message || 'WebSocket 연결 오류')
         })
 
         // 연결 종료
@@ -96,14 +97,31 @@ export class KiwoomWebSocketService {
           this.loggedIn = false
           this.stopPingInterval()
 
-          // 자동 재연결 시도
-          if (this.reconnectAttempts < this.maxReconnectAttempts && this.config) {
-            this.reconnectAttempts++
-            console.log(`[WebSocket] 재연결 시도 ${this.reconnectAttempts}/${this.maxReconnectAttempts}...`)
-            setTimeout(() => {
-              this.connect(this.config!.socketUrl, this.config!.accessToken).catch(console.error)
-            }, this.reconnectDelay)
-          }
+          // 자동 재연결: 횟수 제한 없이 계속 시도한다.
+          // 한 번 실패로 시세가 영구히 멈추면 실시간 기능 자체가 죽는다.
+          if (!this.config) return
+          // 재연결 지수 백오프 (최대 30초)
+          const delay = Math.min(this.reconnectDelay * Math.pow(2, this.reconnectAttempts), 30000)
+          this.reconnectAttempts++
+          console.log(`[WebSocket] ${Math.round(delay / 1000)}초 후 재연결 시도 (${this.reconnectAttempts}회차)`)
+          setTimeout(() => {
+            if (!this.loggedIn && this.config) {
+              // 재연결 전에 최신 토큰을 받아온다 (만료 토큰으로는 로그인 불가)
+              const reconnect = async () => {
+                if (this.tokenProvider) {
+                  try {
+                    this.config!.accessToken = await this.tokenProvider()
+                  } catch (error: any) {
+                    console.error('[WebSocket] 토큰 갱신 실패:', error.message)
+                  }
+                }
+                await this.connect(this.config!.socketUrl, this.config!.accessToken)
+              }
+              reconnect().catch((error) => {
+                console.error('[WebSocket] 재연결 실패:', error.message)
+              })
+            }
+          }, delay)
         })
 
         // 메시지 수신
@@ -121,11 +139,18 @@ export class KiwoomWebSocketService {
             if (response.trnm === 'LOGIN') {
               if (response.return_code !== 0) {
                 console.error('[WebSocket] 로그인 실패:', response.return_msg)
+                failLogin(response.return_msg || '로그인 실패')
                 this.disconnect()
-                reject(new Error(response.return_msg || '로그인 실패'))
               } else {
                 console.log('[WebSocket] 로그인 성공')
                 this.loggedIn = true
+                this.reconnectAttempts = 0
+                // 끊겼다 돌아왔으면 기존 등록을 복구해야 시세가 다시 흐른다
+                this.replayRegistrations()
+                if (!settle.done) {
+                  settle.done = true
+                  resolve()
+                }
               }
               return
             }
@@ -190,12 +215,22 @@ export class KiwoomWebSocketService {
    */
   registerRealTime(
     items: string[],
-    types: string[] = ['00'], // '00': 주식체결
+    types: string[] = ['0B'],
     grpNo: string = '1',
     refresh: string = '1'
   ): void {
+    // 그룹별 등록 상태를 기억한다 (재연결 시 복구용)
+    const group = this.registrations.get(grpNo) || { items: new Set<string>(), types: new Set<string>() }
+    if (refresh === '0') {
+      // 기존 등록을 전부 해지하고 새로 등록하는 요청
+      group.items.clear()
+    }
+    items.forEach((item) => group.items.add(item))
+    types.forEach((type) => group.types.add(type))
+    this.registrations.set(grpNo, group)
+
     if (!this.loggedIn) {
-      console.warn('[WebSocket] 로그인되지 않아 실시간 시세를 등록할 수 없습니다.')
+      console.warn('[WebSocket] 로그인되지 않아 실시간 시세를 등록할 수 없습니다. (재연결 시 자동 등록)')
       return
     }
 
@@ -211,8 +246,32 @@ export class KiwoomWebSocketService {
       ],
     }
 
-    console.log(`[WebSocket] 실시간 시세 등록: ${items.length}개 종목`)
+    console.log(`[WebSocket] 실시간 등록: grp=${grpNo}, ${items.length}개 종목, type=${types.join(',')}`)
     this.sendMessage(registerPacket)
+  }
+
+  /**
+   * 재연결 후 기억해둔 등록을 복구한다.
+   * 이게 없으면 끊겼다 돌아온 뒤로는 시세가 영구히 오지 않는다.
+   */
+  private replayRegistrations(): void {
+    if (this.registrations.size === 0) return
+
+    console.log(`[WebSocket] 등록 복구 시작 (${this.registrations.size}개 그룹)`)
+    this.registrations.forEach((group, grpNo) => {
+      const items = Array.from(group.items)
+      const types = Array.from(group.types)
+      if (items.length === 0 || types.length === 0) return
+
+      // 서버는 재연결로 상태가 비었으므로 refresh '0'(새로 등록)으로 보낸다
+      this.sendMessage({
+        trnm: 'REG',
+        grp_no: grpNo,
+        refresh: '0',
+        data: [{ item: items, type: types }],
+      })
+      console.log(`[WebSocket] 등록 복구: grp=${grpNo}, ${items.length}개 종목`)
+    })
   }
 
   /**
@@ -249,16 +308,17 @@ export class KiwoomWebSocketService {
 
   /**
    * WebSocket 연결 종료
+   * 주의: dataCallbacks는 지우지 않는다. 재연결해도 서버의 브로드캐스트 리스너가 살아 있어야 한다.
    */
   disconnect(): void {
     this.stopPingInterval()
     if (this.websocket) {
+      this.websocket.removeAllListeners()
       this.websocket.close()
       this.websocket = null
     }
     this.connected = false
     this.loggedIn = false
-    this.dataCallbacks.clear()
     console.log('[WebSocket] 연결 종료')
   }
 

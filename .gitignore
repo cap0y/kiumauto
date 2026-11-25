@@ -4,3 +4,25 @@ dist
 server/public
 vite.config.ts.*
 *.tar.gz
+
+# 라이선스 키 저장소 — 절대 커밋하지 않는다 (키 전체가 평문으로 남는다)
+data/license-keys.json
+data/license-keys.json.*
+data/license-keys.db
+data/license-keys.db-shm
+data/license-keys.db-wal
+
+# 로컬 실행 로그
+logs-server.txt
+*.log
+
+# Replit 로컬 상태 (에이전트 세션 바이너리, 배포와 무관)
+.local/
+
+# 압축 백업본 (저장소에 둘 필요 없음 — 6MB+)
+*.7z
+
+# 환경변수 (ADMIN_TOKEN, KIWOOM_APPKEY 등)
+.env
+.env.local
+.env.*.local

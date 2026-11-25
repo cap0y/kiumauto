@@ -1,21 +1,51 @@
 import axios, { InternalAxiosRequestConfig, AxiosResponse, AxiosError } from 'axios'
 
 // Vite 프록시를 사용하므로 상대 경로 사용
-// 개발 환경: /api로 시작하는 요청은 자동으로 http://localhost:8000으로 프록시됨
+// 개발 환경: /api로 시작하는 요청은 자동으로 http://localhost:3000으로 프록시됨
 // 프로덕션: 환경 변수로 설정된 API URL 사용
 const API_BASE_URL = (import.meta as any).env?.VITE_API_URL || '/api'
+
+/**
+ * 인증 헤더.
+ *
+ * 라이선스 키는 서버가 HttpOnly 쿠키로 내려주므로 JS에서 읽을 필요가 없다.
+ * (localStorage에 두면 XSS 한 번에 탈취된다)
+ * 쿠키가 막히는 환경을 위해 헤더 방식도 계속 지원한다.
+ */
+export const authHeaders = (): Record<string, string> => {
+  const headers: Record<string, string> = {}
+  try {
+    // 쿠키가 주 경로지만, 과거 저장값이 남아 있으면 함께 보낸다 (서버는 쿠키를 우선)
+    const license = localStorage.getItem('kiwoom_license_key')
+    if (license) headers['x-license-key'] = license.trim()
+
+    const adminToken = localStorage.getItem('kiwoom_admin_token')
+    if (adminToken) headers['x-admin-token'] = adminToken.trim()
+  } catch {
+    // localStorage 접근 불가(사생활 보호 모드 등) — 쿠키만으로 진행
+  }
+  return headers
+}
 
 export const apiClient = axios.create({
   baseURL: API_BASE_URL,
   headers: {
     'Content-Type': 'application/json',
   },
-  timeout: 30000,
+  // HttpOnly 세션 쿠키를 주고받으려면 credentials가 필요하다
+  withCredentials: true,
+  // 다종목 배치·차트 조회는 서버의 TR 큐에서 순서를 기다린다.
+  // 30초는 짧아 간헐적 타임아웃이 났으므로 60초로 여유를 둔다.
+  timeout: 60000,
 })
 
 // 요청 인터셉터
 apiClient.interceptors.request.use(
   (config: InternalAxiosRequestConfig) => {
+    const extra = authHeaders()
+    for (const [key, value] of Object.entries(extra)) {
+      config.headers.set(key, value)
+    }
     return config
   },
   (error: AxiosError) => {
@@ -41,4 +71,3 @@ apiClient.interceptors.response.use(
 )
 
 export default apiClient
-

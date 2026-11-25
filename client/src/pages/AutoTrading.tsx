@@ -1,8 +1,10 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react'
+﻿import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import { kiwoomApi } from '../api/kiwoom'
+import { authHeaders } from '../api/client'
 import { useKiwoomStore } from '../store/useKiwoomStore'
 import { useThemeStore } from '../store/useThemeStore'
+import { hmsToSec, secInRange, pad2, stepSellTier } from '../utils/tradingTime'
 import toast from 'react-hot-toast'
 import {
   LineChart,
@@ -47,6 +49,9 @@ interface DetectedStock {
   volume: number
   detectedCondition: string
   detectedTime: string
+  openPrice?: number // 시가 (원)
+  highPrice?: number // 고가 (원)
+  prevClose?: number // 전일 종가 (시가%/고가% 계산 기준)
   startPrice?: number // 자동매매 시작 시점의 가격 (상대 변화율 계산용)
   detectedChangePercent?: number // 조건 감지 시점의 등락률 (매수 조건 비교용)
   isHolding?: boolean // 계좌 보유 중 여부 (C# 코드의 b계좌보유중과 동일)
@@ -64,7 +69,10 @@ interface HoldingStock {
   code: string
   name: string
   quantity: number
+  sellableQuantity?: number // 매도가능수량 (미체결 매도 주문분 제외)
   purchasePrice: number
+  purchaseAmount?: number // 정확한 매입금액 (평균단가 반올림 오차 방지)
+  evaluation?: number // 서버가 준 평가금액 (합계 일치용)
   currentPrice: number
   profit: number
   profitPercent: number
@@ -79,10 +87,12 @@ interface OrderLog {
   stockName: string
   stockCode: string
   quantity: number
+  sellableQuantity?: number // 매도가능수량 (미체결 매도 주문분 제외한 실제 주문 가능 수량)
   price: number
   status: string
   orderNumber?: string
   isExecuted?: boolean // 체결 여부 플래그
+  orderPrice?: number // 주문가 (0이면 시장가, 0보다 크면 지정가)
   orderTimestamp?: number // 주문 접수 시점의 타임스탬프 (밀리초)
   cancelTimestamp?: number // 주문 취소 시점의 타임스탬프 (밀리초)
   isMarketOrder?: boolean // 시장가 주문 여부
@@ -102,6 +112,81 @@ interface LogMessage {
   level: 'info' | 'warning' | 'error' | 'success'
 }
 
+// 시가%/고가% 계산 (전일 종가 대비). 전일 종가를 모르면 현재가/등락률로 역산한다.
+const pricePercentFromPrevClose = (target?: number, prevClose?: number): number | null => {
+  if (!target || target <= 0 || !prevClose || prevClose <= 0) return null
+  return ((target - prevClose) / prevClose) * 100
+}
+
+// 전일 종가 역산 (등락률은 전일종가 대비이므로 price/(1+rate/100))
+const prevCloseFromRate = (price: number, changeRate: number): number | undefined => {
+  if (!price || price <= 0) return undefined
+  const denom = 1 + changeRate / 100
+  return denom > 0 ? price / denom : undefined
+}
+
+// 전일대비 = 현재가 - 전일종가 (표시는 정수 원 단위)
+const changeFromRate = (price: number, changeRate: number): number => {
+  const prev = prevCloseFromRate(price, changeRate)
+  return prev === undefined ? 0 : Math.round(price - prev)
+}
+
+// 숫자 입력 (매매시간/수익률 공용 - C# NumericUpDown 대응)
+const Num = ({ value, onChange, theme, width = '40px', step = 1, min, max, disabled = false }: {
+  value: number
+  onChange: (v: number) => void
+  theme: string
+  width?: string
+  step?: number
+  min?: number
+  max?: number
+  disabled?: boolean
+}) => (
+  <input
+    type="number"
+    value={value}
+    step={step}
+    disabled={disabled}
+    onChange={(e) => {
+      const n = Number(e.target.value)
+      if (!Number.isFinite(n)) return onChange(0)
+      onChange(Math.min(max ?? 1e9, Math.max(min ?? -1e9, n)))
+    }}
+    style={{
+      width,
+      padding: '2px 3px',
+      border: `1px solid ${theme === 'dark' ? '#4b5563' : '#999'}`,
+      backgroundColor: disabled ? (theme === 'dark' ? '#1f2937' : '#f3f4f6') : (theme === 'dark' ? '#374151' : 'white'),
+      color: disabled ? '#9ca3af' : (theme === 'dark' ? '#f3f4f6' : '#111827'),
+      textAlign: 'center',
+      fontSize: '11px',
+      borderRadius: '8px'
+    }}
+  />
+)
+
+// 시/분/초 묶음 입력 (초 단위가 없으면 시/분만)
+const Hms = ({ h, m, s, onH, onM, onS, theme, disabled = false }: {
+  h: number
+  m: number
+  s?: number
+  onH: (v: number) => void
+  onM: (v: number) => void
+  onS?: (v: number) => void
+  theme: string
+  disabled?: boolean
+}) => (
+  <span style={{ display: 'inline-flex', alignItems: 'center', gap: '2px', fontSize: '11px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>
+    <Num value={h} onChange={onH} theme={theme} width="36px" min={0} max={23} disabled={disabled} />시
+    <Num value={m} onChange={onM} theme={theme} width="36px" min={0} max={59} disabled={disabled} />분
+    {onS && s !== undefined && (
+      <>
+        <Num value={s} onChange={onS} theme={theme} width="36px" min={0} max={59} disabled={disabled} />초
+      </>
+    )}
+  </span>
+)
+
 // 차트 컴포넌트
 const StockChart = ({ code, period, isConnected, stockInfo, isSelected = true }: { 
   code: string, 
@@ -118,8 +203,14 @@ const StockChart = ({ code, period, isConnected, stockInfo, isSelected = true }:
     () => kiwoomApi.getCandle(code, period),
     {
       enabled: (isConnected || connected) && !!code && isSelected, // 선택한 종목에 대해서만 조회
-      refetchInterval: isSelected ? 10000 : false, // 선택한 종목에 대해서만 10초마다 갱신
-      retry: false, // 500 에러는 재시도하지 않음
+      refetchInterval: isSelected ? 3000 : false, // 3초마다 갱신 (실시간에 가깝게)
+      // 요청 한도 초과(429)는 서버 큐가 간격을 벌리므로 곧 회복된다. 이전 차트를 유지하고 재시도한다.
+      keepPreviousData: true,
+      retry: (failureCount: number, err: any) => {
+        if ((err?.response?.status || err?.status) === 429) return failureCount < 2
+        return false
+      },
+      retryDelay: 3000,
       onSuccess: (data) => {
         // 성공 시 데이터 확인 (개발 환경에서만)
         if (process.env.NODE_ENV === 'development') {
@@ -206,90 +297,31 @@ const StockChart = ({ code, period, isConnected, stockInfo, isSelected = true }:
       console.log(`[차트 컴포넌트] 차트 데이터 없음 - 종목코드: ${code}, stockInfo:`, stockInfo)
     }
     
-    // 종목 정보가 있으면 현재가를 기반으로 간단한 차트 생성
+    // 종목 정보가 있으면 현재가 1포인트만 표시 (가짜 봉을 만들지 않는다)
     if (stockInfo && stockInfo.price && stockInfo.price > 0) {
-      if (process.env.NODE_ENV === 'development') {
-        console.log(`[차트 컴포넌트] 종목 정보로 대체 차트 생성 - 가격: ${stockInfo.price}`)
-      }
       const now = new Date()
       const year = now.getFullYear()
       const month = String(now.getMonth() + 1).padStart(2, '0')
       const day = String(now.getDate()).padStart(2, '0')
       const hours = String(now.getHours()).padStart(2, '0')
       const minutes = String(now.getMinutes()).padStart(2, '0')
-      
-      // 일봉인 경우 날짜만, 분봉인 경우 날짜+시간
-      const dateStr = period === 'day' 
-        ? `${year}${month}${day}` 
+      const dateStr = period === 'day'
+        ? `${year}${month}${day}`
         : `${year}${month}${day}${hours}${minutes}`
-      
-      // 현재가를 기반으로 차트 데이터 생성 (여러 데이터 포인트 생성)
+
       const price = stockInfo.price
-      const changePercent = stockInfo.changePercent || 0
-      // 등락률이 있으면 그에 맞게, 없으면 가격의 1% 범위로 추정
-      const changeRange = changePercent !== 0 
-        ? Math.abs(price * (changePercent / 100))
-        : price * 0.01
-      
-      // 여러 데이터 포인트 생성 (20개)
-      const dataPointCount = 20
-      const fallbackChartData: Array<{
-        time: string
-        open: number
-        high: number
-        low: number
-        close: number
-        volume: number
-      }> = []
-      
-      for (let i = dataPointCount - 1; i >= 0; i--) {
-        const timeOffset = period === 'day' ? i : i * (period === 'min' ? 1 : parseInt(period))
-        const pointDate = new Date(now.getTime() - timeOffset * (period === 'day' ? 24 * 60 * 60 * 1000 : 60 * 1000))
-        
-        const pointYear = pointDate.getFullYear()
-        const pointMonth = String(pointDate.getMonth() + 1).padStart(2, '0')
-        const pointDay = String(pointDate.getDate()).padStart(2, '0')
-        const pointHours = String(pointDate.getHours()).padStart(2, '0')
-        const pointMinutes = String(pointDate.getMinutes()).padStart(2, '0')
-        
-        const pointDateStr = period === 'day' 
-          ? `${pointYear}${pointMonth}${pointDay}` 
-          : `${pointYear}${pointMonth}${pointDay}${pointHours}${pointMinutes}`
-        
-        // 시간에 따른 가격 변동 시뮬레이션 (현재가를 중심으로 약간의 변동)
-        const progress = i / dataPointCount // 0 (과거) ~ 1 (현재)
-        const randomVariation = (Math.random() - 0.5) * changeRange * 0.3 // 랜덤 변동
-        const trendVariation = changePercent > 0 
-          ? changeRange * progress * 0.5 // 상승 추세
-          : -changeRange * progress * 0.5 // 하락 추세
-        
-        const pointPrice = price - trendVariation + randomVariation
-        const pointHigh = pointPrice + changeRange * 0.3
-        const pointLow = pointPrice - changeRange * 0.3
-        const pointOpen = i === dataPointCount - 1 ? price : (fallbackChartData.length > 0 ? fallbackChartData[fallbackChartData.length - 1].close : pointPrice)
-        const pointClose = pointPrice
-        
-        fallbackChartData.push({
-          time: pointDateStr,
-          open: Math.max(pointLow, pointOpen),
-          high: Math.max(pointHigh, pointPrice),
-          low: Math.min(pointLow, pointPrice),
-          close: pointPrice,
-          volume: stockInfo.volume ? Math.floor(stockInfo.volume * (0.5 + Math.random() * 0.5)) : 0,
-        })
-      }
-      
-      // 시간 순서대로 정렬 (과거 -> 현재)
-      fallbackChartData.reverse()
-      
-      // Y축 범위 계산
-      const allPrices = fallbackChartData.flatMap(d => [d.high, d.low, d.open, d.close])
-      const minPrice = Math.min(...allPrices)
-      const maxPrice = Math.max(...allPrices)
-      const yAxisPriceRange = maxPrice - minPrice || maxPrice * 0.1
-      const yAxisMin = Math.max(0, minPrice - yAxisPriceRange * 0.1)
-      const yAxisMax = maxPrice + yAxisPriceRange * 0.1
-      
+      const fallbackChartData = [{
+        time: dateStr,
+        open: price,
+        high: price,
+        low: price,
+        close: price,
+        volume: stockInfo.volume || 0,
+      }]
+
+      const yAxisMin = price * 0.98
+      const yAxisMax = price * 1.02
+
       return (
         <div style={{ width: '100%', height: '300px', backgroundColor: theme === 'dark' ? '#1f2937' : 'transparent' }}>
           <ResponsiveContainer width="100%" height="100%">
@@ -311,16 +343,6 @@ const StockChart = ({ code, period, isConnected, stockInfo, isSelected = true }:
                 tick={{ fontSize: 10, fill: theme === 'dark' ? '#d1d5db' : '#374151' }}
                 tickFormatter={(value) => value.toLocaleString()}
               />
-              <YAxis 
-                yAxisId="volume"
-                orientation="right"
-                tick={{ fontSize: 10, fill: theme === 'dark' ? '#9ca3af' : '#6b7280' }}
-                tickFormatter={(value) => {
-                  if (value >= 1000000) return `${(value / 1000000).toFixed(1)}M`
-                  if (value >= 1000) return `${(value / 1000).toFixed(1)}K`
-                  return value.toString()
-                }}
-              />
               <Tooltip 
                 contentStyle={{
                   backgroundColor: theme === 'dark' ? '#374151' : '#ffffff',
@@ -330,29 +352,8 @@ const StockChart = ({ code, period, isConnected, stockInfo, isSelected = true }:
                   fontSize: '11px',
                   padding: '4px 8px'
                 }}
-                labelStyle={{ 
-                  color: theme === 'dark' ? '#f3f4f6' : '#111827',
-                  fontSize: '11px',
-                  marginBottom: '2px'
-                }}
-                itemStyle={{
-                  padding: '1px 0',
-                  fontSize: '11px'
-                }}
-                formatter={(value: any, name: string) => {
-                  if (name === 'volume') {
-                    return [value.toLocaleString(), '거래량']
-                  }
-                  return [value.toLocaleString(), name]
-                }}
+                formatter={(value: any) => value.toLocaleString()}
                 labelFormatter={(label) => `시간: ${label}`}
-              />
-              <Bar 
-                yAxisId="volume"
-                dataKey="volume" 
-                fill={theme === 'dark' ? '#6b7280' : '#e5e7eb'} 
-                opacity={0.3}
-                name="거래량"
               />
               <Line 
                 yAxisId="price"
@@ -361,32 +362,12 @@ const StockChart = ({ code, period, isConnected, stockInfo, isSelected = true }:
                 stroke="#3b82f6" 
                 strokeWidth={2}
                 dot={true}
-                name="종가"
-              />
-              <Line 
-                yAxisId="price"
-                type="monotone" 
-                dataKey="high" 
-                stroke="#22c55e" 
-                strokeWidth={1}
-                dot={true}
-                strokeDasharray="2 2"
-                name="고가"
-              />
-              <Line 
-                yAxisId="price"
-                type="monotone" 
-                dataKey="low" 
-                stroke="#ef4444" 
-                strokeWidth={1}
-                dot={true}
-                strokeDasharray="2 2"
-                name="저가"
+                name="현재가"
               />
             </ComposedChart>
           </ResponsiveContainer>
           <div style={{ padding: '8px', textAlign: 'center', fontSize: '11px', color: theme === 'dark' ? '#9ca3af' : '#6b7280' }}>
-            * 현재가 정보를 기반으로 표시된 차트입니다
+            * 차트 데이터가 없어 현재가만 표시합니다
           </div>
         </div>
       )
@@ -409,7 +390,9 @@ const StockChart = ({ code, period, isConnected, stockInfo, isSelected = true }:
   }
 
   // 차트 데이터 변환
-  const chartData = candles
+  // 키움 1분봉은 900건(3일치)까지 오므로 당일 데이터만 사용한다.
+  // (전날 봉까지 그리면 축이 압축되어 봉이 뭉개지고 시세도 왜곡된다)
+  const allCandles = candles
     .map((candle: any) => {
       const time = candle.일자 || candle.time || ''
       const open = parseFloat(candle.시가 || candle.open || '0') || 0
@@ -422,7 +405,7 @@ const StockChart = ({ code, period, isConnected, stockInfo, isSelected = true }:
       if (!time || (open === 0 && high === 0 && low === 0 && close === 0)) {
         return null
       }
-      
+    
       return {
         time,
         open,
@@ -433,7 +416,55 @@ const StockChart = ({ code, period, isConnected, stockInfo, isSelected = true }:
       }
     })
     .filter((item: any) => item !== null) // null 제거
-    .reverse() // 최신 데이터가 뒤에 오도록
+
+  // 오늘 날짜(yyyymmdd) — 1분봉·일봉 모두 이 값으로 필터
+  const nowDate = new Date()
+  const todayKey = `${nowDate.getFullYear()}${String(nowDate.getMonth() + 1).padStart(2, '0')}${String(nowDate.getDate()).padStart(2, '0')}`
+
+  // 분봉: 당일 데이터만 (일봉은 날짜별이므로 그대로 사용)
+  const todayCandles = period === 'day'
+    ? allCandles
+    : allCandles.filter((c: any) => c.time.startsWith(todayKey))
+
+  // 당일 데이터가 없으면(장 시작 전·휴장일) 원본 유지 → 빈 차트 방지
+  const chartData = (todayCandles.length > 0 ? todayCandles : allCandles)
+    .slice() // 원본 보호
+    .sort((a: any, b: any) => String(a.time).localeCompare(String(b.time))) // 과거 → 최신
+
+  // 마지막 봉을 실시간 시세로 갱신한다 (폴링 사이에도 차트가 즉시 움직이도록)
+  if (chartData.length > 0 && stockInfo?.price && stockInfo.price > 0) {
+    const lastCandle = chartData[chartData.length - 1]
+    const livePrice = stockInfo.price
+    const lastDate = String(lastCandle.time).substring(0, 8)
+    const isTodayCandle = lastDate === todayKey
+
+    if (isTodayCandle) {
+      lastCandle.close = livePrice
+      if (livePrice > lastCandle.high) lastCandle.high = livePrice
+      if (livePrice < lastCandle.low) lastCandle.low = livePrice
+    }
+
+    // 1분봉: 현재 분(minute) 봉이 아직 없으면 실시간 가격으로 새 봉을 만든다
+    // (API 폴링이 1분 늦게 반영되는 문제 해결)
+    if (period !== 'day') {
+      const now = new Date()
+      const currentMinuteKey =
+        `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}` +
+        `${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}00`
+
+      const hasCurrentBar = chartData.some((c: any) => c.time === currentMinuteKey)
+      if (!hasCurrentBar && lastDate === todayKey) {
+        chartData.push({
+          time: currentMinuteKey,
+          open: livePrice,
+          high: livePrice,
+          low: livePrice,
+          close: livePrice,
+          volume: 0,
+        })
+      }
+    }
+  }
   
   // 변환 후에도 데이터가 없으면 메시지 표시
   if (chartData.length === 0) {
@@ -445,7 +476,9 @@ const StockChart = ({ code, period, isConnected, stockInfo, isSelected = true }:
   }
 
   // Y축 범위 계산
-  const prices = chartData.flatMap(d => [d.high, d.low, d.open, d.close]).filter(p => p > 0)
+  const prices = chartData
+    .flatMap((d: { high: number; low: number; open: number; close: number }) => [d.high, d.low, d.open, d.close])
+    .filter((p: number) => p > 0)
   let yAxisMin = 0
   let yAxisMax = 0
   
@@ -560,6 +593,126 @@ const StockChart = ({ code, period, isConnected, stockInfo, isSelected = true }:
   )
 }
 
+// 보유 종목 응답 정규화 ({ stocks: [...] } 또는 배열 모두 처리)
+const normalizeBalanceRows = (balance: any): any[] => {
+  if (Array.isArray(balance)) return balance
+  if (Array.isArray(balance?.stocks)) return balance.stocks
+  return []
+}
+
+/**
+ * 주문 실패 사유 추출
+ * axios 에러는 message가 "Request failed with status code 400"이라
+ * 서버가 내려온 실제 사유(detail/returnMsg)를 우선 사용한다.
+ */
+const getOrderErrorInfo = (error: any): { message: string; status?: number; returnCode?: any } => {
+  const data = error?.response?.data
+  const message =
+    data?.detail ||
+    data?.returnMsg ||
+    data?.error ||
+    error?.message ||
+    '알 수 없는 오류'
+  return {
+    message,
+    status: error?.response?.status,
+    returnCode: data?.returnCode ?? data?.return_code,
+  }
+}
+
+/**
+ * 매도 가능 수량 계산
+ * 키움 잔고의 trde_able_qty(매도가능수량)를 우선 사용한다.
+ * 그 값이 없을 때만 (보유 - 미체결 매도)로 추정한다.
+ * 미체결 매도 주문 수량만큼 키움이 매도가능수량을 차감하므로,
+ * 보유 16주 + 미체결 매도 16주 상태에서 또 매도하면 (800033) 매도가능수량 부족으로 거부된다.
+ */
+const calcSellableQuantity = (
+  heldQty: number,
+  pendingSellQty: number,
+  sellableFromApi?: number
+): number => {
+  if (Number.isFinite(sellableFromApi as number)) {
+    return Math.max(0, Math.floor(sellableFromApi as number))
+  }
+  return Math.max(0, Math.floor(heldQty) - Math.max(0, Math.floor(pendingSellQty)))
+}
+
+/**
+ * 매도 주문 가격/옵션 결정
+ * 지정가 매도는 상한가처럼 매도 호가가 얇은 종목에서도 체결된다.
+ * 시장가는 유동성이 낮으면 '접수' 상태로 남아 물량을 잠그므로 지정가를 우선 고려한다.
+ */
+const resolveSellOrderPrice = (
+  currentPrice: number,
+  sellType: 'market' | 'limit',
+  offset = 0
+): { price: number; order_option: '00' | '03' } => {
+  if (sellType !== 'limit' || !(currentPrice > 0)) {
+    return { price: 0, order_option: '03' }
+  }
+  return { price: Math.max(1, Math.floor(currentPrice + offset)), order_option: '00' }
+}
+
+/** 미체결로 간주하는 주문 상태
+ *  '종료'는 체결 0 + 잔량 0 으로 더 이상 취소할 수량이 없는 주문이다 (kt00007). */
+const isPendingSellStatus = (status?: string) =>
+  status === '접수' || status === '확인' || status === '미체결'
+// '오전 9:15:15' 형태의 시각을 초 단위로 변환 (정렬/최신 비교용)
+const parseClockSeconds = (time: string): number => {
+  const text = String(time || '')
+  const m = text.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/)
+  if (!m) return NaN
+  let hour = parseInt(m[1], 10)
+  const minute = parseInt(m[2], 10)
+  const second = m[3] ? parseInt(m[3], 10) : 0
+  // 오전/오후가 있으면 12시간제로 보정
+  if (text.includes('오후') && hour < 12) hour += 12
+  if (text.includes('오전') && hour === 12) hour = 0
+  return hour * 3600 + minute * 60 + second
+}
+
+// 보유 종목 표시용 병합: 매수 체결 건만 종목별 1줄로 합친다
+// (매도 내역은 표시하지 않는다 — 매도는 '오늘 실현손익'으로 집계된다)
+const buildDisplayOrders = (logs: OrderLog[]): Array<OrderLog & {
+  count: number
+  quantity: number
+  latestTime: string
+}> => {
+  const filtered = logs.filter(order =>
+    order.type === 'buy' &&
+    order.status !== '취소' &&
+    order.status !== '부분체결' &&
+    (order.status === '체결' || order.isExecuted === true)
+  )
+
+  const groups = new Map<string, OrderLog & { count: number; quantity: number; latestTime: string }>()
+  for (const order of filtered) {
+    const key = `${order.stockCode}_${order.type}`
+    const existing = groups.get(key)
+    if (!existing) {
+      groups.set(key, { ...order, count: 1, quantity: order.quantity, latestTime: order.time })
+      continue
+    }
+    // 수량 누적, 시간은 가장 최근으로, 가격/수익률은 최신 주문 기준
+    const prevSec = parseClockSeconds(existing.latestTime)
+    const nextSec = parseClockSeconds(order.time)
+    const isNewer = Number.isFinite(nextSec) && (!Number.isFinite(prevSec) || nextSec >= prevSec)
+    groups.set(key, {
+      ...(isNewer ? order : existing),
+      count: existing.count + 1,
+      quantity: existing.quantity + order.quantity,
+      latestTime: isNewer ? order.time : existing.latestTime,
+    })
+  }
+
+  // 최신 주문 순으로 정렬
+  return Array.from(groups.values()).sort(
+    (a, b) => parseClockSeconds(b.latestTime) - parseClockSeconds(a.latestTime)
+  )
+}
+
+
 const AutoTrading = () => {
   const { connected, checkStatus } = useKiwoomStore()
   const { theme, toggleTheme } = useThemeStore()
@@ -588,6 +741,12 @@ const AutoTrading = () => {
   const [conditions, setConditions] = useState<Condition[]>([])
   const [detectedStocks, setDetectedStocks] = useState<DetectedStock[]>([])
   const [watchlistStocks, setWatchlistStocks] = useState<DetectedStock[]>([]) // 선택된 종목 (지속 유지)
+
+  // 수동 종목 추가 (조건검색식에 종목 직접 추가)
+  const [manualKeyword, setManualKeyword] = useState<string>('')
+  const [manualResults, setManualResults] = useState<{ code: string; name: string }[]>([])
+  const [manualSelectedCodes, setManualSelectedCodes] = useState<Set<string>>(new Set())
+  const [isManualSearching, setIsManualSearching] = useState<boolean>(false)
   
   // 검색된 종목 페이지네이션
   const [displayedStockCount, setDisplayedStockCount] = useState<number>(20) // 표시할 종목 수
@@ -595,7 +754,7 @@ const AutoTrading = () => {
   
   // 컬럼 너비 상태
   const [columnWidths, setColumnWidths] = useState<{ [key: string]: number }>({
-    name: 80,
+    name: 300, // ETN 등 장문 종목명도 잘리지 않도록
     price: 80,
     change: 70,
     changePercent: 70,
@@ -615,7 +774,16 @@ const AutoTrading = () => {
   const [chartPeriod, setChartPeriod] = useState<'min' | '5' | '15' | '30' | '60' | 'day'>('5')
   
   const [holdingStocks, setHoldingStocks] = useState<HoldingStock[]>([])
+  // 최신 보유종목을 ref로도 보관한다.
+  // (잔고 폴링 콜백·실행 루프가 시작 시점 state 스냅샷을 붙들지 않도록)
+  const holdingStocksRef = useRef<HoldingStock[]>([])
+  holdingStocksRef.current = holdingStocks
   const [orderLogs, setOrderLogs] = useState<OrderLog[]>([])
+  // 최신 주문 목록을 ref로도 보관한다 (자동 취소 타이머가 오래된 스냅샷을 붙들지 않도록)
+  const orderLogsRef = useRef<OrderLog[]>([])
+  orderLogsRef.current = orderLogs
+  // 이미 취소 요청을 보낸 주문번호 (중복 취소 방지)
+  const cancelRequestedRef = useRef<Set<string>>(new Set())
   const [logs, setLogs] = useState<LogMessage[]>([])
   const [showLogSection, setShowLogSection] = useState<boolean>(false) // 로그 섹션 표시 여부
   const [activeTab, setActiveTab] = useState<'orders' | 'conditions' | 'strategies'>('orders')
@@ -630,6 +798,8 @@ const AutoTrading = () => {
   const [processingOrders, setProcessingOrders] = useState<Set<string>>(new Set()) // 주문 처리 중인 종목코드 목록 (중복 방지)
   const [processedOrderNumbers, setProcessedOrderNumbers] = useState<Set<string>>(new Set()) // 처리된 주문번호 목록 (중복 방지)
   const [orderedOrHoldingStocks, setOrderedOrHoldingStocks] = useState<Set<string>>(new Set()) // 매수 주문했거나 보유 중인 종목 목록 (C# 코드의 매수주문했거나보유중인종목과 동일)
+  // 현재 보유 종목 표에서 체크된 종목코드 (선택매도 대상)
+  const [selectedHoldingCodes, setSelectedHoldingCodes] = useState<Set<string>>(new Set())
   
   // 매매설정 상태 (useTradingConditions 제거 - 각 전략별 체크박스로 대체)
   const [amountPerStock, setAmountPerStock] = useState<number>(50000)
@@ -652,15 +822,35 @@ const AutoTrading = () => {
   const [endMinute, setEndMinute] = useState<number>(19)
   const [endSecond, setEndSecond] = useState<number>(59)
   const [dropSellTime, setDropSellTime] = useState<boolean>(true)
-  const [dropSellStartHour, setDropSellStartHour] = useState<number>(15)
-  const [dropSellStartMinute, setDropSellStartMinute] = useState<number>(19)
-  const [dropSellEndSecond, setDropSellEndSecond] = useState<number>(59)
+  const [dropSellStartHour, setDropSellStartHour] = useState<number>(12)
+  const [dropSellStartMinute, setDropSellStartMinute] = useState<number>(0)
+  const [dropSellEndSecond, setDropSellEndSecond] = useState<number>(0)
+  // 시간대정지 (매수만 중단, 매도는 계속)
+  const [pauseBuyEnabled, setPauseBuyEnabled] = useState<boolean>(true)
+  const [pauseStartHour, setPauseStartHour] = useState<number>(12)
+  const [pauseStartMinute, setPauseStartMinute] = useState<number>(0)
+  const [pauseEndHour, setPauseEndHour] = useState<number>(14)
+  const [pauseEndMinute, setPauseEndMinute] = useState<number>(0)
+  // 즉시 매수정지 (수동) / 매수 재개
+  const [buyStopped, setBuyStopped] = useState<boolean>(false)
+  const [nowTick, setNowTick] = useState<number>(Date.now())
+
+  // 단계별 익절 설정 (C# 매매설정.Static기본매수 단계별익절*)
+  const [stepProfit, setStepProfit] = useState({
+    사용: true,
+    익절1: 10.0, // 1차 (10% 수량)
+    익절2: 20.0, // 2차 (40% 수량)
+    익절3: 30.0, // 3차 (60% 수량)
+    익절4: 45.0, // 4차 (잔량)
+    손절: -10.0
+  })
+  const stepSoldRef = useRef<Map<string, number>>(new Map()) // 종목별 완료 단계 (C# 종목정보.단계별익절단계)
   
   // 매수/매도 가격지정
   const [profitTarget, setProfitTarget] = useState<number>(10.0)
   const [profitType, setProfitType] = useState<'market' | 'limit'>('market')
-  const [lossLimit, setLossLimit] = useState<number>(-1.5)
-  const [lossType, setLossType] = useState<'market' | 'limit'>('limit')
+  const [lossLimit, setLossLimit] = useState<number>(-3.0)
+  const [lossType, setLossType] = useState<'market' | 'limit'>('market')
   const [lossPriceOffset, setLossPriceOffset] = useState<number>(0)
   
   // 손절 설정 (시장가 자동 매도)
@@ -671,8 +861,36 @@ const AutoTrading = () => {
   // 기타조건
   const [autoStart, setAutoStart] = useState<boolean>(false)
   const [trailingStop, setTrailingStop] = useState<boolean>(true)
-  const [trailingProfitThreshold, setTrailingProfitThreshold] = useState<number>(1.0)
-  const [trailingDropThreshold, setTrailingDropThreshold] = useState<number>(-0.5)
+  const [trailingProfitThreshold, setTrailingProfitThreshold] = useState<number>(5)
+  const [trailingDropThreshold, setTrailingDropThreshold] = useState<number>(-3.0)
+
+  // 매매시간 상태 계산 (1초 갱신)
+  useEffect(() => {
+    const id = window.setInterval(() => setNowTick(Date.now()), 1000)
+    return () => window.clearInterval(id)
+  }, [])
+  const nowSec = (() => {
+    const d = new Date(nowTick)
+    return hmsToSec(d.getHours(), d.getMinutes(), d.getSeconds())
+  })()
+  const inTradingWindow = secInRange(nowSec, hmsToSec(startHour, startMinute), hmsToSec(endHour, endMinute, endSecond))
+  const inPauseWindow = pauseBuyEnabled && secInRange(nowSec, hmsToSec(pauseStartHour, pauseStartMinute), hmsToSec(pauseEndHour, pauseEndMinute))
+  const buyBlockReason = !inTradingWindow
+    ? '매매시간외'
+    : buyStopped
+      ? '즉시매수정지'
+      : inPauseWindow
+        ? `시간대정지 ${pad2(pauseStartHour)}:${pad2(pauseStartMinute)}~${pad2(pauseEndHour)}:${pad2(pauseEndMinute)}`
+        : null
+  const canBuy = buyBlockReason === null
+
+  // 실행 루프(30초 인터벌)는 시작 시점 클로저를 쓰므로 최신 설정을 ref로 전달
+  const timeGateRef = useRef({ startHour, startMinute, endHour, endMinute, endSecond, pauseBuyEnabled, pauseStartHour, pauseStartMinute, pauseEndHour, pauseEndMinute, buyStopped, dropSellTime, dropSellStartHour, dropSellStartMinute, dropSellEndSecond })
+  timeGateRef.current = { startHour, startMinute, endHour, endMinute, endSecond, pauseBuyEnabled, pauseStartHour, pauseStartMinute, pauseEndHour, pauseEndMinute, buyStopped, dropSellTime, dropSellStartHour, dropSellStartMinute, dropSellEndSecond }
+  const stepProfitRef = useRef(stepProfit)
+  stepProfitRef.current = stepProfit
+  const sellStyleRef = useRef({ profitType, lossType, lossPriceOffset })
+  sellStyleRef.current = { profitType, lossType, lossPriceOffset }
   
   // 매매기법
   const [strategyMarketOpen, setStrategyMarketOpen] = useState<boolean>(true)
@@ -711,8 +929,8 @@ const AutoTrading = () => {
   })
   
   // 사용자수식
-  const [buyFormula1, setBuyFormula1] = useState<boolean>(true) // My 매수수식 1
-  const [buyFormula2, setBuyFormula2] = useState<boolean>(false) // My 매수수식 2
+  const [buyFormula1, setBuyFormula1] = useState<boolean>(false) // My 매수수식 1
+  const [buyFormula2, setBuyFormula2] = useState<boolean>(true) // My 매수수식 2
   const [sellFormula1, setSellFormula1] = useState<boolean>(true) // My 매도수식 1
   const [sellFormula2, setSellFormula2] = useState<boolean>(false) // My 매도수식 2
   
@@ -1079,11 +1297,12 @@ const AutoTrading = () => {
       const accountNo = accountParts[0] || selectedAccount
       const accountProductCode = accountParts[1] || '01'
       
-      return kiwoomApi.getBalance(accountNo, accountProductCode)
+      return kiwoomApi.getBalanceSummary(accountNo, accountProductCode)
     },
     {
       enabled: isConnected && !!selectedAccount,
-      refetchInterval: isRunning ? 5000 : false, // 자동매매 실행 중일 때 5초마다 보유 종목 조회 (체결 확인용)
+      // 자동매매 중이 아니어도 주기적으로 갱신한다 (수익률이 멈추지 않도록)
+      refetchInterval: isRunning ? 3000 : 10000,
       retry: false, // 자동 재시도 비활성화
       retryOnMount: false,
       onSuccess: (data) => {
@@ -1108,28 +1327,52 @@ const AutoTrading = () => {
         
         const newHoldingStocks: HoldingStock[] = []
         
+        // 기존 보유종목의 최고 수익률을 코드별로 보존 (폴링마다 0으로 리셋되면 트레일링 판정이 깨진다)
+        const prevMaxProfit = new Map<string, number>()
+        for (const prev of holdingStocksRef.current) {
+          prevMaxProfit.set(prev.code, prev.maxProfitPercent || 0)
+        }
+
         if (Array.isArray(data)) {
-          newHoldingStocks.push(...data.map((stock: any) => ({
-            code: stock.code || stock.종목코드 || '',
-            name: stock.name || stock.종목명 || '',
-            quantity: stock.quantity || stock.보유수량 || 0,
-            purchasePrice: stock.purchasePrice || stock.매입가 || 0,
-            currentPrice: stock.currentPrice || stock.현재가 || 0,
-            profit: stock.profit || stock.평가손익 || 0,
-            profitPercent: stock.profitPercent || stock.수익률 || 0,
-            maxProfitPercent: stock.maxProfitPercent || stock.maxProfitPercent || 0,
-          })))
+          newHoldingStocks.push(...data.map((stock: any) => {
+            const code = stock.code || stock.종목코드 || ''
+            const profitPercent = Number(stock.profitPercent ?? stock.수익률 ?? 0)
+            return {
+              code,
+              name: stock.name || stock.종목명 || '',
+              quantity: stock.quantity || stock.보유수량 || 0,
+              // 매도가능수량(trde_able_qty). 미체결 매도 주문이 잡아둔 수량은 제외된 값이다.
+              // 이 값이 없으면 유령 미체결 판별이 항상 실패한다.
+              sellableQuantity: Number(stock.sellableQuantity ?? stock.quantity ?? 0),
+              purchasePrice: stock.purchasePrice || stock.매입가 || 0,
+              purchaseAmount: Number(stock.purchaseAmount ?? stock.매입금액 ?? 0) || undefined,
+              evaluation: Number(stock.evaluation ?? stock.평가금액 ?? 0) || undefined,
+              currentPrice: stock.currentPrice || stock.현재가 || 0,
+              profit: stock.profit || stock.평가손익 || 0,
+              profitPercent,
+              // 서버가 최고수익률을 주지 않으므로 기존 값과 현재 수익률 중 큰 값 유지
+              maxProfitPercent: Math.max(prevMaxProfit.get(code) || 0, profitPercent),
+            }
+          }))
         } else if (data?.stocks && Array.isArray(data.stocks)) {
-          newHoldingStocks.push(...data.stocks.map((stock: any) => ({
-            code: stock.code || stock.종목코드 || '',
-            name: stock.name || stock.종목명 || '',
-            quantity: stock.quantity || stock.보유수량 || 0,
-            purchasePrice: stock.purchasePrice || stock.매입가 || 0,
-            currentPrice: stock.currentPrice || stock.현재가 || 0,
-            profit: stock.profit || stock.평가손익 || 0,
-            profitPercent: stock.profitPercent || stock.수익률 || 0,
-            maxProfitPercent: stock.maxProfitPercent || stock.maxProfitPercent || 0,
-          })))
+          newHoldingStocks.push(...data.stocks.map((stock: any) => {
+            const code = stock.code || stock.종목코드 || ''
+            const profitPercent = Number(stock.profitPercent ?? stock.수익률 ?? 0)
+            return {
+              code,
+              name: stock.name || stock.종목명 || '',
+              quantity: stock.quantity || stock.보유수량 || 0,
+              // 매도가능수량(trde_able_qty). 유령 미체결 판별에 필수.
+              sellableQuantity: Number(stock.sellableQuantity ?? stock.quantity ?? 0),
+              purchasePrice: stock.purchasePrice || stock.매입가 || 0,
+              purchaseAmount: Number(stock.purchaseAmount ?? stock.매입금액 ?? 0) || undefined,
+              evaluation: Number(stock.evaluation ?? stock.평가금액 ?? 0) || undefined,
+              currentPrice: stock.currentPrice || stock.현재가 || 0,
+              profit: stock.profit || stock.평가손익 || 0,
+              profitPercent,
+              maxProfitPercent: Math.max(prevMaxProfit.get(code) || 0, profitPercent),
+            }
+          }))
         }
         
         // 부분 체결된 주문도 보유종목에 추가 (WebSocket 체결 정보 기반)
@@ -1149,14 +1392,17 @@ const AutoTrading = () => {
                 : order.quantity
               
               if (체결수량 > 0) {
-                // 이미 보유종목에 있는지 확인
+                // 잔고(kt00018)에 이미 있는 종목은 로그 수량으로 덮어쓰지 않는다.
+                // (오늘 매수 로그 합계가 실제 보유수량보다 클 수 있다)
                 const existingHolding = newHoldingStocks.find(h => h.code === order.stockCode)
-                if (!existingHolding) {
-                  // 보유종목에 없으면 추가 (체결된 수량만)
+                if (existingHolding) {
+                  console.log(`[보유종목 유지] ${order.stockName}: 잔고 수량 ${existingHolding.quantity}주 우선 (로그 체결 ${체결수량}주)`)
+                } else {
+                  // 잔고에 없는 종목만 체결 로그로 보충한다 (부분체결 직후 잔고 반영 지연 대응)
                   const currentPrice = prevDetectedStocks.find(s => s.code === order.stockCode)?.price || order.price || 0
                   const purchasePrice = order.price || 0
                   
-                  console.log(`[보유종목 추가] 부분 체결된 주문을 보유종목에 추가 - ${order.stockName} (${order.stockCode}), 체결수량: ${체결수량}주, 매수가: ${purchasePrice}원`)
+                  console.log(`[보유종목 추가] 잔고에 없는 부분체결 주문 보충 - ${order.stockName} (${order.stockCode}), 체결수량: ${체결수량}주, 매수가: ${purchasePrice}원`)
                   
                   newHoldingStocks.push({
                     code: order.stockCode,
@@ -1168,12 +1414,6 @@ const AutoTrading = () => {
                     profitPercent: purchasePrice > 0 ? ((currentPrice - purchasePrice) / purchasePrice) * 100 : 0,
                     maxProfitPercent: 0,
                   })
-                } else {
-                  // 이미 있으면 수량 업데이트 (더 큰 값으로)
-                  if (체결수량 > existingHolding.quantity) {
-                    console.log(`[보유종목 업데이트] 부분 체결 수량 반영 - ${order.stockName} (${order.stockCode}), 기존: ${existingHolding.quantity}주, 체결: ${체결수량}주`)
-                    existingHolding.quantity = 체결수량
-                  }
                 }
               }
             })
@@ -1491,7 +1731,7 @@ const AutoTrading = () => {
     },
     {
       enabled: connected && !!selectedAccount,
-      refetchInterval: isRunning ? 15000 : false, // 자동매매 실행 중일 때 15초마다 주문 내역 조회 (API 제한 방지)
+      refetchInterval: isRunning ? 8000 : 20000, // 미체결 자동취소가 서버 주문을 볼 수 있도록 상시 조회
       onSuccess: (data) => {
         console.log(`[주문 내역] UI 업데이트 - 받은 데이터 개수: ${Array.isArray(data) ? data.length : 0}`)
         if (Array.isArray(data)) {
@@ -1542,6 +1782,10 @@ const AutoTrading = () => {
                 isExecuted, // 체결 여부 플래그 추가
                 orderTimestamp, // 주문 접수 시점 (API에서 받은 주문의 경우 추정값)
                 cancelTimestamp, // 취소 시점 (취소된 주문인 경우)
+                // 지정가 여부: 서버가 orderPrice(주문가)를 주면 지정가 주문이다.
+                // 이 값이 없으면 자동취소가 지정가를 구분하지 못해 체결 전에 취소한다.
+                isMarketOrder: (Number(order.orderPrice) || 0) <= 0,
+                orderPrice: Number(order.orderPrice) || 0,
               }
             })
             console.log(`[주문 내역] API에서 받은 주문 개수: ${mappedOrders.length}`)
@@ -1743,6 +1987,7 @@ const AutoTrading = () => {
           currentPrice: order.currentPrice,
           profit: order.profit,
           profitPercent: order.profitPercent,
+          buyPrice: order.buyPrice,
         }))
       
       const tradingState = {
@@ -1819,6 +2064,7 @@ const AutoTrading = () => {
                 currentPrice: order.currentPrice,
                 profit: order.profit,
                 profitPercent: order.profitPercent,
+                buyPrice: order.buyPrice,
               })
             }
           })
@@ -1969,6 +2215,40 @@ const AutoTrading = () => {
     return () => clearInterval(intervalId)
   }, [])
   
+  // 매도 체결 → 오늘 실현손익 누적
+  // (WebSocket 체결 이벤트를 놓쳐도 주문 상태가 '체결'이 되면 여기서 집계된다)
+  const realizedCountedRef = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    const settled = orderLogs.filter(order =>
+      order.type === 'sell' &&
+      (order.status === '체결' || order.isExecuted === true) &&
+      order.realizedProfit === undefined
+    )
+    if (settled.length === 0) return
+
+    let added = 0
+    for (const order of settled) {
+      const key = order.orderNumber || `${order.stockCode}_${order.time}_${order.quantity}`
+      if (realizedCountedRef.current.has(key)) continue
+      realizedCountedRef.current.add(key)
+
+      const 매수가 = order.buyPrice || 0
+      const 매도가 = order.price > 0 ? order.price : (order.currentPrice || 0)
+      if (매수가 <= 0 || 매도가 <= 0) continue
+      added += (매도가 - 매수가) * order.quantity
+    }
+    if (added === 0) return
+
+    setTodayTotalRealizedProfit(prev => {
+      const newTotal = prev + added
+      const today = new Date().toLocaleDateString('ko-KR')
+      localStorage.setItem('today_realized_profit', newTotal.toString())
+      localStorage.setItem('today_realized_profit_date', today)
+      console.log(`[실현손익 누적] +${added.toLocaleString()}원, 오늘 총 실현손익: ${newTotal.toLocaleString()}원`)
+      return newTotal
+    })
+  }, [orderLogs])
+
   const addLog = (message: string, level: LogMessage['level'] = 'info') => {
     const newLog: LogMessage = {
       id: logIdRef.current++,
@@ -2018,20 +2298,19 @@ const AutoTrading = () => {
 
   // 검색된 종목 실시간 시세 업데이트 (WebSocket 사용)
   useEffect(() => {
-    // 연결 상태 확인 (엄격하게)
-    if (!isConnected || !connected || detectedStocks.length === 0) {
+    // 연결 상태 확인 (종목 유무와 무관하게 연결해 둔다. 종목은 나중에 생길 수 있고,
+    // 종목이 없다고 여기서 return 하면 이후 종목이 추가돼도 WS가 영영 열리지 않는다)
+    if (!isConnected || !connected) {
       return
     }
 
     let ws: WebSocket | null = null
     let isMounted = true
-    let registeredCodes: string[] = []
-    let wsConnected = false
 
     const connectWebSocket = async () => {
       try {
         // 서버의 WebSocket에 연결 (Vite 프록시를 통해 /ws 경로로 연결)
-        // Vite 프록시가 자동으로 서버(포트 3000)로 전달합니다
+        // 세션 인증은 HttpOnly 쿠키로 이뤄진다 (URL에 키를 넣지 않는다 — 로그에 남는다)
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
         const wsHost = window.location.host
         const wsUrl = `${wsProtocol}//${wsHost}/ws`
@@ -2039,21 +2318,20 @@ const AutoTrading = () => {
 
         ws.onopen = async () => {
           console.log('[실시간 시세] WebSocket 연결 성공')
-          wsConnected = true
           
           // 서버에 WebSocket 연결 요청 (키움증권 WebSocket 연결)
           try {
             await kiwoomApi.connectWebSocket()
+            console.log('[실시간 시세] 키움 WebSocket 연결 완료')
           } catch (error: any) {
-            console.warn('[실시간 시세] 서버 WebSocket 연결 실패:', error.message)
+            console.error('[실시간 시세] 서버 WebSocket 연결 실패:', error.message)
           }
 
-          // 검색된 종목에 대한 실시간 시세 등록
-          const currentCodes = detectedStocks.map(stock => stock.code)
+          // 재연결일 수 있으므로 캡처된 스냅샷이 아닌 최신 종목을 등록한다
+          const currentCodes = detectedStocksRef.current.map(stock => stock.code)
           if (currentCodes.length > 0) {
             try {
               await kiwoomApi.registerRealTimeStocks(currentCodes)
-              registeredCodes = currentCodes
               console.log(`[실시간 시세] ${currentCodes.length}개 종목 등록 완료`)
             } catch (error: any) {
               console.error('[실시간 시세] 종목 등록 실패:', error.message)
@@ -2068,40 +2346,46 @@ const AutoTrading = () => {
             // 실시간 시세 데이터 수신
             if (message.type === 'realtime' && message.data?.trnm === 'REAL' && message.data?.data) {
               message.data.data.forEach((item: any) => {
-                if (item.type === '00' && item.values && item.item) {
+                // 0B: 주식체결(시세), 00: 내 계좌 주문체결 — FID 의미가 다르다
+                if ((item.type === '00' || item.type === '0B') && item.values && item.item) {
                   // 주식체결 데이터 파싱
                   const code = item.item
                   const values = item.values
                   
                   // FID 값 파싱 (키움증권 실시간 시세 필드)
                   // '10': 현재가, '11': 전일대비, '12': 등락률, '13': 누적거래량
-                  const currentPrice = parseFloat(values['10'] || '0')
-                  const change = parseFloat(values['11'] || '0')
-                  const changePercent = parseFloat(values['12'] || '0')
-                  const volume = parseFloat(values['13'] || '0')
+                  const currentPrice = Math.abs(parseFloat((values['10'] || '0').replace(/[+\s]/g, '')) || 0)
+                  const change = parseFloat((values['11'] || '0').replace(/[+\s]/g, '')) || 0
+                  const changePercent = parseFloat((values['12'] || '0').replace(/[+\s]/g, '')) || 0
+                  const volume = parseFloat(values['13'] || '0') || 0
                   
-                  // 체결 정보 파싱 (주문 체결 확인용)
-                  // '900': 주문수량, '901': 체결수량, '902': 미체결수량, '903': 체결가격, '905': 매수/매도 구분, '906': 주문구분
-                  const orderQuantity = parseInt(values['900'] || '0')
-                  const filledQuantity = parseInt(values['901'] || '0') // 체결수량
-                  const unfilledQuantity = parseInt(values['902'] || '0')
-                  // 체결가격 파싱: 문자열에서 + 기호 제거 및 숫자 변환
-                  const executedPriceStr = (values['903'] || '0').toString().replace(/[+\s]/g, '')
-                  const executedPrice = parseFloat(executedPriceStr) || 0
+                  // 체결 정보 파싱 (00 주문체결 전용 FID)
+                  // '900': 주문수량, '901': 주문가격, '902': 미체결수량, '910': 체결가(평균), '911': 누적체결량, '913': 주문상태
+                  const orderQuantity = parseInt(values['900'] || '0') || 0
+                  const filledQuantity = parseInt(values['911'] || '0') || 0 // 누적 체결수량
+                  const unfilledQuantity = parseInt(values['902'] || '0') || 0
+                  const executedPrice = Math.abs(parseFloat((values['910'] || '0').replace(/[+\s]/g, '')) || 0)
                   const orderType = values['905'] || '' // "+매수" 또는 "-매도"
                   const orderOption = values['906'] || '' // "시장가", "지정가" 등
+                  const orderStatus = values['913'] || '' // 접수, 체결, 확인, 취소, 거부
                   
-                  // 실제 체결수량 계산: 주문수량 - 미체결수량 (FID 901이 0일 수 있으므로)
-                  const actualFilledQuantity = orderQuantity > 0 && unfilledQuantity >= 0 
-                    ? orderQuantity - unfilledQuantity 
-                    : filledQuantity
+                  // 실제 체결수량 계산 (누적 체결량 우선, 없으면 주문수량 - 미체결수량)
+                  const actualFilledQuantity = filledQuantity > 0
+                    ? filledQuantity
+                    : orderQuantity > 0
+                      ? orderQuantity - unfilledQuantity
+                      : 0
                   
                   // 디버깅: 체결 정보 로그 출력
                   if (orderQuantity > 0) {
-                    console.log(`[체결 정보 파싱] 종목코드: ${code}, 주문수량: ${orderQuantity}, 체결수량(FID901): ${filledQuantity}, 실제체결수량: ${actualFilledQuantity}, 미체결수량: ${unfilledQuantity}, 체결가격: ${executedPrice}, 주문구분: ${orderType}`)
+                    console.log(`[체결 정보 파싱] 종목코드: ${code}, 주문상태: ${orderStatus}, 주문수량: ${orderQuantity}, 체결수량: ${filledQuantity}, 실제체결수량: ${actualFilledQuantity}, 미체결수량: ${unfilledQuantity}, 체결가: ${executedPrice}, 주문구분: ${orderType} ${orderOption}`)
                   }
 
-                  if (currentPrice > 0 && isMounted) {
+                  // 시세(현재가/등락률/거래량) 갱신은 0B(주식체결)일 때만 한다.
+                  // 00(주문체결)에는 등락률·누적거래량이 없어 0으로 덮어쓰게 된다.
+                  const isMarketTick = item.type === '0B'
+
+                  if (isMarketTick && currentPrice > 0 && isMounted) {
                     // 검색된 종목 업데이트
                     setDetectedStocks(prevStocks => {
                       return prevStocks.map(stock => {
@@ -2207,7 +2491,8 @@ const AutoTrading = () => {
                   // WebSocket 체결 정보를 즉시 반영하여 체결 상태 업데이트
                   // 미체결수량이 줄어들거나 체결수량이 있으면 체결로 판단
                   // FID 900은 총 보유 수량일 수 있으므로, 실제 주문 수량과 비교해야 함
-                  if (orderQuantity > 0 && isMounted) {
+                  // 체결 정보 반영은 00(내 계좌 주문체결)에서만
+                  if (item.type === '00' && orderQuantity > 0 && isMounted) {
                     console.log(`[WebSocket 체결 정보] 종목코드: ${code}, 총보유수량(FID900): ${orderQuantity}, 체결수량(FID901): ${filledQuantity}, 실제체결수량: ${actualFilledQuantity}, 미체결수량(FID902): ${unfilledQuantity}, 체결가격(FID903): ${executedPrice}, 주문구분: ${orderType}`)
                     
                     // 체결 정보를 orderLogs에 즉시 반영
@@ -2228,8 +2513,8 @@ const AutoTrading = () => {
                           if (unfilledQuantity === 0 && 주문수량 > 0) {
                             const 체결수량 = 주문수량
                             // executedPrice는 누적 체결금액이므로 평균 체결가 계산
-                            const 평균체결가 = executedPrice > 0 && 체결수량 > 0 
-                              ? Math.round(executedPrice / 체결수량) 
+                            const 평균체결가 = executedPrice > 0
+                              ? Math.round(executedPrice)
                               : order.price
                             console.log(`[WebSocket 체결] ${order.stockName} 매수 주문 전량 체결 (체결수량: ${체결수량}주, 주문수량: ${주문수량}주, 누적체결금액: ${executedPrice.toLocaleString()}원, 평균체결가: ${평균체결가.toLocaleString()}원)`)
                             addLog(`[체결 완료] ${order.stockName} ${체결수량}주 매수 체결 (평균가: ${평균체결가.toLocaleString()}원)`, 'success')
@@ -2260,8 +2545,8 @@ const AutoTrading = () => {
                             if (unfilledQuantity === 0) {
                               // 전량 체결
                               // executedPrice는 누적 체결금액이므로 평균 체결가 계산
-                              const 평균체결가 = executedPrice > 0 && 총체결수량 > 0 
-                                ? Math.round(executedPrice / 총체결수량) 
+                              const 평균체결가 = executedPrice > 0
+                                ? Math.round(executedPrice)
                                 : order.price
                               console.log(`[WebSocket 체결] ${order.stockName} 매수 주문 전량 체결 (체결수량: ${총체결수량}주, 주문수량: ${주문수량}주, 누적체결금액: ${executedPrice.toLocaleString()}원, 평균체결가: ${평균체결가.toLocaleString()}원)`)
                               addLog(`[체결 완료] ${order.stockName} ${총체결수량}주 매수 체결 (평균가: ${평균체결가.toLocaleString()}원)`, 'success')
@@ -2286,8 +2571,8 @@ const AutoTrading = () => {
                             } else {
                               // 부분 체결
                               // executedPrice는 누적 체결금액이므로 평균 체결가 계산
-                              const 평균체결가 = executedPrice > 0 && 총체결수량 > 0 
-                                ? Math.round(executedPrice / 총체결수량) 
+                              const 평균체결가 = executedPrice > 0
+                                ? Math.round(executedPrice)
                                 : order.price
                               console.log(`[WebSocket 부분체결] ${order.stockName} 매수 주문 부분 체결 (이번체결: ${체결수량}주, 총체결: ${총체결수량}주, 미체결: ${unfilledQuantity}주, 주문: ${주문수량}주, 누적체결금액: ${executedPrice.toLocaleString()}원, 평균체결가: ${평균체결가.toLocaleString()}원)`)
                               addLog(`[부분 체결] ${order.stockName} 이번 ${체결수량}주 체결 (총 ${총체결수량}주 체결, 평균가: ${평균체결가.toLocaleString()}원, 미체결: ${unfilledQuantity}주)`, 'info')
@@ -2318,8 +2603,8 @@ const AutoTrading = () => {
                             if (unfilledQuantity === 0) {
                               // 전량 체결
                               // executedPrice는 누적 체결금액이므로 평균 체결가 계산
-                              const 평균체결가 = executedPrice > 0 && 총체결수량 > 0 
-                                ? Math.round(executedPrice / 총체결수량) 
+                              const 평균체결가 = executedPrice > 0
+                                ? Math.round(executedPrice)
                                 : order.price
                               addLog(`[체결 완료] ${order.stockName} ${총체결수량}주 매수 체결 (평균가: ${평균체결가.toLocaleString()}원)`, 'success')
                               
@@ -2343,8 +2628,8 @@ const AutoTrading = () => {
                             } else {
                               // 부분 체결
                               // executedPrice는 누적 체결금액이므로 평균 체결가 계산
-                              const 평균체결가 = executedPrice > 0 && 총체결수량 > 0 
-                                ? Math.round(executedPrice / 총체결수량) 
+                              const 평균체결가 = executedPrice > 0
+                                ? Math.round(executedPrice)
                                 : order.price
                               addLog(`[부분 체결] ${order.stockName} ${총체결수량}주 체결 (평균가: ${평균체결가.toLocaleString()}원, 미체결: ${unfilledQuantity}주)`, 'info')
                               
@@ -2381,8 +2666,8 @@ const AutoTrading = () => {
                           // 미체결 수량이 0이면 전량 체결
                           if (unfilledQuantity === 0 && 주문수량 > 0) {
                             const 체결수량 = 주문수량
-                            const 평균체결가 = executedPrice > 0 && 체결수량 > 0 
-                              ? Math.round(executedPrice / 체결수량) 
+                            const 평균체결가 = executedPrice > 0
+                              ? Math.round(executedPrice)
                               : order.price
                             
                             // 실현손익 계산 (매도가 - 매수가) * 수량
@@ -2402,6 +2687,8 @@ const AutoTrading = () => {
                               console.log(`[실현손익 누적] ${order.stockName}: ${실현손익.toLocaleString()}원, 오늘 총 실현손익: ${newTotal.toLocaleString()}원`)
                               return newTotal
                             })
+                            // 아래 effect가 같은 체결을 다시 집계하지 않도록 표시
+                            realizedCountedRef.current.add(order.orderNumber || `${order.stockCode}_${order.time}_${order.quantity}`)
                             
                             // 매도 체결 완료 후 해당 매수/매도 주문을 orderLogs에서 삭제
                             setTimeout(() => {
@@ -2440,8 +2727,8 @@ const AutoTrading = () => {
                             const 총체결수량 = 주문수량 - unfilledQuantity
                             
                             if (unfilledQuantity === 0) {
-                              const 평균체결가 = executedPrice > 0 && 총체결수량 > 0 
-                                ? Math.round(executedPrice / 총체결수량) 
+                              const 평균체결가 = executedPrice > 0
+                                ? Math.round(executedPrice)
                                 : order.price
                               
                               // 실현손익 계산
@@ -2490,8 +2777,8 @@ const AutoTrading = () => {
                                 realizedProfitPercent: 실현손익률,
                               }
                             } else {
-                              const 평균체결가 = executedPrice > 0 && 총체결수량 > 0 
-                                ? Math.round(executedPrice / 총체결수량) 
+                              const 평균체결가 = executedPrice > 0
+                                ? Math.round(executedPrice)
                                 : order.price
                               
                               // 부분체결 실현손익 계산 (체결된 수량만큼)
@@ -2539,10 +2826,9 @@ const AutoTrading = () => {
         ws.onclose = () => {
           console.log('[실시간 시세] WebSocket 연결 종료')
           ws = null
-          wsConnected = false
           
-          // 재연결 시도 (3초 후)
-          if (isMounted && isConnected && connected && detectedStocks.length > 0) {
+          // 재연결 시도 (3초 후). 연결 상태만 보면 되고 종목 유무와 무관하다.
+          if (isMounted) {
             setTimeout(() => {
               if (isMounted) {
                 connectWebSocket()
@@ -2558,20 +2844,6 @@ const AutoTrading = () => {
     // WebSocket 연결 시작
     connectWebSocket()
 
-    // 종목이 추가되면 실시간 시세 등록 (검색된 종목 + 체결된 주문의 종목, 부분체결 포함)
-    const detectedCodes = detectedStocks.map(stock => stock.code)
-    const executedOrderCodes = orderLogs
-      .filter(order => order.type === 'buy' && (order.status === '체결' || order.status === '부분체결' || order.isExecuted))
-      .map(order => order.stockCode)
-      .filter((code, index, self) => self.indexOf(code) === index) // 중복 제거
-    
-    const currentCodes = [...new Set([...detectedCodes, ...executedOrderCodes])] // 중복 제거
-    const newCodes = currentCodes.filter(code => !registeredCodes.includes(code))
-    if (newCodes.length > 0 && wsConnected) {
-      kiwoomApi.registerRealTimeStocks(newCodes).catch(console.error)
-      registeredCodes = [...registeredCodes, ...newCodes]
-    }
-
     return () => {
       isMounted = false
       if (ws) {
@@ -2579,7 +2851,39 @@ const AutoTrading = () => {
       }
       // 서버 WebSocket 연결 해제는 하지 않음 (다른 클라이언트가 사용할 수 있음)
     }
-  }, [isConnected, connected, detectedStocks.length, orderLogs.length]) // 연결 상태와 종목 개수, 주문 개수 확인
+  }, [isConnected, connected]) // 종목 변경 시 재연결하지 않는다. 등록은 아래 별도 effect에서 처리.
+
+  // 검색된 종목이 늘어나면 실시간 등록만 추가한다 (브라우저 WS는 유지)
+  // 서버 WS가 아직 준비되지 않아 등록이 실패할 수 있으므로 주기적으로 재시도한다.
+  const registeredCodesRef = useRef<Set<string>>(new Set())
+  const connectedSessionKey = `${connected ? 1 : 0}-${selectedAccount}`
+  const registeredSessionRef = useRef<string>('')
+  useEffect(() => {
+    if (!isConnected || !connected) return
+
+    // 서버가 재시작되면 서버측 등록 상태는 비는데 클라이언트 캐시는 남아 있게 된다.
+    // 연결이 새로 성립하면 캐시를 버리고 전체를 다시 등록한다.
+    if (registeredSessionRef.current !== connectedSessionKey) {
+      registeredSessionRef.current = connectedSessionKey
+      registeredCodesRef.current.clear()
+    }
+
+    const sync = () => {
+      const codes = detectedStocksRef.current.map(s => s.code)
+      const newCodes = codes.filter(code => !registeredCodesRef.current.has(code))
+      if (newCodes.length === 0) return
+      newCodes.forEach(code => registeredCodesRef.current.add(code))
+      kiwoomApi.registerRealTimeStocks(newCodes).catch((error) => {
+        // 실패하면 다음 주기에 다시 시도할 수 있도록 기록을 되돌린다
+        newCodes.forEach(code => registeredCodesRef.current.delete(code))
+        console.error('[실시간 시세] 등록 실패:', error.message)
+      })
+    }
+
+    sync()
+    const id = window.setInterval(sync, 5000)
+    return () => window.clearInterval(id)
+  }, [isConnected, connected, connectedSessionKey])
 
   // 체결된 주문의 종목코드를 실시간 시세에 등록
   useEffect(() => {
@@ -2602,10 +2906,14 @@ const AutoTrading = () => {
   }, [isConnected, connected, orderLogs]) // 체결된 주문이 추가될 때마다 실행
 
   // 보유종목이 비어있으면 체결된 주문 기반으로 생성
+  // 주의: 잔고 조회가 성공한 상태에서는 절대 로그로 보유종목을 만들지 않는다.
+  // (로그 기반 생성이 잔고보다 먼저/나중에 실행되면 목록이 달라져 보인다)
   useEffect(() => {
     if (holdingStocks.length > 0) return
     if (orderLogs.length === 0) return
     if (!isConnected || !connected) return
+    // 잔고를 조회할 수 있는 상태면 잔고 결과를 기다린다 (로그로 대체하지 않음)
+    if (isConnected && !!selectedAccount && !balanceError) return
 
     const executedBuyOrders = orderLogs.filter(order => 
       order.type === 'buy' && 
@@ -2722,6 +3030,7 @@ const AutoTrading = () => {
   // 손절 모니터링 (보유종목의 수익률을 실시간 체크하여 손절 기준에 도달하면 시장가 매도)
   useEffect(() => {
     if (!stopLossEnabled) return
+    if (stepProfit.사용) return // 단계별 익절/손절 사용 시 단계 손절이 담당 (이중 매도 방지)
     if (!isRunning) return
     if (holdingStocks.length === 0) return
     if (!isConnected || !connected || !selectedAccount) return
@@ -2772,6 +3081,8 @@ const AutoTrading = () => {
                 orderNumber: sellResult.orderNumber || sellResult.order_number,
                 isExecuted: false,
                 orderTimestamp: Date.now(),
+                buyPrice: stock.purchasePrice, // 실현손익 계산용 매수가
+                currentPrice: stock.currentPrice,
               }
               
               setOrderLogs(prev => [newOrder, ...prev])
@@ -2811,7 +3122,7 @@ const AutoTrading = () => {
         executeSellOrder()
       }
     })
-  }, [holdingStocks, stopLossEnabled, stopLossRate, isRunning, isConnected, connected, selectedAccount])
+  }, [holdingStocks, stopLossEnabled, stopLossRate, stepProfit.사용, isRunning, isConnected, connected, selectedAccount])
 
   // 차트 데이터로 검색된 종목 화면 갱신 (주기적으로 차트 데이터 조회하여 가격 정보 업데이트)
   // 조건검색 직후에는 차트 데이터 조회를 지연시켜 API 제한 방지
@@ -2821,6 +3132,15 @@ const AutoTrading = () => {
   const lastOrderTimeRef = useRef<number>(0)
   const minOrderInterval = 5000 // 주문 간 최소 간격: 5초 (API 요청 제한 방지)
   const apiLimitErrorRef = useRef<boolean>(false) // API 제한 에러 발생 플래그
+  // 실행 중첩 방지: 1회 실행이 30초를 넘으면 다음 인터벌과 겹쳐 같은 종목을 중복 주문한다
+  const isExecutingRef = useRef<boolean>(false)
+  // 주문 처리 중 종목을 동기적으로 기록한다.
+  // setProcessingOrders는 다음 렌더에야 반영되므로 같은 루프 안에서 중복 주문을 막지 못한다.
+  const processingOrdersRef = useRef<Set<string>>(new Set())
+  // 실행 루프는 시작 시점 state 스냅샷을 붙들므로 최신 값을 ref로 읽는다
+  // (holdingStocksRef는 상단에서 선언했다)
+  const orderedOrHoldingRef = useRef<Set<string>>(new Set())
+  orderedOrHoldingRef.current = orderedOrHoldingStocks
   
   useEffect(() => {
     if (!isConnected || !connected || detectedStocks.length === 0) {
@@ -2829,92 +3149,82 @@ const AutoTrading = () => {
 
     let isMounted = true
     let intervalId: number | null = null
+    let isFetching = false // 이전 조회가 끝나기 전에 겹쳐 실행되지 않도록
 
     const updateStocksFromChartData = async () => {
-      if (!isMounted || detectedStocks.length === 0) {
+      if (!isMounted || detectedStocks.length === 0 || isFetching) {
         return
       }
 
-      // 조건검색 직후 30초 이내에는 차트 데이터 조회하지 않음 (API 제한 방지)
+      // 조건검색 직후에는 차트 데이터 조회를 지연시켜 API 제한 방지.
+      // 단 시가/고가가 아직 없는 종목이 있으면 짧게만 기다린다 (표가 '-'로 남지 않도록).
       const timeSinceLastSearch = Date.now() - lastSearchTimeRef.current
-      if (timeSinceLastSearch < 30000) {
+      const needsOpenHigh = detectedStocks.some(s => !s.openPrice || !s.highPrice)
+      const waitMs = needsOpenHigh ? 3000 : 30000
+      if (timeSinceLastSearch < waitMs) {
         if (process.env.NODE_ENV === 'development') {
-          console.log(`[차트 갱신] 조건검색 직후 대기 중 (${Math.ceil((30000 - timeSinceLastSearch) / 1000)}초 남음)`)
+          console.log(`[차트 갱신] 조건검색 직후 대기 중 (${Math.ceil((waitMs - timeSinceLastSearch) / 1000)}초 남음)`)
         }
         return
       }
 
       try {
-        // 검색된 종목들에 대해 차트 데이터 조회하여 최신 가격 정보 업데이트 (모든 종목)
-        // API 제한을 고려하여 배치 크기를 줄이고 딜레이를 늘림
-        const batchSize = 3 // 한 번에 3개씩 처리 (5개에서 줄임)
-        const delayBetweenBatches = 2000 // 배치 간 2초 딜레이 (500ms에서 증가)
-        
-        for (let i = 0; i < detectedStocks.length; i += batchSize) {
-          if (!isMounted) break
-          
-          const batch = detectedStocks.slice(i, i + batchSize)
-          const batchPromises = batch.map(async (stock) => {
-            try {
-              // 분봉 차트 데이터 조회 (최신 데이터 1개만 필요)
-              const candles = await kiwoomApi.getCandle(stock.code, 'min')
-              
-              if (candles && candles.length > 0 && isMounted) {
-                // 최신 차트 데이터에서 종가를 가져와서 가격 정보 업데이트
-                const latestCandle = candles[0]
-                const closePrice = parseFloat(latestCandle.종가 || latestCandle.close || '0') || 0
-                const volume = parseFloat(latestCandle.거래량 || latestCandle.volume || '0') || 0
-                
-                if (closePrice > 0) {
-                  // detectedStocks 업데이트 (가격이 변경된 경우만)
-                  setDetectedStocks(prevStocks => {
-                    return prevStocks.map(s => {
-                      if (s.code === stock.code && s.price !== closePrice) {
-                        // 가격 변화율 계산
-                        const change = closePrice - (s.startPrice || closePrice)
-                        const changePercent = s.startPrice && s.startPrice > 0
-                          ? ((closePrice - s.startPrice) / s.startPrice) * 100
-                          : 0
-                        
-                        return {
-                          ...s,
-                          price: closePrice,
-                          change: change,
-                          changePercent: changePercent,
-                          volume: volume > 0 ? volume : s.volume,
-                        }
-                      }
-                      return s
-                    })
-                  })
-                }
-              }
-            } catch (error: any) {
-              // API 제한 에러(429)는 조용히 처리
-              if (error.response?.status === 429) {
-                if (process.env.NODE_ENV === 'development') {
-                  console.log(`[차트 갱신] ${stock.code} API 제한으로 건너뜀`)
-                }
-                return
-              }
-              // 개별 종목 조회 실패는 조용히 처리
-              if (process.env.NODE_ENV === 'development') {
-                console.log(`[차트 갱신] ${stock.code} 조회 실패:`, error)
-              }
-            }
-          })
+        isFetching = true
+        // 검색된 종목들의 최신 가격만 필요하므로 다종목 시세(ka10095)로 한 번에 조회한다.
+        // 종목별 현재가(ka10001)를 반복하면 서버 TR 큐 간격 때문에 수십 초가 걸린다.
+        const codes = detectedStocks.map(s => s.code)
+        const prices = await kiwoomApi.getMultipleStockPrices(codes)
 
-          await Promise.all(batchPromises)
-          
-          // 배치 간 딜레이 (API 호출 제한 방지)
-          if (i + batchSize < detectedStocks.length && isMounted) {
-            await new Promise(resolve => setTimeout(resolve, delayBetweenBatches))
-          }
+        if (isMounted && prices.length > 0) {
+          const priceMap = new Map<string, any>(prices.map((p: any) => [p.code, p]))
+
+          setDetectedStocks(prevStocks => {
+            return prevStocks.map(s => {
+              const latest = priceMap.get(s.code)
+              if (!latest || !latest.price) {
+                return s
+              }
+
+              const closePrice = latest.price
+              // 대비/등락률은 전일 종가 기준이어야 한다 (시작가 기준 상대변화율은 매수 조건에서 별도 계산)
+              const change = latest.change ?? (closePrice - (s.startPrice || closePrice))
+              const changePercent = latest.changePercent ?? s.changePercent
+
+              // 시가/고가는 ka10095 응답에서만 오므로, 한 번 받으면 유지한다
+              const openPrice = latest.openPrice || latest.시가 || s.openPrice
+              const highPrice = latest.highPrice || latest.고가 || s.highPrice
+              const prevClose = latest.prevClose || s.prevClose
+
+              if (
+                closePrice === s.price &&
+                change === s.change &&
+                changePercent === s.changePercent &&
+                openPrice === s.openPrice &&
+                highPrice === s.highPrice &&
+                prevClose === s.prevClose
+              ) {
+                return s
+              }
+
+              return {
+                ...s,
+                price: closePrice,
+                change: change,
+                changePercent: changePercent,
+                volume: latest.volume > 0 ? latest.volume : s.volume,
+                openPrice,
+                highPrice,
+                prevClose,
+              }
+            })
+          })
         }
       } catch (error) {
         if (process.env.NODE_ENV === 'development') {
-          console.error('[차트 갱신] 오류:', error)
+          console.error('[가격 갱신] 오류:', error)
         }
+      } finally {
+        isFetching = false
       }
     }
 
@@ -2928,7 +3238,7 @@ const AutoTrading = () => {
           updateStocksFromChartData()
         }
       }, 30000) // 30초마다
-    }, 30000) // 첫 실행은 30초 후
+    }, 4000) // 첫 실행은 4초 후 (시가/고가 보강 대기)
 
     return () => {
       isMounted = false
@@ -2984,6 +3294,7 @@ const AutoTrading = () => {
     try {
       const response = await fetch('/api/auth/validate-key', {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
         },
@@ -2993,10 +3304,20 @@ const AutoTrading = () => {
       const data = await response.json()
       
       if (data.success) {
-        setKeyInfo({
+        const info = {
           expiresAt: data.expiresAt,
           remainingDays: data.remainingDays
-        })
+        }
+        setKeyInfo(info)
+        // 검증 결과를 저장해 재시작 후에도 "검증 완료"가 유지되게 한다.
+        // 키 자체는 서버가 HttpOnly 쿠키로 관리하므로 localStorage에 남기지 않는다.
+        // (남기면 XSS 한 번에 키가 탈취된다. 만료 정보만 저장한다)
+        try {
+          localStorage.removeItem('kiwoom_license_key')
+          localStorage.setItem('kiwoom_license_info', JSON.stringify({ expiresAt: info.expiresAt, remainingDays: info.remainingDays }))
+        } catch (storageError) {
+          console.warn('[라이선스] 검증 결과 저장 실패:', storageError)
+        }
         return { success: true }
       } else {
         throw new Error(data.message || '키 검증 실패')
@@ -3051,18 +3372,25 @@ const AutoTrading = () => {
       console.log('SecretKey 길이:', finalSecretkey.length)
 
       // localStorage에 저장 (trim된 값)
+      // 주의: appkey/secretkey는 브라우저에 남는다. 서버 세션에만 두는 것이 이상적이나
+      //       서버 재시작 후 자동 재연결에 필요해 유지한다. (공용 PC에서는 사용 금지)
       localStorage.setItem('kiwoom_appkey', finalAppkey)
       localStorage.setItem('kiwoom_secretkey', finalSecretkey)
       localStorage.setItem('kiwoom_apimode', apiMode)
-      if (useLicenseKey && licenseKey.trim()) {
-        localStorage.setItem('kiwoom_license_key', licenseKey.trim())
+      // 라이선스 키는 HttpOnly 쿠키로 관리되므로 localStorage에 저장하지 않는다
+      try {
+        localStorage.removeItem('kiwoom_license_key')
+      } catch {
+        // 저장소 접근 불가 시 무시
       }
 
       // API 연결 시도 (백엔드에 요청)
       const response = await fetch('/api/kiwoom/connect', {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
+          ...authHeaders(),
         },
         body: JSON.stringify({ 
           appkey: finalAppkey, 
@@ -3092,7 +3420,7 @@ const AutoTrading = () => {
   // 키움 API 연결 해제
   const handleDisconnect = async () => {
     try {
-      await fetch('/api/kiwoom/disconnect', { method: 'POST' })
+      await fetch('/api/kiwoom/disconnect', { method: 'POST', credentials: 'include', headers: authHeaders() })
       setIsConnected(false)
       // useKiwoomStore의 connected 상태 업데이트
       await checkStatus()
@@ -3112,6 +3440,132 @@ const AutoTrading = () => {
       c.id === id ? { ...c, enabled: !c.enabled } : c
     )
     setConditions(updatedConditions)
+  }
+
+  // 검색 직후 시가/고가 보강: 순위정보 API는 시가/고가를 주지 않으므로
+  // 다종목 시세(ka10095)로 한 번 채워 표에 '-'가 남지 않게 한다.
+  const enrichOpenHigh = async (codes: string[]) => {
+    if (codes.length === 0) return
+    try {
+      const prices = await kiwoomApi.getMultipleStockPrices(codes)
+      if (!prices || prices.length === 0) return
+      const map = new Map<string, any>(prices.map((p: any) => [p.code, p]))
+      setDetectedStocks(prev => prev.map(s => {
+        const latest = map.get(s.code)
+        if (!latest) return s
+        const openPrice = latest.openPrice || latest.시가 || s.openPrice
+        const highPrice = latest.highPrice || latest.고가 || s.highPrice
+        const prevClose = latest.prevClose || s.prevClose
+        if (openPrice === s.openPrice && highPrice === s.highPrice && prevClose === s.prevClose) return s
+        return { ...s, openPrice, highPrice, prevClose }
+      }))
+    } catch (error: any) {
+      if (process.env.NODE_ENV === 'development') {
+        console.error('[시가/고가 보강] 오류:', error.message)
+      }
+    }
+  }
+
+  // 수동 종목 검색 (조건검색식에 종목 직접 추가)
+  const handleManualSearch = async () => {
+    const keyword = manualKeyword.trim()
+    if (!keyword) return
+    setIsManualSearching(true)
+    try {
+      const stocks = await kiwoomApi.searchStocks(keyword)
+      setManualResults(stocks)
+      setManualSelectedCodes(new Set())
+      if (stocks.length === 0) addLog(`'${keyword}' 검색 결과가 없습니다`, 'warning')
+    } catch (error: any) {
+      addLog(`종목 검색 실패: ${error.message}`, 'error')
+    } finally {
+      setIsManualSearching(false)
+    }
+  }
+
+  // 검색 결과에서 선택한 종목을 검색된 종목 목록에 추가
+  const handleManualAdd = async () => {
+    const picked = manualResults.filter(s => manualSelectedCodes.has(s.code))
+    if (picked.length === 0) {
+      addLog('추가할 종목을 선택하세요', 'warning')
+      return
+    }
+
+    // 현재가/등락률을 채워야 매매 로직이 바로 동작한다
+    let priceMap = new Map<string, any>()
+    try {
+      const prices = await kiwoomApi.getMultipleStockPrices(picked.map(s => s.code))
+      priceMap = new Map<string, any>((prices || []).map((p: any) => [p.code, p]))
+    } catch {
+      // 시세 조회 실패해도 종목은 추가한다 (이후 폴링에서 채워짐)
+    }
+
+    const now = new Date().toLocaleTimeString()
+    const added: DetectedStock[] = []
+    const skipped: string[] = []
+
+    setDetectedStocks(prev => {
+      const existing = new Set(prev.map(s => s.code))
+      const next = [...prev]
+      for (const pickedStock of picked) {
+        if (existing.has(pickedStock.code)) {
+          skipped.push(pickedStock.name)
+          continue
+        }
+        const p = priceMap.get(pickedStock.code) || {}
+        const price = p.price ?? 0
+        const change = p.change ?? 0
+        const changePercent = p.changePercent ?? 0
+        const stock: DetectedStock = {
+          code: pickedStock.code,
+          name: pickedStock.name || p.name || pickedStock.code,
+          price,
+          change,
+          changePercent,
+          volume: p.volume ?? 0,
+          openPrice: p.openPrice,
+          highPrice: p.highPrice,
+          prevClose: p.prevClose ?? (price - change),
+          detectedCondition: '수동추가',
+          detectedTime: now,
+          startPrice: price,
+          detectedChangePercent: changePercent,
+        }
+        next.push(stock)
+        added.push(stock)
+      }
+      return next
+    })
+
+    // 시세를 못 받아온 종목은 한 번 더 보강
+    const missing = picked.filter(s => !(priceMap.get(s.code)?.price))
+    if (missing.length > 0) enrichOpenHigh(missing.map(s => s.code))
+
+    if (added.length > 0) addLog(`수동 종목 추가: ${added.map(s => s.name).join(', ')}`, 'success')
+    if (skipped.length > 0) addLog(`이미 검색된 종목: ${skipped.join(', ')}`, 'warning')
+
+    setManualSelectedCodes(new Set())
+  }
+
+  // 수동 추가 종목 해제 (검색된 종목 목록에서 제거)
+  const handleManualRemove = (code: string, name: string) => {
+    setDetectedStocks(prev => prev.filter(s => s.code !== code))
+    setManualSelectedCodes(prev => {
+      if (!prev.has(code)) return prev
+      const next = new Set(prev)
+      next.delete(code)
+      return next
+    })
+    addLog(`수동 종목 삭제: ${name} (${code})`, 'info')
+  }
+
+  // 조건식 검색 결과로 목록을 교체하되, 수동 추가 종목은 유지한다
+  const applyConditionResults = (newStocks: DetectedStock[]) => {
+    setDetectedStocks(prev => {
+      const manual = prev.filter(s => s.detectedCondition === '수동추가')
+      const codes = new Set(newStocks.map(s => s.code))
+      return [...manual.filter(s => !codes.has(s.code)), ...newStocks]
+    })
   }
 
   // 시작 버튼 클릭
@@ -3140,19 +3594,24 @@ const AutoTrading = () => {
           code: stock.code,
           name: stock.name,
           price: stock.price,
-          change: stock.price * (stock.changeRate / 100),
+          change: changeFromRate(stock.price, stock.changeRate),
           changePercent: stock.changeRate,
           volume: stock.volume,
+          openPrice: stock.openPrice,
+          highPrice: stock.highPrice,
           detectedCondition: result.appliedConditions.join(', '),
           detectedTime: new Date().toLocaleTimeString(),
           startPrice: stock.price, // 자동매매 시작 시점의 가격 저장
           detectedChangePercent: stock.changeRate, // 조건 감지 시점의 등락률 저장 (매수 조건 비교용)
         }))
         
-        setDetectedStocks(newStocks)
+        applyConditionResults(newStocks)
         
         // 조건검색 시간 기록 (차트 데이터 조회 지연용)
         lastSearchTimeRef.current = Date.now()
+        
+        // 시가/고가 즉시 보강 (순위정보에는 없는 값)
+        enrichOpenHigh(newStocks.map(s => s.code))
         
         // 선택된 종목도 업데이트 (가격만 갱신)
         if (watchlistStocks.length > 0) {
@@ -3800,37 +4259,43 @@ const AutoTrading = () => {
     }
   }
 
+  // 매수 가능 시간 여부 (최신 ref 기준 - 인터벌 클로저 대응)
+  const isBuyTimeNow = () => {
+    const g = timeGateRef.current
+    const d = new Date()
+    const sec = hmsToSec(d.getHours(), d.getMinutes(), d.getSeconds())
+    if (g.buyStopped) return false
+    if (!secInRange(sec, hmsToSec(g.startHour, g.startMinute), hmsToSec(g.endHour, g.endMinute, g.endSecond))) return false
+    if (g.pauseBuyEnabled && secInRange(sec, hmsToSec(g.pauseStartHour, g.pauseStartMinute), hmsToSec(g.pauseEndHour, g.pauseEndMinute))) return false
+    return true
+  }
+
   // 매수 조건 확인 함수 (async로 변경)
   const checkBuyConditions = async (stock: DetectedStock): Promise<boolean> => {
     // 기본 매수 조건 체크 (C# 코드의 기존매수조건확인과 동일)
     // 1. 이미 보유 중인 종목은 제외 (C# 코드: b계좌보유중 || 매수주문했거나보유중인종목.Contains)
-    if (stock.isHolding || orderedOrHoldingStocks.has(stock.code)) {
+    if (stock.isHolding || orderedOrHoldingRef.current.has(stock.code)) {
       return false
     }
     
     // 2. holdingStocks에도 있는지 확인 (이중 체크)
-    if (holdingStocks.some(h => h.code === stock.code)) {
+    if (holdingStocksRef.current.some(h => h.code === stock.code)) {
       return false
     }
 
     // 3. 최대 동시 보유 종목 수 체크
-    if (holdingStocks.length >= maxSimultaneousBuy) {
+    if (holdingStocksRef.current.length >= maxSimultaneousBuy) {
       return false
     }
 
-    // 3. 매매 시간 체크
-    const now = new Date()
-    const currentHour = now.getHours()
-    const currentMinute = now.getMinutes()
-    const currentSecond = now.getSeconds()
-    
-    const startTime = startHour * 60 + startMinute
-    const endTime = endHour * 60 + endMinute + (endSecond >= 59 ? 1 : 0)
-    const currentTime = currentHour * 60 + currentMinute
-    
-    if (currentTime < startTime || currentTime >= endTime) {
+    // 3. 매매 시간 체크 (시작/종료 + 시간대정지 + 즉시 매수정지)
+    if (!isBuyTimeNow()) {
       return false
     }
+
+    // 전략별 시간 구간 비교용 (분 단위)
+    const nowForStrategy = new Date()
+    const currentTime = nowForStrategy.getHours() * 60 + nowForStrategy.getMinutes()
 
     // 4. 레버리지/인버스 ETF 제외
     if (stock.name.includes('레버리지') || 
@@ -3886,11 +4351,12 @@ const AutoTrading = () => {
     // 기본매수설정은 차트 분석이 필요 없음 (등락률 차이만 확인)
     const 차트분석필요알고리즘 = [
       buyFormula1,           // My_매수신호_1 (이동평균선 기반)
-      strategyMarketOpen,   // 장시작급등주
-      strategyBollinger,    // 볼린저밴드
-      strategyScalping,      // 스캘핑
-      strategyBreakout,      // 돌파매매
-      strategyMarketClose    // 장마감종가배팅
+      // 전략 6종은 매수수식 2가 켜져 있을 때만 동작하므로 함께 묶는다
+      buyFormula2 && strategyMarketOpen,   // 장시작급등주
+      buyFormula2 && strategyBollinger,    // 볼린저밴드
+      buyFormula2 && strategyScalping,     // 스캘핑
+      buyFormula2 && strategyBreakout,     // 돌파매매
+      buyFormula2 && strategyMarketClose   // 장마감종가배팅
     ]
     
     const 차트분석필요 = 차트분석필요알고리즘.some(checked => checked)
@@ -4005,7 +4471,7 @@ const AutoTrading = () => {
     const 장마감종가배팅 = currentTime >= 장마감시작시각 && currentTime < 장마감시각
 
     // 1. 장시작 급등주 매수 로직 (차트 데이터 우선 사용, 없으면 상대 변화율 기반)
-    if (!기본매수설정차단 && 장시작직후 && strategyMarketOpen) {
+    if (!기본매수설정차단 && buyFormula2 && 장시작직후 && strategyMarketOpen) {
       if (candles.length >= marketOpenBuy.shortTermPeriod) {
         // 차트 데이터가 있으면 차트 기반 전략 실행
         const 장시작급등주결과 = await 장시작급등주매수(stock, candles)
@@ -4025,7 +4491,7 @@ const AutoTrading = () => {
     // 장중 매매 로직 (실시간 시세 기반으로 모든 전략 실행)
     if (!기본매수설정차단 && !장시작직후 && !장마감종가배팅) {
       // 2. 볼린저밴드 기반 매수 (차트 데이터가 있으면 사용, 없으면 실시간 시세로 판단)
-      if (strategyBollinger) {
+      if (buyFormula2 && strategyBollinger) {
         if (candles.length >= bollingerBuy.shortTermPeriod) {
           // 차트 데이터가 있으면 차트 기반 전략 실행
           const 볼린저밴드결과 = await 볼린저밴드매수(stock, candles)
@@ -4045,7 +4511,7 @@ const AutoTrading = () => {
       }
 
       // 4. 스캘핑 매매 로직 (차트 데이터 우선 사용)
-      if (strategyScalping) {
+      if (buyFormula2 && strategyScalping) {
         if (candles.length >= scalpingBuy.minCandleCount) {
           // 차트 데이터가 충분하면 차트 기반 전략 실행 (스캘핑은 최소 설정값 개수 필요)
           const 스캘핑결과 = await 스캘핑매수(stock, candles)
@@ -4070,7 +4536,7 @@ const AutoTrading = () => {
       }
 
       // 5. 돌파매매 로직 (차트 데이터 우선 사용)
-      if (strategyBreakout) {
+      if (buyFormula2 && strategyBreakout) {
         if (candles.length >= breakoutBuy.shortTermPeriod) {
           // 차트 데이터가 있으면 차트 기반 전략 실행 (돌파매수는 최소 설정값 개수 필요)
           const 돌파결과 = await 돌파매수(stock, candles)
@@ -4089,8 +4555,8 @@ const AutoTrading = () => {
       }
     }
 
-    // 3. 장마감 종가 배팅 매매 (실시간 시세 기반)
-    if (!기본매수설정차단 && 장마감종가배팅 && strategyMarketClose) {
+      // 3. 장마감 종가 배팅 매매 (실시간 시세 기반)
+      if (!기본매수설정차단 && buyFormula2 && 장마감종가배팅 && strategyMarketClose) {
       if (candles.length >= marketCloseBuy.minCandleCount) {
         // 차트 데이터가 있으면 차트 기반 전략 실행
         if (await 장마감종가배팅매수(stock, candles)) {
@@ -4106,11 +4572,10 @@ const AutoTrading = () => {
       }
     }
 
-    // 기본매수설정 체크 (strategyBasicBuy가 체크되어 있을 때만 적용)
-    // 기본매수설정은 다른 전략과 독립적으로 실행 (OR 조건)
+    // 4. 기본매수설정 체크 (매수수식 2 + strategyBasicBuy가 체크되어 있을 때만 적용)
     // 매매설정의 % 값은 조건 감지 시점 등락률과 현재 등락률의 차이를 의미함
     // 기본매수설정: 등락률 차이가 2% 이상 15% 이하로 상승한 종목만 매수
-    if (strategyBasicBuy) {
+    if (buyFormula2 && strategyBasicBuy) {
       // 등락률 차이가 설정된 범위 내에 있는지 확인
       // 등락률 차이는 반드시 양수여야 함 (상승한 경우만 매수)
       // minFluctuation(2%) 이상 maxFluctuation(15%) 이하일 때만 매수
@@ -4154,28 +4619,50 @@ const AutoTrading = () => {
     return 매수신호
   }
 
+  // 단계별 익절/손절 판단 (C# 키움데이터수신처리.cs 727~790행 로직)
+  // 실행 루프가 시작 시점 클로저를 쓰므로 최신 설정은 ref에서 읽는다
+  // 반환: 매도할 수량과 사유. 조건 미충족이면 null
+  const getStepSellPlan = (holding: HoldingStock): { quantity: number; reason: string } | null => {
+    const tier = stepSellTier(holding.profitPercent, stepProfitRef.current, stepSoldRef.current.get(holding.code) || 0)
+    if (!tier) return null
+    stepSoldRef.current.set(holding.code, tier.step) // 이후 단계만 진행되도록 확정
+    return { quantity: Math.ceil(holding.quantity * tier.ratio), reason: tier.reason }
+  }
+
+  // 매도 단계 기록 정리 (보유 목록에서 사라진 종목)
+  useEffect(() => {
+    const codes = new Set(holdingStocks.map(h => h.code))
+    for (const code of Array.from(stepSoldRef.current.keys())) {
+      if (!codes.has(code)) stepSoldRef.current.delete(code)
+    }
+  }, [holdingStocks])
+
   // 매도 조건 확인 함수 (My_매도신호_1 로직 적용)
   const checkSellConditions = (holding: HoldingStock): boolean => {
-    // 매도수익률설정이 체크되어 있지 않으면 매도하지 않음 (기본적으로 항상 체크되어 있다고 가정)
-    // My_매도신호_1의 checkBox_매도수익률설정.Checked 로직
-    
+    // 매도수식이 하나도 선택되어 있지 않으면 자동 매도하지 않는다
+    // (사용자가 매도수식 1·2를 모두 해제한 경우)
+    if (!sellFormula1 && !sellFormula2) return false
+
     // 최고 수익률 갱신
     if (holding.profitPercent > holding.maxProfitPercent) {
       holding.maxProfitPercent = holding.profitPercent
     }
     const 최고수익률 = holding.maxProfitPercent
 
-    // 1. 트레일링 스탑 조건 체크 (My_매도신호_1의 트레일링 스탑 로직)
+    // 1. 트레일링 스탑 조건 체크 (매도수식 2: 트레일링 매도 조건)
     // checkBox_Trailing매도.Checked && 최고수익률 >= numericUpDown_Trailing매도기준.Value
-    if (trailingStop && 최고수익률 >= trailingProfitThreshold) {
+    if (sellFormula2 && trailingStop && 최고수익률 >= trailingProfitThreshold) {
       const 하락률기준 = Math.abs(trailingDropThreshold) // numericUpDown_Trailing최고점대비.Value
       const 현재하락률 = 최고수익률 - holding.profitPercent
       
       if (현재하락률 >= 하락률기준) {
-        addLog(`[매도신호1] ${holding.name}: 트레일링 매도 - 최고수익률: ${최고수익률.toFixed(2)}% → 현재수익률: ${holding.profitPercent.toFixed(2)}% (하락률: ${현재하락률.toFixed(2)}%)`, 'warning')
+        addLog(`[매도신호2] ${holding.name}: 트레일링 매도 - 최고수익률: ${최고수익률.toFixed(2)}% → 현재수익률: ${holding.profitPercent.toFixed(2)}% (하락률: ${현재하락률.toFixed(2)}%)`, 'warning')
         return true
       }
     }
+
+    // 아래 익절/손절은 매도수식 1 (익절/손절 조건)
+    if (!sellFormula1) return false
 
     // 2. 익절 조건 체크 (My_매도신호_1의 익절 로직: 최고수익률이 익절기준 이상)
     // 최고수익률 >= 익절기준
@@ -4192,20 +4679,7 @@ const AutoTrading = () => {
     }
 
     // 4. 시간 매도 조건 체크 (15:19:59 이후 강제 매도)
-    if (dropSellTime) {
-      const now = new Date()
-      const currentHour = now.getHours()
-      const currentMinute = now.getMinutes()
-      const currentSecond = now.getSeconds()
-      
-      const dropSellTimeMinutes = dropSellStartHour * 60 + dropSellStartMinute
-      const currentTimeMinutes = currentHour * 60 + currentMinute
-      
-      if (currentTimeMinutes >= dropSellTimeMinutes && currentSecond >= dropSellEndSecond) {
-        addLog(`${holding.name} 시간 매도 조건 달성`, 'warning')
-        return true
-      }
-    }
+    // 목표시간 전량매도는 executeAutoTrading의 forceFullSell에서 처리하므로 여기서는 생략
 
     return false
   }
@@ -4256,9 +4730,11 @@ const AutoTrading = () => {
               code: stock.code,
               name: stock.name,
               price: stock.price,
-              change: stock.price * (stock.changeRate / 100),
+              change: changeFromRate(stock.price, stock.changeRate),
               changePercent: stock.changeRate,
               volume: stock.volume,
+              openPrice: stock.openPrice,
+              highPrice: stock.highPrice,
               detectedCondition: result.appliedConditions.join(', '),
               detectedTime: existingStock?.detectedTime || new Date().toLocaleTimeString(),
               // 기존 종목이면 시작 가격 유지, 새 종목이면 현재 가격을 시작 가격으로 설정
@@ -4268,11 +4744,14 @@ const AutoTrading = () => {
             }
           })
           
-          // 상태 업데이트
-          setDetectedStocks(newStocks)
+          // 상태 업데이트 (수동 추가 종목은 조건식 결과와 무관하게 유지)
+          applyConditionResults(newStocks)
 
           // 조건검색 시간 기록 (차트 데이터 조회 지연용)
           lastSearchTimeRef.current = Date.now()
+
+          // 시가/고가 즉시 보강 (순위정보에는 없는 값)
+          enrichOpenHigh(newStocks.map(s => s.code))
           
           console.log(`[자동매매] 조건식 검색 완료: ${newStocks.length}개 종목`)
         } else {
@@ -4338,7 +4817,7 @@ const AutoTrading = () => {
             }
             
             // 주문 처리 중인 종목 체크 (중복 주문 방지)
-            if (processingOrders.has(stock.code)) {
+            if (processingOrders.has(stock.code) || processingOrdersRef.current.has(stock.code)) {
               console.log(`[자동매수 건너뜀] ${stock.name} (${stock.code}): 이미 주문 처리 중입니다`)
               continue // 이미 주문 처리 중인 종목은 건너뜀
             }
@@ -4455,6 +4934,7 @@ const AutoTrading = () => {
                 }
                 
                 // 주문 처리 중 상태로 표시 (중복 방지)
+                processingOrdersRef.current.add(stockCode)
                 setProcessingOrders(prev => new Set(prev).add(stockCode))
                 
                 // 매수 주문 실행
@@ -4502,6 +4982,7 @@ const AutoTrading = () => {
                     addLog(`[예수금 부족] ${stock.name} 매수 불가 - 예수금이 부족합니다. (현재 예수금: ${currentDeposit.toLocaleString()}원, 주문금액: ${(quantity * orderPrice).toLocaleString()}원)`, 'warning')
                     console.log(`[자동매매] ${stock.name} 예수금 부족으로 건너뜀`)
                     // 주문 처리 중 상태 해제
+                    processingOrdersRef.current.delete(stockCode)
                     setProcessingOrders(prev => {
                       const updated = new Set(prev)
                       updated.delete(stockCode)
@@ -4528,6 +5009,7 @@ const AutoTrading = () => {
                       addLog(`[API 제한 해제] 자동매매를 재개합니다.`, 'info')
                     }, 90000) // 90초 대기 (더 긴 대기 시간)
                     // 주문 처리 중 상태 해제
+                    processingOrdersRef.current.delete(stockCode)
                     setProcessingOrders(prev => {
                       const updated = new Set(prev)
                       updated.delete(stockCode)
@@ -4553,6 +5035,7 @@ const AutoTrading = () => {
                   }
                   
                   // 에러 발생 시 주문 처리 중 상태 해제
+                  processingOrdersRef.current.delete(stockCode)
                   setProcessingOrders(prev => {
                     const updated = new Set(prev)
                     updated.delete(stockCode)
@@ -4573,6 +5056,7 @@ const AutoTrading = () => {
                     if (prev.has(orderNumber)) {
                       console.log(`[주문 내역] 중복 주문번호 감지 - ${stock.name} (주문번호: ${orderNumber}) 이미 처리됨, 건너뜀`)
                       // 주문 처리 중 상태 해제
+                      processingOrdersRef.current.delete(stockCode)
                       setProcessingOrders(prevOrders => {
                         const updated = new Set(prevOrders)
                         updated.delete(stockCode)
@@ -4637,6 +5121,7 @@ const AutoTrading = () => {
                     })
                     
                     // 주문 처리 중 상태 해제
+                    processingOrdersRef.current.delete(stockCode)
                     setProcessingOrders(prevOrders => {
                       const updated = new Set(prevOrders)
                       updated.delete(stockCode)
@@ -4719,18 +5204,62 @@ const AutoTrading = () => {
           }
 
       // 3. 보유 종목 매도 조건 확인 및 실행
-      for (const holding of holdingStocks) {
+      const nowDate = new Date()
+      const nowSecValue = hmsToSec(nowDate.getHours(), nowDate.getMinutes(), nowDate.getSeconds())
+      const gate = timeGateRef.current
+      // 목표시간 도달 → 전량매도 (단계별 익절 사용 중에도 우선)
+      const dropSellNow = gate.dropSellTime && nowSecValue >= hmsToSec(gate.dropSellStartHour, gate.dropSellStartMinute, gate.dropSellEndSecond)
+      const stepEnabled = stepProfitRef.current.사용
+      // 손절은 단계별 익절 사용 여부와 무관하게 항상 적용한다.
+      // (단계별 손절이 -10%여도 사용자가 설정한 -1.5%가 더 타이트하면 그쪽을 따른다)
+      const hardStop = stepEnabled
+        ? Math.max(lossLimit, stepProfitRef.current.손절)
+        : lossLimit
+
+      // 클로저 스냅샷이 아닌 최신 보유종목을 사용한다 (매도가 안 되던 원인)
+      for (const holding of holdingStocksRef.current) {
         if (!isRunning) break // 중지되면 중단
+
+        // 손절 기준 도달 → 전량 매도
+        const stopLossHit = hardStop < 0 && holding.profitPercent <= hardStop
+        const forceFullSell = dropSellNow || stopLossHit
+        // 단계별 익절이 켜져 있으면 단계 로직만 사용 (C#과 동일: else-if 구조)
+        const stepPlan = !forceFullSell && stepEnabled ? getStepSellPlan(holding) : null
+        const sellQuantity = forceFullSell
+          ? holding.quantity
+          : stepPlan
+            ? Math.min(stepPlan.quantity, holding.quantity)
+            : holding.quantity
+
+        if (stopLossHit) {
+          addLog(`[손절] ${holding.name}: 현재 수익률 ${holding.profitPercent.toFixed(2)}% ≤ 기준 ${hardStop}% → 전량 매도`, 'warning')
+        }
         
-        if (checkSellConditions(holding)) {
+        if (forceFullSell || stepPlan || (!stepEnabled && checkSellConditions(holding))) {
           try {
             // 매도 가격 결정
             let sellPrice = 0 // 시장가
             let orderOption = '03' // 시장가
+            const sellStyle = sellStyleRef.current
             
+            // 강제 전량매도(목표시간 도달)는 시장가
+            if (forceFullSell) {
+              sellPrice = 0
+              orderOption = '03'
+            }
+            // 단계별 익절/손절인 경우 (C# radioButton_매도_시장가/지정가 + numericUpDown_매도호가)
+            else if (stepPlan) {
+              const isStepLoss = stepPlan.reason === '단계별손절'
+              const type = isStepLoss ? sellStyle.lossType : sellStyle.profitType
+              const offset = isStepLoss ? sellStyle.lossPriceOffset : 0
+              if (type === 'limit') {
+                sellPrice = Math.max(0, holding.currentPrice + offset)
+                orderOption = '00'
+              }
+            }
             // 익절인 경우
-            if (holding.profitPercent >= profitTarget) {
-              if (profitType === 'market') {
+            else if (holding.profitPercent >= profitTarget) {
+              if (sellStyle.profitType === 'market') {
                 sellPrice = 0
                 orderOption = '03' // 시장가
               } else {
@@ -4741,12 +5270,12 @@ const AutoTrading = () => {
             }
             // 손절인 경우
             else if (holding.profitPercent <= lossLimit) {
-              if (lossType === 'market') {
+              if (sellStyle.lossType === 'market') {
                 sellPrice = 0
                 orderOption = '03' // 시장가
               } else {
                 // 지정가 매도호가 (현재가 + lossPriceOffset)
-                sellPrice = Math.max(0, holding.currentPrice + lossPriceOffset)
+                sellPrice = Math.max(0, holding.currentPrice + sellStyle.lossPriceOffset)
                 orderOption = '00' // 지정가
               }
             }
@@ -4764,6 +5293,16 @@ const AutoTrading = () => {
               continue
             }
 
+            // 이미 미체결 매도 주문이 있으면 신규 주문 금지
+            // (보유 수량이 그 주문에 묶여 매도가능수량 부족 800033으로 거부된다)
+            const pendingSell = orderLogs.find(o =>
+              o.stockCode === stockCode && o.type === 'sell' && isPendingSellStatus(o.status)
+            )
+            if (pendingSell) {
+              addLog(`[자동매도 건너뜀] ${holding.name}: 미체결 매도 주문이 이미 있습니다 (주문번호: ${pendingSell.orderNumber || 'N/A'}, ${pendingSell.quantity}주)`, 'warning')
+              continue
+            }
+
             // 주문 API 요청 제한 방지: 마지막 주문 시간 확인
             const timeSinceLastOrder = Date.now() - lastOrderTimeRef.current
             if (timeSinceLastOrder < minOrderInterval) {
@@ -4773,10 +5312,45 @@ const AutoTrading = () => {
               await new Promise(resolve => setTimeout(resolve, waitTime))
             }
 
-            // 매도 주문 실행
+            // 실제 보유 수량 - 미체결 매도 수량 = 매도가능수량
+            // (클라이언트 로컬 수량이 크면 800033 매도가능수량 부족으로 거부된다)
+            let actualSellQty = sellQuantity
+            try {
+              const balance = await kiwoomApi.getBalance(accountNo, accountProductCode)
+              const rows = normalizeBalanceRows(balance)
+              const live = rows.find((b: any) => String(b.code ?? b.stockCode ?? b.종목코드).trim() === stockCode)
+              const heldQty = Number(live?.quantity ?? live?.보유수량 ?? 0)
+              const apiSellable = live?.sellableQuantity
+              if (Number.isFinite(heldQty) && heldQty > 0) {
+                const pendingQty = orderLogs
+                  .filter(o => o.stockCode === stockCode && o.type === 'sell' && isPendingSellStatus(o.status))
+                  .reduce((sum, o) => sum + (o.quantity || 0), 0)
+                const sellable = calcSellableQuantity(heldQty, pendingQty, apiSellable)
+                if (sellable <= 0) {
+                  addLog(`[자동매도 건너뜀] ${holding.name}: 매도가능수량이 없습니다 (보유 ${heldQty}주, 미체결 매도 ${pendingQty}주)`, 'warning')
+                  continue
+                }
+                actualSellQty = Math.min(sellQuantity, sellable)
+              } else if (Number.isFinite(heldQty) && heldQty === 0) {
+                addLog(`[자동매도 건너뜀] ${holding.name}: 계좌에 보유 수량이 없습니다 (잔고 0주)`, 'warning')
+                // 잔고가 없으므로 로컬 로그에서도 제거 (표에 유령 종목이 남지 않도록)
+                dropLocalHolding(stockCode)
+                continue
+              }
+            } catch (balanceError: any) {
+              // 잔고 조회 실패는 주문을 막지 않는다 (서버가 최종 판단)
+              console.warn(`[자동매도] ${holding.name}: 잔고 조회 실패, 로컬 수량으로 진행 - ${balanceError.message}`)
+            }
+
+            if (actualSellQty <= 0) {
+              addLog(`[자동매도 건너뜀] ${holding.name}: 매도 가능 수량이 0주입니다`, 'warning')
+              continue
+            }
+
+            // 매도 주문 실행 (단계별 익절은 일부 수량만 매도)
             const sellOrderResult = await kiwoomApi.placeOrder({
               code: stockCode,
-              quantity: holding.quantity,
+              quantity: actualSellQty,
               price: sellPrice,
               order_type: 'sell',
               order_option: orderOption,
@@ -4792,41 +5366,44 @@ const AutoTrading = () => {
               // 모의투자 환경에서는 주문 내역 조회 API가 실패하므로, 로컬 상태에 직접 추가
               const orderTimestamp = Date.now() // 주문 접수 시점 기록
               const isMarketOrder = orderOption === '03' // 시장가 주문 여부
-              const newOrder: OrderLog = {
-                id: Date.now(),
-                date: new Date().toLocaleDateString('ko-KR'),
-                time: new Date().toLocaleTimeString('ko-KR'),
-                type: 'sell',
-                stockName: holding.name,
-                stockCode: stockCode,
-                quantity: holding.quantity,
-                price: sellPrice,
-                status: '접수',
-                orderNumber: sellOrderResult.orderNumber,
-                orderTimestamp, // 주문 접수 시점 기록
-                isMarketOrder, // 시장가 주문 여부
-              }
-              
+                const newOrder: OrderLog = {
+                  id: Date.now(),
+                  date: new Date().toLocaleDateString('ko-KR'),
+                  time: new Date().toLocaleTimeString('ko-KR'),
+                  type: 'sell',
+                  stockName: holding.name,
+                  stockCode: stockCode,
+                  quantity: actualSellQty,
+                  price: sellPrice,
+                  status: '접수',
+                  orderNumber: sellOrderResult.orderNumber,
+                  orderTimestamp, // 주문 접수 시점 기록
+                  isMarketOrder, // 시장가 주문 여부
+                  buyPrice: holding.purchasePrice, // 실현손익 계산용 매수가
+                  currentPrice: holding.currentPrice,
+                }
+
               setOrderLogs(prev => {
                 const updated = [newOrder, ...prev]
                 console.log(`[주문 내역] 로컬 상태에 매도 주문 추가 완료 - 총 주문 개수: ${updated.length}`, newOrder)
                 return updated
               })
               
-              // C# 코드와 동일: 매도 주문 성공 시 매수주문했거나보유중인종목에서 제거
-              // (실제로는 계좌 조회 시 보유 수량이 0이 되면 자동으로 제거되지만, 명시적으로 제거)
-              setDetectedStocks(prev => prev.map(stock => 
-                stock.code === stockCode
-                  ? { ...stock, isHolding: false }
-                  : stock
-              ))
-              
-              // 매도 주문 성공 시 orderedOrHoldingStocks에서 제거 (보유 수량이 0이 되면 제거)
-              setOrderedOrHoldingStocks(prev => {
-                const updated = new Set(prev)
-                updated.delete(stockCode)
-                return updated
-              })
+              // C# 코드와 동일: 전량 매도 시에만 보유 목록에서 제거 (단계별 익절은 잔량 유지)
+              if (actualSellQty >= holding.quantity) {
+                setDetectedStocks(prev => prev.map(stock => 
+                  stock.code === stockCode
+                    ? { ...stock, isHolding: false }
+                    : stock
+                ))
+                
+                // 매도 주문 성공 시 orderedOrHoldingStocks에서 제거 (보유 수량이 0이 되면 제거)
+                setOrderedOrHoldingStocks(prev => {
+                  const updated = new Set(prev)
+                  updated.delete(stockCode)
+                  return updated
+                })
+              }
               
               // 모의투자 환경에서는 주문 내역 조회 API가 실패하므로 refetch 호출하지 않음
               // setTimeout(() => {
@@ -4836,20 +5413,24 @@ const AutoTrading = () => {
             }
 
             const priceType = sellPrice === 0 ? '시장가' : `지정가(${sellPrice.toLocaleString()}원)`
-            addLog(`[자동매도] ${holding.name} ${holding.quantity}주 매도 주문 (${priceType}, 수익률: ${holding.profitPercent.toFixed(2)}%)`, 'success')
+            addLog(`[자동매도${stepPlan ? ` ${stepPlan.reason}` : ''}] ${holding.name} ${actualSellQty}주 매도 주문 (${priceType}, 수익률: ${holding.profitPercent.toFixed(2)}%)`, 'success')
             
             // API 호출 제한을 위한 딜레이
             await new Promise(resolve => setTimeout(resolve, 500))
           } catch (error: any) {
             // 모의투자 환경 제한 에러인 경우 경고로 처리
-            const errorMessage = error.message || error.response?.data?.detail || '알 수 없는 오류'
-            if (error.response?.data?.isMockApiLimit || 
-                error.message?.includes('모의투자 환경 제한') ||
-                error.message?.includes('매매제한 종목') ||
-                error.message?.includes('RC4007')) {
+            // axios 에러는 message가 "Request failed with status code 500"이라
+            // 서버가 내려준 실제 원인(detail/error)을 우선 사용한다
+            const apiData = error.response?.data
+            const errorMessage = apiData?.detail || apiData?.error || error.message || '알 수 없는 오류'
+            const returnCode = apiData?.returnCode
+            if (apiData?.isMockApiLimit ||
+                errorMessage.includes('모의투자 환경 제한') ||
+                errorMessage.includes('매매제한 종목') ||
+                errorMessage.includes('RC4007')) {
               addLog(`[자동매도 건너뜀] ${holding.name}: 모의투자 매매 제한 종목`, 'warning')
             } else {
-              addLog(`[자동매도 실패] ${holding.name}: ${errorMessage}`, 'error')
+              addLog(`[자동매도 실패] ${holding.name}: ${errorMessage}${returnCode ? ` (return_code: ${returnCode})` : ''}`, 'error')
             }
           }
         }
@@ -4869,24 +5450,28 @@ const AutoTrading = () => {
       return
     }
 
-    let intervalId: number | null = null
+    // 1회 실행이 끝난 뒤에만 다음 주기를 예약한다.
+    // setInterval은 실행 시간이 주기를 넘으면 다음 실행과 겹쳐 같은 종목을 중복 주문한다.
+    const runOnce = async () => {
+      if (isExecutingRef.current) {
+        console.log('[자동매매] 이전 실행이 진행 중입니다. 이번 주기는 건너뜁니다.')
+        return
+      }
+      isExecutingRef.current = true
+      try {
+        await executeAutoTrading()
+      } finally {
+        isExecutingRef.current = false
+      }
+    }
 
-    // 첫 실행은 약간의 딜레이 후
-    const timeoutId = window.setTimeout(() => {
-      executeAutoTrading()
-      
-      // 이후 30초마다 실행 (조건식 검색 + 매수/매도 체크)
-      // API 제한을 고려하여 주기를 늘림 (10초 -> 30초)
-      intervalId = window.setInterval(() => {
-        executeAutoTrading()
-      }, 30000) // 30초마다
-    }, 2000) // 첫 실행은 2초 후
+    const intervalId = window.setInterval(runOnce, 30000)
+    // 첫 실행은 2초 후
+    const timeoutId = window.setTimeout(runOnce, 2000)
 
     return () => {
       window.clearTimeout(timeoutId)
-      if (intervalId) {
-        window.clearInterval(intervalId)
-      }
+      window.clearInterval(intervalId)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isRunning]) // isRunning만 의존성으로 사용 (함수 내부에서 최신 상태 참조)
@@ -4915,8 +5500,152 @@ const AutoTrading = () => {
   }, [])
 
   // 전량매도 버튼 클릭
+  // 현재 보유 종목 표에 실제로 표시되는 행
+  // 잔고 조회가 성공하면 "계좌에 실제로 있는 종목"만 표시한다.
+  // (주문 로그만 쓰면 매도 후에도 유령 종목이 남는다)
+  // 보유 종목 표의 데이터 소스 결정
+  //  - 잔고 조회 성공: 계좌의 실제 종목만 표시 (정답)
+  //  - 잔고 조회 실패: 표를 비운다. 로그로 대체하면 이미 매도한 종목이 유령으로 남는다.
+  //  - 잔고 조회 중: 로그로 대체하지 않고 "불러오는 중" 유지
+  const balanceLoading = isConnected && !!selectedAccount && !balanceData && !balanceError
+  const balanceHoldings = (() => {
+    if (!isConnected || !selectedAccount) return null // 조회 전: 로그 기준 유지
+    if (balanceError) return [] // 조회 실패: 보유 종목을 알 수 없으므로 비운다
+    // 서버는 { stocks: [...] } 또는 배열을 반환한다
+    const rows: any[] | null = Array.isArray(balanceData)
+      ? balanceData
+      : Array.isArray((balanceData as any)?.stocks)
+        ? (balanceData as any).stocks
+        : null
+    if (!rows) return null
+    // 잔고 조회에 에러가 실린 경우(모의투자 제한 등)는 신뢰할 수 없으므로 비운다
+    if ((balanceData as any)?.error) return []
+    return rows
+      .map((b: any) => ({
+        code: String(b.code ?? b.stockCode ?? b.종목코드 ?? '').trim(),
+        name: String(b.name ?? b.stockName ?? b.종목명 ?? '').trim(),
+        quantity: Number(b.quantity ?? b.보유수량 ?? 0),
+        sellableQuantity: Number(b.sellableQuantity ?? b.quantity ?? b.보유수량 ?? 0),
+        purchasePrice: Number(b.purchasePrice ?? b.매입가 ?? 0),
+        currentPrice: Number(b.currentPrice ?? b.현재가 ?? 0),
+        profitPercent: Number(b.profitPercent ?? b.수익률 ?? 0),
+      }))
+      .filter((b: any) => b.code && b.quantity > 0)
+  })()
+
+  const logRows = buildDisplayOrders(orderLogs)
+  const displayHoldingOrders = balanceHoldings
+    ? balanceHoldings.map((b: any) => {
+        const fromLog = logRows.find((r) => r.stockCode === b.code)
+        // OrderLog 형태로 맞춰 표 렌더링을 그대로 재사용한다
+        return {
+          ...(fromLog || ({
+            id: b.code,
+            date: '',
+            time: '',
+            type: 'buy' as const,
+            stockCode: b.code,
+            stockName: b.name || b.code,
+            quantity: b.quantity,
+            price: b.purchasePrice,
+            status: '체결',
+            isExecuted: true,
+          } as OrderLog)),
+          stockCode: b.code,
+          stockName: b.name || fromLog?.stockName || b.code,
+          quantity: b.quantity,
+          // 매도가능수량: 주문 가능한 실제 수량 (미체결 매도 주문분 제외)
+          sellableQuantity: b.sellableQuantity,
+          // 표는 잔고 기준 '보유' 목록이므로 상태는 항상 체결이다.
+          // (로그의 '종료'/'취소' 상태를 그대로 쓰면 보유 중인데 취소로 보인다)
+          status: '체결',
+          isExecuted: true,
+          price: b.purchasePrice || (fromLog?.price ?? 0),
+          buyPrice: b.purchasePrice || fromLog?.buyPrice,
+          currentPrice: b.currentPrice || fromLog?.currentPrice,
+          profitPercent: b.profitPercent,
+          count: fromLog?.count ?? 1,
+          latestTime: fromLog?.latestTime ?? '',
+        }
+      })
+    : (balanceLoading ? [] : logRows)
+  // 표의 수익률/현재가만 실시간 시세(WebSocket)로 보강한다.
+  // 수량·매도가능수량은 잔고 API(kt00018) 값이 유일한 정답이다.
+  // (holdingStocks는 오늘 체결 로그를 합산해 만들기 때문에 수량이 실제 잔고보다 클 수 있다)
+  const displayHoldingOrdersWithLive = displayHoldingOrders.map(row => {
+    const live = holdingStocksRef.current.find(h => h.code === row.stockCode)
+    if (!live) return row
+    return {
+      ...row,
+      currentPrice: live.currentPrice || row.currentPrice,
+      profitPercent: Number.isFinite(live.profitPercent) ? live.profitPercent : row.profitPercent,
+    }
+  })
+
+  // 계좌 요약 합계: 서버 합계를 기준으로 삼아 "보유 종목"과 항상 일치시킨다.
+  // (평균단가 반올림 × 수량 재계산은 실제 매입금액과 어긋난다)
+  const accountTotals = (() => {
+    const data: any = balanceData
+    const serverPurchase = Number(data?.totalPurchase) || 0
+    const serverValue = Number(data?.totalStockValue) || 0
+    const serverProfit = Number(data?.totalProfit) || 0
+
+    const list = holdingStocksRef.current
+    // 서버 합계가 없을 때만 로컬로 계산 (매입금액은 purchaseAmount 우선)
+    const localPurchase = list.reduce(
+      (sum, s: any) => sum + (Number(s.purchaseAmount) || (s.purchasePrice || 0) * (s.quantity || 0)),
+      0,
+    )
+    const localValue = list.reduce(
+      (sum, s: any) => sum + (Number(s.evaluation) || (s.currentPrice || 0) * (s.quantity || 0)),
+      0,
+    )
+    const localProfit = list.reduce((sum, s) => sum + (s.profit || 0), 0)
+
+    const totalPurchase = serverPurchase > 0 ? serverPurchase : localPurchase
+    const totalStockValue = serverValue > 0 ? serverValue : localValue
+    const totalProfit = serverValue > 0 || totalPurchase > 0 ? serverProfit : localProfit
+
+    // 총수익률은 표시된 합계로 다시 계산해 앞뒤가 맞게 한다
+    const totalProfitRate = totalPurchase > 0
+      ? (totalProfit / totalPurchase) * 100
+      : (Number(data?.totalProfitRate) || 0)
+
+    return { totalPurchase, totalStockValue, totalProfit, totalProfitRate }
+  })()
+
+  // 잔고에 없는 종목을 로컬 상태에서 제거 (유령 종목 방지)
+  const dropLocalHolding = (stockCode: string) => {
+    setDetectedStocks(prev => prev.map(s => s.code === stockCode ? { ...s, isHolding: false } : s))
+    setOrderedOrHoldingStocks(prev => {
+      if (!prev.has(stockCode)) return prev
+      const next = new Set(prev)
+      next.delete(stockCode)
+      return next
+    })
+    setOrderLogs(prev => {
+      const filtered = prev.filter(o => !(o.stockCode === stockCode && o.type === 'buy'))
+      return filtered.length === prev.length ? prev : filtered
+    })
+  }
+
+  // 잔고 기준 보유 종목과 로컬 로그를 동기화한다.
+  // 잔고 조회가 성공했는데 로그에만 남은 종목은 실제로 없는 종목이므로 제거한다.
+  useEffect(() => {
+    if (!balanceHoldings) return
+    const liveCodes = new Set(balanceHoldings.map(b => b.code))
+    setOrderLogs(prev => {
+      const filtered = prev.filter(o => o.type !== 'buy' || liveCodes.has(o.stockCode))
+      return filtered.length === prev.length ? prev : filtered
+    })
+    setSelectedHoldingCodes(prev => {
+      const next = new Set(Array.from(prev).filter(code => liveCodes.has(code)))
+      return next.size === prev.size ? prev : next
+    })
+  }, [balanceData, balanceError, isConnected, selectedAccount])
+
   const handleSellAll = async () => {
-    if (holdingStocks.length === 0) {
+    if (displayHoldingOrdersWithLive.length === 0) {
       return
     }
 
@@ -4924,13 +5653,39 @@ const AutoTrading = () => {
       return
     }
 
-    if (!window.confirm(`보유 중인 ${holdingStocks.length}개 종목을 모두 매도하시겠습니까?`)) {
+    // 표에서 체크한 종목만 매도한다 (전체 선택 시 전량매도와 동일)
+    const selected = displayHoldingOrdersWithLive.filter(d => selectedHoldingCodes.has(d.stockCode))
+    if (selected.length === 0) {
+      addLog('매도할 종목을 선택해주세요 (전체 선택 후 선택매도 가능)', 'warning')
       return
     }
 
+    // 매도가능수량이 0인 종목은 주문해도 800033으로 거부되므로 미리 제외한다
+    const targets = selected.filter(d => !(d.sellableQuantity !== undefined && d.sellableQuantity <= 0))
+    const blocked = selected.filter(d => d.sellableQuantity !== undefined && d.sellableQuantity <= 0)
+    if (blocked.length > 0) {
+      addLog(
+        `매도가능수량 부족으로 제외: ${blocked.map(b => b.stockName).join(', ')} (미체결 매도 주문을 먼저 취소하세요)`,
+        'warning'
+      )
+    }
+    if (targets.length === 0) return
+
     try {
       let successCount = 0
-      for (const stock of holdingStocks) {
+      for (const target of targets) {
+        const stockCode = String(target.stockCode).trim()
+        // 보유 수량은 계좌 조회 값을 우선 사용하고, 없으면 표의 수량을 쓴다
+        const live = holdingStocks.find(h => h.code === stockCode)
+        const stock = {
+          code: stockCode,
+          name: target.stockName,
+          quantity: live?.quantity ?? target.quantity,
+          purchasePrice: live?.purchasePrice ?? target.buyPrice ?? target.price,
+          currentPrice: live?.currentPrice ?? target.currentPrice ?? target.price,
+          // 매도 가격 결정(익절/손절 지정가)에 필요하다
+          profitPercent: live?.profitPercent ?? target.profitPercent ?? 0,
+        }
         try {
           // 종목코드 검증: 6자리 숫자만 허용 (ELW, ETF 등 비표준 종목코드 제외)
           const stockCode = String(stock.code).trim()
@@ -4952,12 +5707,60 @@ const AutoTrading = () => {
             await new Promise(resolve => setTimeout(resolve, waitTime))
           }
 
+          // 미체결 매도 주문이 있으면 신규 주문 금지 (물량이 이미 묶여 있음)
+          const pendingSellAll = orderLogs.find(o =>
+            o.stockCode === stockCode && o.type === 'sell' && isPendingSellStatus(o.status)
+          )
+          if (pendingSellAll) {
+            addLog(`[선택매도 건너뜀] ${stock.name}: 미체결 매도 주문이 이미 있습니다 (주문번호: ${pendingSellAll.orderNumber || 'N/A'})`, 'warning')
+            continue
+          }
+
+          // 실제 잔고 수량으로 제한 (로컬 수량 초과 주문은 800033으로 거부된다)
+          let sellAllQty = stock.quantity
+          try {
+            const balance = await kiwoomApi.getBalance(accountNo, accountProductCode)
+            const rows = normalizeBalanceRows(balance)
+            const liveRow = rows.find((b: any) => String(b.code ?? b.stockCode ?? b.종목코드).trim() === stockCode)
+            const heldQty = Number(liveRow?.quantity ?? liveRow?.보유수량 ?? 0)
+            const apiSellable = liveRow?.sellableQuantity
+            if (Number.isFinite(heldQty) && heldQty > 0) {
+              const pendingQty = orderLogs
+                .filter(o => o.stockCode === stockCode && o.type === 'sell' && isPendingSellStatus(o.status))
+                .reduce((sum, o) => sum + (o.quantity || 0), 0)
+              const sellable = calcSellableQuantity(heldQty, pendingQty, apiSellable)
+              if (sellable <= 0) {
+                addLog(`[선택매도 건너뜀] ${stock.name}: 매도가능수량이 없습니다 (보유 ${heldQty}주, 미체결 매도 ${pendingQty}주)`, 'warning')
+                continue
+              }
+              sellAllQty = Math.min(stock.quantity, sellable)
+            } else if (Number.isFinite(heldQty) && heldQty === 0) {
+              addLog(`[선택매도 건너뜀] ${stock.name}: 계좌에 보유 수량이 없습니다 (잔고 0주)`, 'warning')
+              continue
+            }
+          } catch (balanceError: any) {
+            console.warn(`[선택매도] ${stock.name}: 잔고 조회 실패, 로컬 수량으로 진행 - ${balanceError.message}`)
+          }
+
+          if (sellAllQty <= 0) {
+            addLog(`[선택매도 건너뜀] ${stock.name}: 매도 가능 수량이 0주입니다`, 'warning')
+            continue
+          }
+
+          // 매도 가격/옵션: 매매조건의 지정가 설정을 따른다
+          const { profitType: sProfitType, lossType: sLossType, lossPriceOffset: sLossOffset } = sellStyleRef.current
+          const sLivePrice = stock.currentPrice || stock.purchasePrice || 0
+          const sIsLoss = (stock.profitPercent ?? 0) < 0
+          const sSellType = sIsLoss ? sLossType : sProfitType
+          const sSellOffset = sIsLoss ? sLossOffset : 0
+          const { price: sSellPrice, order_option: sSellOption } = resolveSellOrderPrice(sLivePrice, sSellType, sSellOffset)
+
           const sellAllOrderResult = await kiwoomApi.placeOrder({
             code: stockCode,
-            quantity: stock.quantity,
-            price: 0, // 시장가
+            quantity: sellAllQty,
+            price: sSellPrice,
             order_type: 'sell',
-            order_option: '03', // 시장가
+            order_option: sSellOption,
             accountNo,
             accountProductCode,
           })
@@ -4969,7 +5772,7 @@ const AutoTrading = () => {
           if (sellAllOrderResult?.orderNumber) {
             // 모의투자 환경에서는 주문 내역 조회 API가 실패하므로, 로컬 상태에 직접 추가
             const orderTimestamp = Date.now() // 주문 접수 시점 기록
-            const isMarketOrder = true // 전량매도는 항상 시장가
+            const isMarketOrder = sSellOption === '03'
             const newOrder: OrderLog = {
               id: Date.now(),
               date: new Date().toLocaleDateString('ko-KR'),
@@ -4977,14 +5780,16 @@ const AutoTrading = () => {
               type: 'sell',
               stockName: stock.name,
               stockCode: stockCode,
-              quantity: stock.quantity,
-              price: 0, // 시장가
+              quantity: sellAllQty,
+              price: isMarketOrder ? sLivePrice : sSellPrice,
               status: '접수',
               orderNumber: sellAllOrderResult.orderNumber,
               orderTimestamp, // 주문 접수 시점 기록
               isMarketOrder, // 시장가 주문 여부
+              buyPrice: stock.purchasePrice, // 실현손익 계산용 매수가
+              currentPrice: stock.currentPrice,
             }
-            
+
             setOrderLogs(prev => {
               const updated = [newOrder, ...prev]
               console.log(`[주문 내역] 로컬 상태에 전량매도 주문 추가 완료 - 총 주문 개수: ${updated.length}`, newOrder)
@@ -5016,15 +5821,14 @@ const AutoTrading = () => {
           addLog(`${stock.name} 전량매도 주문 전송`, 'success')
           await new Promise(resolve => setTimeout(resolve, 100))
         } catch (error: any) {
-          // 모의투자 환경 제한 에러인 경우 경고로 처리
-          const errorMessage = error.message || error.response?.data?.detail || '알 수 없는 오류'
-          if (error.response?.data?.isMockApiLimit || 
-              error.message?.includes('모의투자 환경 제한') ||
-              error.message?.includes('매매제한 종목') ||
-              error.message?.includes('RC4007')) {
+          const { message: errorMessage, returnCode } = getOrderErrorInfo(error)
+          if (error.response?.data?.isMockApiLimit ||
+              errorMessage.includes('모의투자 환경 제한') ||
+              errorMessage.includes('매매제한 종목') ||
+              errorMessage.includes('RC4007')) {
             addLog(`${stock.name} 전량매도 건너뜀: 모의투자 매매 제한 종목`, 'warning')
           } else {
-            addLog(`${stock.name} 매도 실패: ${errorMessage}`, 'error')
+            addLog(`${stock.name} 매도 실패: ${errorMessage}${returnCode !== undefined ? ` (return_code: ${returnCode})` : ''}`, 'error')
           }
         }
       }
@@ -5038,6 +5842,35 @@ const AutoTrading = () => {
   }
 
   // 개별 종목 매도 (주문 내역에서 클릭한 종목만 매도)
+
+  // 주문 내역 클릭 → 해당 종목 차트 표시
+  const showChartForOrder = (order: OrderLog) => {
+    const fromDetected = detectedStocks.find(s => s.code === order.stockCode)
+    const fromWatchlist = watchlistStocks.find(s => s.code === order.stockCode)
+    const fromHolding = holdingStocks.find(h => h.code === order.stockCode)
+
+    // 차트는 DetectedStock 형태를 요구하므로 보유/주문 정보로 보강한다
+    const base: DetectedStock = fromDetected || fromWatchlist || {
+      code: order.stockCode,
+      name: order.stockName,
+      price: order.currentPrice ?? order.price,
+      change: 0,
+      changePercent: order.profitPercent ?? 0,
+      volume: 0,
+      detectedCondition: '',
+      detectedTime: order.time,
+    }
+
+    setSelectedStockForChart(fromHolding
+      ? { ...base, price: fromHolding.currentPrice || base.price, changePercent: fromHolding.profitPercent }
+      : base)
+    setChartPeriod('5')
+    // PC: 우측 컬럼, 모바일: 아래에 붙으므로 해당 영역으로 스크롤
+    setTimeout(() => {
+      document.querySelector('.at-sec-chart')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    }, 100)
+  }
+
   const handleSellStock = async (stockCode: string, stockName: string) => {
     console.log(`[매도 함수 시작] ${stockName} (${stockCode}), 계좌: ${selectedAccount}, 연결: ${connected}`)
     
@@ -5081,9 +5914,6 @@ const AutoTrading = () => {
       }
     }
 
-    if (!window.confirm(`${stockName} ${stock.quantity}주를 시장가 매도하시겠습니까?`)) {
-      return
-    }
 
     try {
       // 종목코드 검증: 6자리 숫자만 허용
@@ -5106,12 +5936,61 @@ const AutoTrading = () => {
         await new Promise(resolve => setTimeout(resolve, waitTime))
       }
 
+      // 미체결 매도 주문이 있으면 신규 주문 금지 (물량이 이미 묶여 있음)
+      const pendingIndividualSell = orderLogs.find(o =>
+        o.stockCode === validStockCode && o.type === 'sell' && isPendingSellStatus(o.status)
+      )
+      if (pendingIndividualSell) {
+        addLog(`${stockName}: 미체결 매도 주문이 이미 있습니다 (주문번호: ${pendingIndividualSell.orderNumber || 'N/A'})`, 'warning')
+        return
+      }
+
+      // 실제 보유 수량으로 제한 (로컬 수량이 잔고보다 크면 800033으로 거부된다)
+      let individualSellQty = stock.quantity
+      try {
+        const balance = await kiwoomApi.getBalance(accountNo, accountProductCode)
+        const rows = normalizeBalanceRows(balance)
+        const live = rows.find((b: any) => String(b.code ?? b.stockCode ?? b.종목코드).trim() === validStockCode)
+        const heldQty = Number(live?.quantity ?? live?.보유수량 ?? 0)
+        const apiSellable = live?.sellableQuantity
+        if (Number.isFinite(heldQty) && heldQty > 0) {
+          const pendingQty = orderLogs
+            .filter(o => o.stockCode === validStockCode && o.type === 'sell' && isPendingSellStatus(o.status))
+            .reduce((sum, o) => sum + (o.quantity || 0), 0)
+          const sellable = calcSellableQuantity(heldQty, pendingQty, apiSellable)
+          if (sellable <= 0) {
+            addLog(`${stockName}: 매도가능수량이 없습니다 (보유 ${heldQty}주, 미체결 매도 ${pendingQty}주)`, 'warning')
+            return
+          }
+          individualSellQty = Math.min(stock.quantity, sellable)
+        } else if (Number.isFinite(heldQty) && heldQty === 0) {
+          addLog(`${stockName}: 계좌에 보유 수량이 없습니다 (잔고 0주)`, 'warning')
+          return
+        }
+      } catch (balanceError: any) {
+        console.warn(`[매도] ${stockName}: 잔고 조회 실패, 로컬 수량으로 진행 - ${balanceError.message}`)
+      }
+
+      if (individualSellQty <= 0) {
+        addLog(`${stockName}: 매도 가능 수량이 0주입니다`, 'warning')
+        return
+      }
+
+      // 매도 가격/옵션: 매매조건의 '익절 지정가' 설정을 따른다.
+      // (상한가처럼 매도 호가가 얇으면 시장가 주문이 체결되지 않고 물량만 잠긴다)
+      const { profitType: profitSellType, lossType: lossSellType, lossPriceOffset: lossOffset } = sellStyleRef.current
+      const livePrice = stock.currentPrice || stock.purchasePrice || 0
+      const isLoss = (stock.profitPercent ?? 0) < 0
+      const sellType = isLoss ? lossSellType : profitSellType
+      const sellOffset = isLoss ? lossOffset : 0
+      const { price: sellPrice, order_option: sellOrderOption } = resolveSellOrderPrice(livePrice, sellType, sellOffset)
+
       const orderParams = {
         code: validStockCode,
-        quantity: stock.quantity,
-        price: 0, // 시장가
+        quantity: individualSellQty,
+        price: sellPrice,
         order_type: 'sell' as const,
-        order_option: '03', // 시장가
+        order_option: sellOrderOption,
         accountNo,
         accountProductCode,
       }
@@ -5119,10 +5998,10 @@ const AutoTrading = () => {
       console.log(`[매도 주문 전송] ${stockName} (${validStockCode}):`, {
         종목코드: validStockCode,
         종목명: stockName,
-        수량: stock.quantity,
-        가격: 0,
+        수량: individualSellQty,
+        가격: sellPrice,
         주문타입: 'sell',
-        주문옵션: '03',
+        주문옵션: sellOrderOption,
         계좌번호: accountNo,
         계좌상품코드: accountProductCode,
         전체파라미터: orderParams,
@@ -5137,8 +6016,10 @@ const AutoTrading = () => {
       if (sellOrderResult?.orderNumber || sellOrderResult?.order_number) {
         const orderNumber = sellOrderResult.orderNumber || sellOrderResult.order_number
         
-        // 시장가 매도지만 주문 내역에 표시할 참고가격 (현재가 또는 매수가)
-        const referencePrice = stock.currentPrice || stock.purchasePrice || 0
+        // 주문 내역 표시용 가격: 지정가면 주문가, 시장가면 현재가
+        const referencePrice = sellOrderOption === '00'
+          ? sellPrice
+          : (stock.currentPrice || stock.purchasePrice || 0)
         
         const newOrder: OrderLog = {
           id: Date.now(),
@@ -5147,14 +6028,14 @@ const AutoTrading = () => {
           type: 'sell',
           stockName: stockName,
           stockCode: validStockCode,
-          quantity: stock.quantity,
-          price: referencePrice, // 시장가이지만 참고가격 표시 (현재가 또는 매수가)
+          quantity: individualSellQty,
+          price: referencePrice,
           status: '접수',
           orderNumber: orderNumber,
           orderTimestamp: Date.now(),
-          isMarketOrder: true,
-          currentPrice: referencePrice, // 현재가 정보도 포함
-          buyPrice: stock.purchasePrice, // 매수가 저장 (실현손익 계산용)
+          isMarketOrder: sellOrderOption === '03',
+          currentPrice: referencePrice,
+          buyPrice: stock.purchasePrice,
         }
 
         setOrderLogs(prev => {
@@ -5188,9 +6069,7 @@ const AutoTrading = () => {
         addLog(`${stockName} 매도 주문 실패: 주문번호를 받지 못했습니다`, 'error')
       }
     } catch (error: any) {
-      const errorMessage = error.message || error.response?.data?.detail || error.response?.data?.error || '알 수 없는 오류'
-      const statusCode = error.response?.status || 'N/A'
-      
+      const { message: errorMessage, status: statusCode, returnCode } = getOrderErrorInfo(error)
       console.error(`[매도 실패] ${stockName} (${stockCode}):`, {
         에러메시지: errorMessage,
         상태코드: statusCode,
@@ -5200,14 +6079,24 @@ const AutoTrading = () => {
       })
       
       if (error.response?.data?.isMockApiLimit ||
-          error.message?.includes('모의투자 환경 제한') ||
-          error.message?.includes('매매제한 종목') ||
-          error.message?.includes('RC4007')) {
+          errorMessage.includes('모의투자 환경 제한') ||
+          errorMessage.includes('매매제한 종목') ||
+          errorMessage.includes('RC4007')) {
         addLog(`${stockName} 매도 건너뜀: 모의투자 매매 제한 종목`, 'warning')
-      } else if (statusCode === 500) {
-        addLog(`${stockName} 매도 실패: 서버 오류 (${errorMessage}). 서버 로그를 확인해주세요.`, 'error')
+      } else if (errorMessage.includes('800033') || errorMessage.includes('매도가능수량')) {
+        // 잔고의 매도가능수량이 0인데 로컬 수량으로 주문한 경우다.
+        // 잔고를 다시 받아 실제 수량을 반영하고 원인을 알려준다.
+        addLog(
+          `${stockName} 매도 불가: 매도가능수량이 부족합니다. ` +
+          `미체결 매도 주문이 물량을 잡고 있거나 보유 수량이 없습니다. ` +
+          `'미체결취소' 후 다시 시도하세요.`,
+          'error'
+        )
+        refetchBalance()
+        queryClient.invalidateQueries('balance')
       } else {
-        addLog(`${stockName} 매도 실패: ${errorMessage} (상태코드: ${statusCode})`, 'error')
+        // 서버가 내려준 실제 사유를 그대로 보여준다 (상태코드만으로는 원인을 알 수 없음)
+        addLog(`${stockName} 매도 실패: ${errorMessage}${returnCode !== undefined ? ` (return_code: ${returnCode})` : ''}`, 'error')
       }
     }
   }
@@ -5215,78 +6104,236 @@ const AutoTrading = () => {
   // 미체결 주문 취소
   const handleCancelUnfilledOrders = async () => {
     try {
-      const unfilledOrders = orderLogs.filter(o => o.status === '접수' || o.status === '확인')
-      if (unfilledOrders.length === 0) {
+      if (!selectedAccount) {
+        addLog('계좌를 선택해주세요', 'error')
         return
       }
 
-      // TODO: 미체결 주문 취소 API 구현 필요
-      addLog(`미체결 주문 ${unfilledOrders.length}건 취소 요청`, 'info')
+      // 로컬 상태뿐 아니라 키움 서버의 미체결 주문을 직접 조회한다.
+      // (로컬에 병합되지 않은 주문은 화면에 안 보이지만 실제로는 물량을 잡고 있다)
+      addLog('미체결 주문 조회 중...', 'info')
+      let serverOrders: any[] = []
+      try {
+        serverOrders = await kiwoomApi.getOrderHistory(selectedAccount)
+      } catch (error: any) {
+        addLog(`주문 내역 조회 실패, 로컬 목록으로 진행: ${error.message}`, 'warning')
+      }
+
+      const isUnfilledStatus = (status?: string) =>
+        status === '접수' || status === '확인' || status === '미체결'
+
+      // 서버 응답 기준 미체결 주문
+      const serverUnfilled = (serverOrders || []).filter(o => isUnfilledStatus(o.status))
+
+      // 로컬 기준 미체결 주문 (서버에서 못 받은 경우 대비)
+      const localUnfilled = orderLogs.filter(o => isUnfilledStatus(o.status))
+
+      // 주문번호 기준 중복 제거
+      const targets = new Map<string, { orderNumber: string; stockCode: string; stockName: string; quantity: number; type: string }>()
+      for (const o of serverUnfilled) {
+        if (!o.orderNumber) continue
+        targets.set(String(o.orderNumber), {
+          orderNumber: String(o.orderNumber),
+          stockCode: String(o.stockCode || '').trim(),
+          stockName: o.stockName || o.stockCode || '',
+          quantity: Number(o.unfilledQuantity) > 0 ? Number(o.unfilledQuantity) : Number(o.quantity) || 0,
+          type: o.type || 'sell',
+        })
+      }
+      for (const o of localUnfilled) {
+        if (!o.orderNumber || targets.has(o.orderNumber)) continue
+        targets.set(o.orderNumber, {
+          orderNumber: o.orderNumber,
+          stockCode: String(o.stockCode || '').trim(),
+          stockName: o.stockName || o.stockCode || '',
+          quantity: o.unfilledQuantity && o.unfilledQuantity > 0 ? o.unfilledQuantity : o.quantity,
+          type: o.type,
+        })
+      }
+
+      const list = Array.from(targets.values())
+        .filter(t => t.stockCode && t.quantity > 0)
+        .filter(t => {
+          // 이미 종료된 매도 주문은 제외한다.
+          // 매도가능수량이 보유수량보다 적을 때만 실제로 물량이 잠겨 있다.
+          if (t.type !== 'sell') return true
+          const held = holdingStocksRef.current.find(h => h.code === t.stockCode)
+          const sellable = held?.sellableQuantity
+          if (held && sellable !== undefined) return sellable < held.quantity
+          return true
+        })
+      if (list.length === 0) {
+        addLog('취소할 미체결 주문이 없습니다 (이미 종료된 주문)', 'info')
+        queryClient.invalidateQueries('orders')
+        queryClient.invalidateQueries('balance')
+        return
+      }
+
+      addLog(`미체결 주문 ${list.length}건 취소 시작`, 'info')
+
+      let successCount = 0
+      let failCount = 0
+
+      for (const order of list) {
+        try {
+          await kiwoomApi.cancelOrder(order.orderNumber, order.stockCode, order.quantity)
+          addLog(`[취소 접수] ${order.stockName} ${order.quantity}주 (원주문: ${order.orderNumber})`, 'success')
+
+          // 로컬 상태를 취소로 갱신
+          setOrderLogs(prev => prev.map(o =>
+            o.orderNumber === order.orderNumber
+              ? { ...o, status: '취소', type: 'cancel', cancelTimestamp: Date.now() }
+              : o
+          ))
+          if (order.type === 'buy') {
+            setOrderedOrHoldingStocks(prev => {
+              const next = new Set(prev)
+              next.delete(order.stockCode)
+              return next
+            })
+          }
+          successCount++
+          await new Promise(resolve => setTimeout(resolve, 400))
+        } catch (error: any) {
+          const { message, returnCode } = getOrderErrorInfo(error)
+          // 이미 체결·취소된 주문은 실패로 집계하되 ERROR 대신 warning으로 남긴다
+          addLog(`[취소 건너뜀] ${order.stockName} (${order.orderNumber}): ${message}${returnCode !== undefined ? ` (return_code: ${returnCode})` : ''}`, 'warning')
+          failCount++
+        }
+      }
+
+      addLog(`미체결 주문 취소 완료: 성공 ${successCount}건, 실패 ${failCount}건`, successCount > 0 ? 'success' : 'warning')
       queryClient.invalidateQueries('orders')
+      queryClient.invalidateQueries('balance')
+      // 매도가능수량이 복구되도록 잔고를 다시 받아온다
+      setTimeout(() => {
+        refetchBalance()
+        refetchOrders()
+      }, 1000)
     } catch (error: any) {
       addLog(`미체결 주문 취소 실패: ${error.message}`, 'error')
     }
   }
 
-  // 주문 접수 후 20초가 지난 미체결 주문 자동 취소
+  // 미체결 주문 자동 취소 (자동매매 실행 여부와 무관하게 동작)
+  // ⚠️ 로컬 상태만 '취소'로 바꾸면 키움 서버 주문은 살아 있어 계속 물량을 잡는다.
+  //    반드시 kt10003(주문취소) API를 호출해야 매도가능수량이 복구된다.
   useEffect(() => {
-    if (!isRunning) {
+    if (!connected || !selectedAccount) {
       return
     }
 
     // 5초마다 미체결 주문 확인
     const checkInterval = setInterval(() => {
       const now = Date.now()
-      const timeoutMs = 30000 // 30초로 연장 (체결 확인 시간 확보)
+      const timeoutMs = 30000 // 30초 (체결 확인 시간 확보)
 
-      setOrderLogs(prev => {
-        const ordersToCancel = prev.filter(order => {
-          // 미체결 주문이고, 주문 접수 시점이 30초 이상 지난 경우
-          if (!order.orderTimestamp) {
-            return false // orderTimestamp가 없으면 취소 대상에서 제외
-          }
-          
-          const isUnfilled = order.status === '접수' || order.status === '확인' || order.status === '미체결'
-          const elapsedTime = now - order.orderTimestamp
-          const shouldCancel = isUnfilled && elapsedTime >= timeoutMs
-
-          if (shouldCancel) {
-            console.log(`[자동 취소] ${order.stockName} 주문 취소 (경과 시간: ${Math.floor(elapsedTime / 1000)}초)`)
-            addLog(`[자동 취소] ${order.stockName} ${order.quantity}주 ${order.type === 'buy' ? '매수' : '매도'} 주문 취소 (${Math.floor(elapsedTime / 1000)}초 경과)`, 'warning')
-          }
-
-          return shouldCancel
-        })
-
-        if (ordersToCancel.length === 0) {
-          return prev // 취소할 주문이 없으면 변경 없음
+      // 이미 죽은 주문(유령 미체결)을 먼저 걸러낸다.
+      // kt00007(주문내역)은 이미 끝난 주문도 '접수'로 남기는 경우가 있다.
+      // 매도가능수량이 보유수량과 같으면 그 주문은 물량을 잡고 있지 않다.
+      const staleIds = new Set<number>()
+      for (const order of orderLogsRef.current) {
+        if (!order.orderNumber) continue
+        const isUnfilled = order.status === '접수' || order.status === '확인' || order.status === '미체결'
+        if (!isUnfilled || order.type !== 'sell') continue
+        const held = holdingStocksRef.current.find(h => h.code === order.stockCode)
+        const sellable = held?.sellableQuantity
+        if (held && sellable !== undefined && sellable >= held.quantity) {
+          staleIds.add(order.id)
+          cancelRequestedRef.current.add(order.orderNumber)
         }
+      }
+      if (staleIds.size > 0) {
+        // 서버 호출 없이 로컬 상태만 정리한다 (이미 종료된 주문)
+        setOrderLogs(prev => prev.map(o =>
+          staleIds.has(o.id)
+            ? { ...o, status: '취소', type: 'cancel' as const, cancelTimestamp: Date.now() }
+            : o
+        ))
+      }
 
-        // 취소할 주문들의 상태를 '취소'로 변경하고 취소 시점 기록
-        const cancelTimestamp = Date.now()
-        const updated = prev.map(order => {
-          const shouldCancel = ordersToCancel.some(cancelOrder => cancelOrder.id === order.id)
-          if (shouldCancel) {
-            return {
-              ...order,
-              status: '취소',
-              type: 'cancel' as const,
-              cancelTimestamp, // 취소 시점 기록
-            }
-          }
-          return order
-        })
+      const targets = orderLogsRef.current.filter(order => {
+        if (!order.orderNumber) return false
+        if (staleIds.has(order.id)) return false
+        const isUnfilled = order.status === '접수' || order.status === '확인' || order.status === '미체결'
+        if (!isUnfilled) return false
+        if (cancelRequestedRef.current.has(order.orderNumber)) return false
 
-        console.log(`[자동 취소] ${ordersToCancel.length}건의 미체결 주문 취소 처리 완료`)
-        return updated
+        // 지정가 주문은 체결을 기다려야 한다. 자동취소하면 영원히 체결되지 않는다.
+        // (시장가만 미체결로 남으면 물량을 잠그고 의미가 없으므로 취소 대상)
+        // orderPrice > 0 이면 지정가 주문이다 (isMarketOrder는 API 병합 시 누락될 수 있음)
+        if (order.isMarketOrder === false) return false
+        if ((order.orderPrice ?? 0) > 0) return false
+
+        // 주문 접수 시각: 타임스탬프가 없으면 '오전 11:35:23' 형태에서 복원한다
+        let placedAt = order.orderTimestamp
+        if (!placedAt) {
+          const sec = parseClockSeconds(order.time)
+          if (!Number.isFinite(sec)) return false
+          const d = new Date()
+          d.setHours(Math.floor(sec / 3600), Math.floor((sec % 3600) / 60), sec % 60, 0)
+          placedAt = d.getTime()
+        }
+        return now - placedAt >= timeoutMs
       })
+
+      if (targets.length === 0) return
+
+      // 서버 취소는 비동기이므로 상태 갱신과 분리해서 호출한다
+      void (async () => {
+        for (const order of targets) {
+          const orderNo = order.orderNumber as string
+          if (cancelRequestedRef.current.has(orderNo)) continue
+          cancelRequestedRef.current.add(orderNo)
+
+          const cancelQty = order.unfilledQuantity && order.unfilledQuantity > 0
+            ? order.unfilledQuantity
+            : order.quantity
+          const placedAt = order.orderTimestamp
+            || (() => {
+              const sec = parseClockSeconds(order.time)
+              const d = new Date()
+              d.setHours(Math.floor(sec / 3600), Math.floor((sec % 3600) / 60), sec % 60, 0)
+              return d.getTime()
+            })()
+          const elapsed = Math.floor((Date.now() - placedAt) / 1000)
+
+          try {
+            await kiwoomApi.cancelOrder(orderNo, order.stockCode, cancelQty)
+            addLog(
+              `[자동 취소] ${order.stockName} ${cancelQty}주 ${order.type === 'buy' ? '매수' : '매도'} 주문 취소 (${elapsed}초 경과)`,
+              'warning'
+            )
+            setOrderLogs(prev => prev.map(o =>
+              o.id === order.id
+                ? { ...o, status: '취소', type: 'cancel' as const, cancelTimestamp: Date.now() }
+                : o
+            ))
+            if (order.type === 'buy') {
+              setOrderedOrHoldingStocks(prev => {
+                const next = new Set(prev)
+                next.delete(order.stockCode)
+                return next
+              })
+            }
+          } catch (error: any) {
+            const { message } = getOrderErrorInfo(error)
+            // 이미 체결·취소된 주문은 취소할 수 없다 → 재시도하지 않도록 기록만 남긴다
+            addLog(`[자동 취소 실패] ${order.stockName}: ${message}`, 'warning')
+          }
+          await new Promise(resolve => setTimeout(resolve, 300))
+        }
+        // 취소 후 매도가능수량이 복구되도록 잔고를 즉시 갱신
+        queryClient.invalidateQueries('balance')
+        queryClient.invalidateQueries('orders')
+      })()
     }, 5000) // 5초마다 확인
 
     return () => {
       clearInterval(checkInterval)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isRunning]) // isRunning만 의존성으로 사용 (함수형 업데이트로 최신 상태 참조)
+  }, [connected, selectedAccount])
 
   // 취소된 주문을 20초 후 자동 삭제
   useEffect(() => {
@@ -5368,13 +6415,67 @@ const AutoTrading = () => {
   useEffect(() => {
     // connected 상태와 isConnected 상태 동기화
     setIsConnected(connected)
-    
+
     if (connected) {
       addLog('키움증권 API 연결 성공', 'success')
     } else {
       addLog('키움증권 API 연결 안됨', 'warning')
     }
   }, [connected])
+
+  // 서버가 재시작되면 키움 세션이 사라진다. 브라우저는 연결됨으로 알고 있어
+  // 시세가 조용히 멈추므로, 주기적으로 서버 상태를 확인해 자동으로 다시 연결한다.
+  const reconnectingRef = useRef(false)
+  useEffect(() => {
+    if (!connected) return
+
+    let stopped = false
+    const verify = async () => {
+      if (stopped || reconnectingRef.current) return
+      try {
+        const status = await kiwoomApi.getStatus()
+        if (status.connected) return
+
+        // 서버 세션이 끊김 → 저장된 키로 재연결
+        const savedAppkey = localStorage.getItem('kiwoom_appkey')
+        const savedSecretkey = localStorage.getItem('kiwoom_secretkey')
+        const savedMode = localStorage.getItem('kiwoom_apimode') || 'virtual'
+        if (!savedAppkey || !savedSecretkey) {
+          addLog('서버 연결이 끊겼습니다. 다시 연결해주세요', 'warning')
+          return
+        }
+
+        reconnectingRef.current = true
+        const host = savedMode === 'real' ? 'https://api.kiwoom.com' : 'https://mockapi.kiwoom.com'
+        console.log('[자동 재연결] 서버 세션 없음 → 재연결 시도')
+        addLog('[자동 재연결] 서버 연결이 끊겨 다시 연결합니다', 'warning')
+
+        const response = await fetch('/api/kiwoom/connect', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          body: JSON.stringify({ appkey: savedAppkey, secretkey: savedSecretkey, host }),
+        })
+        const data = await response.json()
+        if (data.success) {
+          await checkStatus()
+          addLog('[자동 재연결] 키움증권 API 재연결 성공', 'success')
+        } else {
+          addLog(`[자동 재연결] 실패: ${data.message || '알 수 없는 오류'}`, 'error')
+        }
+      } catch (error: any) {
+        console.error('[자동 재연결] 오류:', error.message)
+      } finally {
+        reconnectingRef.current = false
+      }
+    }
+
+    const interval = window.setInterval(verify, 15000)
+    return () => {
+      stopped = true
+      window.clearInterval(interval)
+    }
+  }, [connected, checkStatus])
 
   // 조건식 변경시 텍스트 업데이트
   useEffect(() => {
@@ -5386,26 +6487,38 @@ const AutoTrading = () => {
     }
   }, [conditions])
 
-  // localStorage에서 API 키 로드
+  // 저장된 설정 로드 + 쿠키 세션 복원
   useEffect(() => {
     try {
-      const savedLicenseKey = localStorage.getItem('kiwoom_license_key')
       const savedAppkey = localStorage.getItem('kiwoom_appkey')
       const savedSecretkey = localStorage.getItem('kiwoom_secretkey')
       const savedApiMode = localStorage.getItem('kiwoom_apimode')
-      
-      // 라이선스 키가 있으면 우선 사용
-      if (savedLicenseKey) {
-        setLicenseKey(savedLicenseKey)
-        setUseLicenseKey(true)
-      } else {
-        // 직접 입력 모드
-        if (savedAppkey) setAppkey(savedAppkey)
-        if (savedSecretkey) setSecretkey(savedSecretkey)
-        setUseLicenseKey(false)
+
+      // 과거 버전이 남긴 라이선스 키는 즉시 제거 (XSS 노출면 제거)
+      const legacyKey = localStorage.getItem('kiwoom_license_key')
+      if (legacyKey) {
+        localStorage.removeItem('kiwoom_license_key')
       }
-      
+
+      // 저장된 appkey/secretkey 복원 (자동 재연결용)
+      if (savedAppkey) setAppkey(savedAppkey)
+      if (savedSecretkey) setSecretkey(savedSecretkey)
       if (savedApiMode) setApiMode(savedApiMode as 'real' | 'virtual')
+
+      // 라이선스 세션은 HttpOnly 쿠키로 복원한다 (키를 localStorage에 두지 않는다)
+      fetch('/api/auth/session', { credentials: 'include' })
+        .then((res) => res.json())
+        .then((data) => {
+          if (data?.authenticated && data.remainingDays !== undefined) {
+            setUseLicenseKey(true)
+            setKeyInfo({ expiresAt: data.expiresAt, remainingDays: data.remainingDays })
+          } else {
+            setUseLicenseKey(true) // 키 입력 UI는 유지 (재로그인 유도)
+          }
+        })
+        .catch(() => {
+          // 세션 확인 실패는 치명적이지 않다 (로그인 화면에서 다시 검증)
+        })
     } catch (error) {
       console.error('API 키 로드 오류:', error)
     }
@@ -5521,6 +6634,11 @@ const AutoTrading = () => {
           if (parsed.목표시 !== undefined) setDropSellStartHour(parsed.목표시)
           if (parsed.목표분 !== undefined) setDropSellStartMinute(parsed.목표분)
           if (parsed.목표초 !== undefined) setDropSellEndSecond(parsed.목표초)
+          if (parsed.시간대정지사용 !== undefined) setPauseBuyEnabled(parsed.시간대정지사용)
+          if (parsed.정지시작시 !== undefined) setPauseStartHour(parsed.정지시작시)
+          if (parsed.정지시작분 !== undefined) setPauseStartMinute(parsed.정지시작분)
+          if (parsed.정지종료시 !== undefined) setPauseEndHour(parsed.정지종료시)
+          if (parsed.정지종료분 !== undefined) setPauseEndMinute(parsed.정지종료분)
         } catch (e) {
           console.error('매매시간 설정 파싱 오류:', e)
         }
@@ -5554,10 +6672,59 @@ const AutoTrading = () => {
           console.error('기타조건 설정 파싱 오류:', e)
         }
       }
+      
+      // 단계별 익절 설정 로드
+      const savedStepProfit = localStorage.getItem('stepProfitSettings')
+      if (savedStepProfit) {
+        try {
+          const parsed = JSON.parse(savedStepProfit)
+          setStepProfit(prev => ({ ...prev, ...parsed }))
+        } catch (e) {
+          console.error('단계별 익절 설정 파싱 오류:', e)
+        }
+      }
+
+      // 새 기본값 1회 적용 (기존 저장값이 덮어쓰지 않도록)
+      if (localStorage.getItem('tradingDefaultsVersion') !== '4') {
+        setPauseBuyEnabled(true)
+        setStepProfit(prev => ({ ...prev, 사용: true }))
+        setDropSellTime(true)
+        setDropSellStartHour(12)
+        setDropSellStartMinute(0)
+        setDropSellEndSecond(0)
+        // 기타 매도: 시장가 · 기준손실률 -3.0%
+        setLossType('market')
+        setLossLimit(-3.0)
+        // Trailing 매도: 기준 5% / 최고점 대비 -3.0%
+        setTrailingStop(true)
+        setTrailingProfitThreshold(5)
+        setTrailingDropThreshold(-3.0)
+        localStorage.setItem('tradingDefaultsVersion', '4')
+      }
     } catch (error) {
       console.error('매매설정 로드 오류:', error)
     }
   }, [])
+
+  // 프로그램 실행 시 자동 시작 (autoStart)
+  // API 연결 + 계좌 선택 + 조건식 선택이 모두 준비된 뒤 1회만 실행한다.
+  const autoStartedRef = useRef(false)
+  useEffect(() => {
+    if (autoStartedRef.current) return
+    if (!autoStart) return
+    if (isRunning) return // 이미 실행 중이면 아무 것도 하지 않음
+    if (!isConnected || !selectedAccount) return
+    if (conditions.filter(c => c.enabled).length === 0) return
+
+    autoStartedRef.current = true
+    addLog('프로그램 실행 시 자동시작 설정에 따라 자동매매를 시작합니다', 'info')
+    // 상태(조건식·계좌)가 반영된 다음 틱에서 시작
+    const timer = window.setTimeout(() => {
+      handleStart().catch((e: any) => addLog(`자동시작 실패: ${e.message}`, 'error'))
+    }, 800)
+    return () => window.clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoStart, isRunning, isConnected, selectedAccount, conditions])
   
   // TradingSettings에서 설정이 변경될 때 실시간으로 반영
   useEffect(() => {
@@ -5638,8 +6805,16 @@ const AutoTrading = () => {
         목표시: dropSellStartHour,
         목표분: dropSellStartMinute,
         목표초: dropSellEndSecond,
+        시간대정지사용: pauseBuyEnabled,
+        정지시작시: pauseStartHour,
+        정지시작분: pauseStartMinute,
+        정지종료시: pauseEndHour,
+        정지종료분: pauseEndMinute,
       }
       localStorage.setItem('tradingTime', JSON.stringify(tradingTime))
+      
+      // 단계별 익절 설정 저장
+      localStorage.setItem('stepProfitSettings', JSON.stringify(stepProfit))
       
       // 매도 가격지정 설정 저장
       const sellPriceSettings = {
@@ -5665,6 +6840,7 @@ const AutoTrading = () => {
   }, [
     amountPerStock, maxSimultaneousBuy, tradeLimitPerStock, maxDailyStocks, feePercent, buyPriceSettings,
     startHour, startMinute, endHour, endMinute, endSecond, dropSellTime, dropSellStartHour, dropSellStartMinute, dropSellEndSecond,
+    pauseBuyEnabled, pauseStartHour, pauseStartMinute, pauseEndHour, pauseEndMinute, stepProfit,
     profitTarget, profitType, lossLimit, lossType, lossPriceOffset,
     autoStart, trailingStop, trailingProfitThreshold, trailingDropThreshold
   ])
@@ -5789,6 +6965,345 @@ const AutoTrading = () => {
             max-height: 500px;
           }
         }
+
+        /* ===== 모바일(기본): 세로 1열 스택 ===== */
+        .at-orders-scroll {
+          flex: 1;
+          min-height: 0;
+          overflow: auto;
+          display: flex;
+          flex-direction: column;
+          gap: 4px; /* 화면 간격 최소화 */
+          padding: 0;
+        }
+        .at-right-col {
+          display: contents;
+        }
+        /* 조건검색식 카드: PC에서는 조건식(좌) + 종목 직접 추가(우) 6:4 */
+        .at-cond-body {
+          display: block;
+        }
+        /* 사용자수식: PC에서는 매수조건/매도조건 2열 */
+        .at-formula-grid {
+          display: block;
+        }
+        @media (min-width: 1024px) {
+          .at-formula-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+            align-items: start;
+          }
+          .at-formula-grid > div { margin-bottom: 0 !important; }
+          .at-formula-grid label {
+            font-size: 11px;
+            line-height: 1.3;
+            align-items: flex-start !important;
+          }
+        }
+
+        @media (min-width: 1024px) {
+          /* 조건검색식 카드 목록은 3열 (좌측 6 비율 안에서) */
+          .at-cond-list {
+            grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+          }
+          /* 3열에서는 카드가 좁아지므로 여백/글자 크기 축소 */
+          .at-cond-list > label {
+            padding: 5px 6px !important;
+            gap: 4px !important;
+            font-size: 12px !important;
+          }
+          .at-cond-list > label > input[type="checkbox"] {
+            width: 15px !important;
+            height: 15px !important;
+          }
+          .at-cond-list > label > div > div:first-child { font-size: 12px !important; }
+          .at-cond-list > label > div > div:last-child { font-size: 10px !important; }
+          .at-cond-list > label > div:last-child:not(:nth-child(2)) {
+            padding: 1px 4px !important;
+            font-size: 9px !important;
+          }
+          .at-cond-body {
+            display: grid;
+            grid-template-columns: minmax(0, 6fr) minmax(0, 4fr);
+            gap: 10px;
+            align-items: start;
+          }
+          .at-cond-manual {
+            margin-top: 0 !important;
+            padding-top: 0 !important;
+            border-top: none !important;
+            border-left: 1px solid #4b5563;
+            padding-left: 10px !important;
+            position: sticky;
+            top: 0;
+          }
+          .bg-gray-50 .at-cond-manual {
+            border-left-color: #d1d5db;
+          }
+        }
+
+        /* 표 컬럼 헤더 고정 (세로 스크롤 시 상단 유지) */
+        .at-detected-table thead th,
+        .at-order-table thead th,
+        .at-watch-table thead th {
+          position: sticky !important;
+          top: 0 !important;
+          z-index: 3;
+        }
+        /* 그라데이션 텍스트는 sticky 배경 위에서 사라지므로 단색 처리 */
+        .at-detected-table thead th {
+          background-image: none !important;
+          -webkit-text-fill-color: currentColor !important;
+        }
+        .bg-gradient-dark .at-detected-table thead th,
+        .bg-gradient-dark .at-order-table thead th,
+        .bg-gradient-dark .at-watch-table thead th { background-color: #374151 !important; }
+        .bg-gray-50 .at-detected-table thead th,
+        .bg-gray-50 .at-order-table thead th { background-color: #f3f4f6 !important; }
+        .bg-gray-50 .at-watch-table thead th { background-color: #e5e7eb !important; }
+        .at-conditions-grid {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+          max-width: 100%;
+          margin: 0 auto;
+          width: 100%;
+        }
+        .at-conditions-cards {
+          display: block;
+          columns: 1;
+          gap: 8px;
+        }
+        .at-conditions-cards > div {
+          break-inside: avoid;
+          margin-bottom: 8px;
+        }
+        .at-strategies-grid {
+          display: flex;
+          flex-direction: column;
+          gap: 16px;
+          max-width: 800px;
+          margin: 0 auto;
+          width: 100%;
+        }
+        .at-log {
+          height: 128px;
+        }
+        /* 주문 내역: 한 줄 표시 + 세로 스크롤 */
+        .at-order-table th,
+        .at-order-table td {
+          white-space: nowrap;
+          word-break: keep-all;
+          line-height: 1.25;
+          padding: 3px 4px !important;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        /* 10개 컬럼 폭 배분 (PC: 고정 레이아웃 / 모바일: 자동 + 가로 스크롤) */
+        .at-order-table col.c-check   { width: 4%; }
+        .at-order-table col.c-time    { width: 8%; }
+        .at-order-table col.c-name    { width: 30%; }
+        .at-order-table col.c-type    { width: 5%; }
+        .at-order-table col.c-qty     { width: 6%; }
+        .at-order-table col.c-price   { width: 10%; }
+        .at-order-table col.c-status  { width: 6%; }
+        .at-order-table col.c-cur     { width: 10%; }
+        .at-order-table col.c-profit  { width: 8%; }
+        .at-order-table col.c-action  { width: 6%; }
+        .at-order-table-wrap {
+          max-height: 220px;
+        }
+
+        /* ===== PC(1024px~): 3분할 트레이딩 터미널 레이아웃 ===== */
+        @media (min-width: 1024px) {
+          /* PC는 컬럼 비율을 고정해 수평 스크롤 없이 표시 */
+          .at-order-table { table-layout: fixed; }
+          .auto-trading-container {
+            padding-left: 0;
+            padding-right: 0;
+          }
+          /* 주문시작 탭: 좌측 '사이드'(매매조건→계좌요약→보유종목→로그)
+             · 우측 '상세'(차트/선택종목/검색종목)로 완전히 분리한다.
+             컨테이너는 화면에 고정하고, 각 영역이 내부에서 스크롤한다. */
+          .at-orders-scroll {
+            display: grid;
+            grid-template-columns: minmax(300px, 350px) minmax(0, 1fr);
+            /* 1·2행: 제어 카드(내용) / 3·4행: 보유종목·로그가 남는 높이를 나눠 갖는다 */
+            grid-template-rows: max-content max-content minmax(150px, 1fr) minmax(120px, 0.8fr);
+            gap: 8px;
+            padding: 6px 6px 6px 4px;
+            /* 화면 높이에 맞춰 자동 확장 (헤더/탭 높이만큼 빼고 채운다) */
+            height: 100%;
+            min-height: 0;
+            overflow: hidden;
+            align-content: stretch;
+            align-items: stretch;
+          }
+          /* ── 좌측 사이드 ───────────────────────────────── */
+          .at-sec-conditions {
+            grid-column: 1;
+            grid-row: 1;
+            border: 1px solid #4b5563;
+            border-radius: 8px;
+            overflow: hidden;
+            align-self: start;
+          }
+          .at-sec-account {
+            grid-column: 1;
+            grid-row: 2;
+            border-radius: 8px;
+            overflow: hidden;
+            align-self: start;
+          }
+          /* 사이드 하단 두 영역은 남는 높이를 나눠 갖고 내부에서 스크롤 */
+          .at-sec-orders {
+            grid-column: 1;
+            grid-row: 3;
+            min-height: 0;
+            overflow: hidden;
+          }
+          .at-log {
+            grid-column: 1;
+            grid-row: 4;
+            min-height: 0;
+            overflow: hidden;
+          }
+          /* ── 우측 상세 ─────────────────────────────────── */
+          .at-right-col {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            grid-column: 2;
+            grid-row: 1 / -1;
+            min-width: 0;
+            min-height: 0;
+            align-self: stretch;
+            overflow-y: auto;
+            /* 사이드와의 경계를 시각적으로 분리 */
+            border-left: 1px solid #374151;
+            padding-left: 8px;
+          }
+          .at-sec-chart { align-self: stretch; margin-bottom: 0 !important; flex: 0 0 auto; }
+          .at-sec-watchlist { min-height: 0 !important; flex: 0 0 auto; }
+          /* 좌측 사이드바는 폭이 좁아 핵심 컬럼만 표시 (시간/가격/현재가 숨김)
+             컬럼 순서: 1체크 2종목명 3구분 4수량 5가격 6상태 7현재가 8수익률 9매도 10시간 */
+          .at-sec-orders .at-order-table col.c-time,
+          .at-sec-orders .at-order-table col.c-price,
+          .at-sec-orders .at-order-table col.c-cur,
+          .at-sec-orders .at-order-table th:nth-child(5),
+          .at-sec-orders .at-order-table td:nth-child(5),
+          .at-sec-orders .at-order-table th:nth-child(7),
+          .at-sec-orders .at-order-table td:nth-child(7),
+          .at-sec-orders .at-order-table th:nth-child(10),
+          .at-sec-orders .at-order-table td:nth-child(10) {
+            display: none;
+          }
+          .at-sec-orders .at-order-table col.c-check  { width: 8%; }
+          .at-sec-orders .at-order-table col.c-name   { width: 34%; }
+          .at-sec-orders .at-order-table col.c-type   { width: 9%; }
+          .at-sec-orders .at-order-table col.c-qty    { width: 11%; }
+          .at-sec-orders .at-order-table col.c-status { width: 10%; }
+          .at-sec-orders .at-order-table col.c-profit { width: 19%; }
+          .at-sec-orders .at-order-table col.c-action { width: 9%; }
+          .at-sec-orders .at-order-table-wrap { max-height: none; }
+          /* 검색된 종목: 우측 컬럼 안에서 남는 높이를 모두 차지 */
+          .at-sec-detected {
+            display: flex;
+            flex-direction: column;
+            flex: 1 1 auto;
+            height: auto !important;
+            min-height: 200px !important;
+            border: 1px solid #4b5563;
+            border-radius: 8px;
+            overflow: hidden;
+            padding: 0 4px 0 4px !important;
+          }
+          .at-sec-detected > div:last-child {
+            flex: 1 1 auto;
+            min-height: 0;
+            height: auto !important;
+          }
+          /* 사이드 '현재 보유 종목' 카드: 남는 높이 채우고 내부 스크롤 */
+          .at-sec-orders {
+            border: 1px solid #4b5563;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+          }
+          /* 사이드 '로그' 카드: 남는 높이 채우고 내부 세로 스크롤 */
+          .at-log {
+            border: 1px solid #374151;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            height: auto !important;
+            min-height: 0;
+          }
+          /* PC: 주문 내역은 남는 높이를 채우고 내부에서 스크롤 */
+          .at-order-table-wrap {
+            max-height: none;
+            flex: 1 1 auto;
+            min-height: 0;
+          }
+          /* 검색된 종목: 10컬럼이 수평 스크롤 없이 들어오도록 폭 배분 */
+        .at-sec-detected > div:last-child { overflow-x: auto !important; }
+        .at-detected-table th,
+        .at-detected-table td {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        /* 종목명은 말줄임 없이 전체 표시 (컬럼이 내용에 맞춰 늘어난다) */
+        .at-detected-table td.at-col-name {
+          overflow: visible;
+          text-overflow: clip;
+          white-space: nowrap;
+          min-width: 300px;
+        }
+          .at-sec-detected > div:first-child {
+            margin-bottom: 0 !important;
+            padding: 2px 4px !important;
+          }
+          .at-sec-detected > div:last-child {
+            padding-bottom: 0 !important;
+          }
+
+          /* 매매조건 탭: 카드 2열 masonry (조건검색식/사용자수식은 전체 폭) */
+          .at-conditions-grid {
+            display: block;
+            max-width: 1400px;
+          }
+          .at-conditions-cards {
+            display: block;
+            column-count: 2;
+            column-gap: 10px;
+          }
+          .at-conditions-cards > div {
+            break-inside: avoid;
+            margin-bottom: 10px;
+          }
+          .at-span2 { column-span: all; }
+
+          /* 매매설정 탭: 2열 카드 그리드 */
+          .at-strategies-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            align-items: start;
+            gap: 12px;
+            max-width: 1280px;
+          }
+        }
+
+        /* 대형 모니터: 매매조건 3열 */
+        @media (min-width: 1600px) {
+          .at-orders-scroll {
+            grid-template-columns: minmax(380px, 440px) minmax(0, 1fr);
+          }
+          .at-conditions-grid {
+            max-width: 1600px;
+          }
+        }
         @media (max-width: 768px) {
           .auto-trading-container {
             padding-left: 24px;
@@ -5820,7 +7335,94 @@ const AutoTrading = () => {
           .bg-gray-50 .account-summary-section {
             border: 1px solid #d1d5db;
           }
+
+          /* 모바일: 좌우 여백 최소화 */
+          .auto-trading-container {
+            padding-left: 0 !important;
+            padding-right: 0 !important;
+          }
+          .trading-conditions-section,
+          .account-summary-section {
+            margin-left: 2px !important;
+            margin-right: 2px !important;
+            margin-top: 2px !important;
+            margin-bottom: 2px !important;
+            border-radius: 6px !important;
+          }
+
+          /* 모바일: 카드 사이 간격/내부 여백 최소화 */
+          .at-orders-scroll { gap: 2px !important; }
+          .at-sec-orders { padding: 4px !important; }
+          .at-log { margin-top: 0 !important; }
+          .at-sec-detected { margin: 0 !important; }
+          .at-sec-detected > div:first-child h3 { font-size: 11px !important; }
+          .account-summary-section h3,
+          .trading-conditions-section h3 { margin-bottom: 1px !important; }
+
+          /* 계좌 요약: 화면 폭에 맞춰 2열 → 폭 부족 시 1열로 자동 전환 */
+          .at-account-grid {
+            display: grid !important;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)) !important;
+            gap: 2px 4px !important;
+          }
+
+          /* 검색된 종목: 모바일에서 수평 스크롤 (컬럼 잘림 방지) */
+          .at-sec-detected {
+            height: auto !important;
+            min-height: 0 !important;
+            padding: 0 2px !important;
+          }
+          .at-detected-scroll {
+            overflow-x: auto !important;
+            overflow-y: auto !important;
+            -webkit-overflow-scrolling: touch;
+            /* 부모 높이가 auto라 inline height:0 + flex:1 이면 0으로 접힌다 */
+            height: auto !important;
+            max-height: 260px;
+            min-height: 0 !important;
+          }
+          .at-detected-table {
+            width: max-content !important;
+            min-width: 100% !important;
+          }
+          .at-detected-table th,
+          .at-detected-table td {
+            padding: 2px 4px !important;
+          }
+
+          /* 보유 종목 표도 모바일에서 수평 스크롤 */
+          .at-order-table-wrap {
+            overflow-x: auto !important;
+            -webkit-overflow-scrolling: touch;
+          }
+          /* 글자 잘림 방지: 내용 폭 기준(auto) 레이아웃 + 가로 스크롤 */
+          .at-order-table {
+            table-layout: auto !important;
+            width: max-content !important;
+            min-width: 100% !important;
+          }
+          .at-order-table col { width: auto !important; }
+          .at-order-table th,
+          .at-order-table td {
+            padding: 3px 5px !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
+          }
+
+          /* 검색된 종목: 종목명 좌우 여백 축소 (폭은 내용에 맞춤) */
+          .at-detected-table td.at-col-name,
+          .at-detected-table th:first-child {
+            padding-left: 2px !important;
+            padding-right: 2px !important;
+            min-width: 0 !important;
+          }
+
+          /* 로그 높이 축소 */
+          .at-log {
+            min-height: 90px !important;
+          }
         }
+
       `}</style>
       <div 
         className={`w-screen h-screen overflow-hidden flex flex-col auto-trading-container ${
@@ -5994,36 +7596,32 @@ const AutoTrading = () => {
       >
         {activeTab === 'orders' && (
           <div 
+            className="at-orders-scroll"
             style={{
-              flex: 1,
-              overflow: 'auto',
-              display: 'flex',
-              flexDirection: 'column',
               backgroundColor: theme === 'dark' ? '#111827' : 'white',
-              minHeight: 0
             }}
           >
-            {/* 상단: 매매 조건 섹션 */}
+            {/* 매매 조건 섹션 */}
             <div 
-              className="trading-conditions-section"
+              className="trading-conditions-section at-sec-conditions"
               style={{
                 borderBottom: theme === 'dark' ? '1px solid #374151' : '1px solid #d1d5db',
-                padding: '5px',
+                padding: '2px 4px',
                 backgroundColor: theme === 'dark' ? '#1f2937' : '#f9fafb',
                 flexShrink: 0
               }}
             >
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '2px' }}>
                 <h2 style={{ 
-                  fontSize: '18px', 
+                  fontSize: '13px', 
                   fontWeight: 'bold', 
-                  width: '300px',
                   color: theme === 'dark' ? '#f3f4f6' : '#111827',
                   display: 'flex',
                   alignItems: 'center',
-                  gap: '8px'
+                  gap: '4px',
+                  margin: 0
                 }}>
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
                   </svg>
                   매매 조건
@@ -6031,21 +7629,21 @@ const AutoTrading = () => {
                 {/* 테마 전환 스위치 */}
                 <button
                   onClick={toggleTheme}
-                  className="relative w-12 h-6 rounded-full transition-all duration-300 bg-gradient-to-r from-blue-600 to-green-500 hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
+                  className="relative w-9 h-5 rounded-full transition-all duration-300 bg-gradient-to-r from-blue-600 to-green-500 hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2"
                   aria-label="테마 전환"
                   style={{ flexShrink: 0 }}
                 >
                   <span
-                    className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow-md transform transition-transform duration-300 flex items-center justify-center ${
-                      theme === 'dark' ? 'translate-x-6' : 'translate-x-0'
+                    className={`absolute top-0.5 left-0.5 w-4 h-4 bg-white rounded-full shadow-md transform transition-transform duration-300 flex items-center justify-center ${
+                      theme === 'dark' ? 'translate-x-4' : 'translate-x-0'
                     }`}
                   >
                     {theme === 'dark' ? (
-                      <svg className="w-3 h-3 text-gray-800" fill="currentColor" viewBox="0 0 20 20">
+                      <svg className="w-2.5 h-2.5 text-gray-800" fill="currentColor" viewBox="0 0 20 20">
                         <path d="M17.293 13.293A8 8 0 016.707 2.707a8.001 8.001 0 1010.586 10.586z" />
                       </svg>
                     ) : (
-                      <svg className="w-3 h-3 text-yellow-500" fill="currentColor" viewBox="0 0 20 20">
+                      <svg className="w-2.5 h-2.5 text-yellow-500" fill="currentColor" viewBox="0 0 20 20">
                         <path fillRule="evenodd" d="M10 2a1 1 0 011 1v1a1 1 0 11-2 0V3a1 1 0 011-1zm4 8a4 4 0 11-8 0 4 4 0 018 0zm-.464 4.95l.707.707a1 1 0 001.414-1.414l-.707-.707a1 1 0 00-1.414 1.414zm2.12-10.607a1 1 0 010 1.414l-.706.707a1 1 0 11-1.414-1.414l.707-.707a1 1 0 011.414 0zM17 11a1 1 0 100-2h-1a1 1 0 100 2h1zm-7 4a1 1 0 011 1v1a1 1 0 11-2 0v-1a1 1 0 011-1zM5.05 6.464A1 1 0 106.465 5.05l-.708-.707a1 1 0 00-1.414 1.414l.707.707zm1.414 8.486l-.707.707a1 1 0 01-1.414-1.414l.707-.707a1 1 0 011.414 1.414zM4 11a1 1 0 100-2H3a1 1 0 000 2h1z" clipRule="evenodd" />
                       </svg>
                     )}
@@ -6053,159 +7651,160 @@ const AutoTrading = () => {
                 </button>
               </div>
               
-              {/* 조건식 선택 */}
-              <div style={{ marginBottom: '12px' }}>
-                <span style={{ fontSize: '14px', fontWeight: 500, color: theme === 'dark' ? '#d1d5db' : '#374151' }}>선택된 조건식: </span>
-                <span style={{ fontSize: '14px', color: '#16a34a', fontWeight: 500 }}>
-                  {conditions.filter(c => c.enabled).length > 0 
-                    ? conditions.filter(c => c.enabled).map(c => c.name).join(', ')
-                    : '없음'}
-                </span>
-              </div>
+              {/* 조건식 / 종목 / 매수유형 - 내부 2열 그리드 */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 6px', fontSize: '11px', lineHeight: '1.5', marginBottom: '2px' }}>
+                <div style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <span style={{ fontWeight: 500, color: theme === 'dark' ? '#d1d5db' : '#374151' }}>조건식: </span>
+                  <span style={{ color: '#16a34a', fontWeight: 500 }}>
+                    {conditions.filter(c => c.enabled).length > 0 
+                      ? conditions.filter(c => c.enabled).map(c => c.name).join(', ')
+                      : '없음'}
+                  </span>
+                </div>
 
-              {/* 선택된 종목 */}
-              <div style={{ marginBottom: '16px' }}>
-                <span style={{ fontSize: '14px', fontWeight: 500, color: theme === 'dark' ? '#d1d5db' : '#374151' }}>선택된 종목: </span>
-                <span style={{ fontSize: '14px', color: '#f59e0b', fontWeight: 500 }}>
-                  {watchlistStocks.length > 0 
-                    ? watchlistStocks.map(s => s.name).join(', ')
-                    : '없음'}
-                </span>
-              </div>
+                <div style={{ minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <span style={{ fontWeight: 500, color: theme === 'dark' ? '#d1d5db' : '#374151' }}>종목: </span>
+                  <span style={{ color: '#f59e0b', fontWeight: 500 }}>
+                    {watchlistStocks.length > 0 
+                      ? watchlistStocks.map(s => s.name).join(', ')
+                      : '없음'}
+                  </span>
+                </div>
 
-              {/* 매수유형 */}
-              <div style={{ marginBottom: '16px' }}>
-                <label style={{ fontSize: '14px', fontWeight: 500, display: 'block', marginBottom: '8px', color: theme === 'dark' ? '#d1d5db' : '#111827' }}>매수유형</label>
-                <div style={{ display: 'flex', gap: '16px' }}>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', gridColumn: '1 / -1' }}>
+                  <span style={{ fontSize: '11px', fontWeight: 500, color: theme === 'dark' ? '#d1d5db' : '#111827' }}>매수유형</span>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}>
                     <input
                       type="radio"
                       name="buyType"
                       value="cash"
                       checked={buyType === 'cash'}
                       onChange={(e) => setBuyType(e.target.value as 'cash')}
-                      style={{ width: '16px', height: '16px' }}
+                      style={{ width: '12px', height: '12px' }}
                     />
-                    <span style={{ fontSize: '15px', fontWeight: 600, color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>현금매수</span>
+                    <span style={{ fontSize: '11px', fontWeight: 600, color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>현금매수</span>
                   </label>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}>
                     <input
                       type="radio"
                       name="buyType"
                       value="credit"
                       checked={buyType === 'credit'}
                       onChange={(e) => setBuyType(e.target.value as 'credit')}
-                      style={{ width: '16px', height: '16px' }}
+                      style={{ width: '12px', height: '12px' }}
                     />
-                    <span style={{ fontSize: '15px', fontWeight: 600, color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>신용매수</span>
+                    <span style={{ fontSize: '11px', fontWeight: 600, color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>신용매수</span>
                   </label>
                 </div>
               </div>
 
-              {/* 제어 버튼 그리드 */}
+              {/* 제어 버튼 그리드 (3열 × 2행) */}
               <div 
                 style={{
-                  display: 'flex',
-                  flexWrap: 'wrap',
-                  columnGap: '2px',
-                  rowGap: '2px',
-                  height: '145px'
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(3, 1fr)',
+                  gap: '2px',
                 }}
               >
                 <button
                   onClick={handleStart}
                   disabled={!connected || !selectedAccount || isRunning}
-                  className={`px-6 py-2 rounded-full font-semibold text-sm flex items-center gap-2 transition-all duration-300 ${
+                  className={`px-2 rounded font-semibold flex items-center justify-center gap-1 transition-all duration-300 ${
                     (!connected || !selectedAccount || isRunning)
                       ? 'bg-gray-500 cursor-not-allowed opacity-50'
                       : 'btn-gradient-primary'
                   }`}
+                  style={{ padding: '8px 4px', gridColumn: 'span 2', fontSize: '14px' }}
                 >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                   </svg>
-                  <span className="font-bold text-white text-base">자동매매</span>
+                  <span className="font-bold text-white" style={{ fontSize: '14px' }}>자동매매</span>
                 </button>
                 <button
                   onClick={handleCancelUnfilledOrders}
                   disabled={!connected || !selectedAccount}
-                  className={`px-4 py-2 rounded-full font-semibold text-sm flex items-center gap-2 transition-all duration-300 ${
+                  className={`px-2 py-0.5 rounded font-semibold flex items-center justify-center gap-1 transition-all duration-300 ${
                     (!connected || !selectedAccount)
                       ? 'bg-gray-500 cursor-not-allowed opacity-50'
                       : 'bg-gradient-to-r from-yellow-500 to-orange-500 hover:from-yellow-600 hover:to-orange-600 shadow-lg hover:shadow-yellow-500/50'
                   }`}
                 >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                   </svg>
-                  <span className="font-bold text-white text-base">미체결주문취소</span>
+                  <span className="font-bold text-white" style={{ fontSize: '11px' }}>미체결취소</span>
                 </button>
                 <button
                   onClick={handleSellAll}
-                  disabled={!connected || !selectedAccount || holdingStocks.length === 0}
-                  className={`px-4 py-2 rounded-full font-semibold text-sm flex items-center gap-2 transition-all duration-300 ${
-                    (!connected || !selectedAccount || holdingStocks.length === 0)
+                  disabled={!connected || !selectedAccount || displayHoldingOrdersWithLive.length === 0 || selectedHoldingCodes.size === 0}
+                  title="현재 보유 종목에서 체크한 종목을 시장가로 매도합니다"
+                  className={`px-2 py-0.5 rounded font-semibold flex items-center justify-center gap-1 transition-all duration-300 ${
+                    (!connected || !selectedAccount || displayHoldingOrdersWithLive.length === 0 || selectedHoldingCodes.size === 0)
                       ? 'bg-gray-500 cursor-not-allowed opacity-50'
                       : 'bg-gradient-to-r from-orange-500 to-red-600 hover:from-orange-600 hover:to-red-700 shadow-lg hover:shadow-orange-500/50'
                   }`}
                 >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 17h8m0 0V9m0 8l-8-8-4 4-6-6" />
                   </svg>
-                  <span className="font-bold text-white text-base">선택매도</span>
+                  <span className="font-bold text-white" style={{ fontSize: '11px' }}>
+                    선택매도{selectedHoldingCodes.size > 0 ? ` (${selectedHoldingCodes.size})` : ''}
+                  </span>
                 </button>
                 <button
                   onClick={handleStop}
                   disabled={!isRunning}
-                  className={`px-4 py-2 rounded-full font-semibold text-sm flex items-center gap-2 transition-all duration-300 ${
+                  className={`px-2 py-0.5 rounded font-semibold flex items-center justify-center gap-1 transition-all duration-300 ${
                     !isRunning
                       ? 'bg-gray-500 cursor-not-allowed opacity-50'
                       : 'bg-gradient-to-r from-red-500 to-red-600 hover:from-red-600 hover:to-red-700 shadow-lg hover:shadow-red-500/50'
                   }`}
                 >
-                  <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
                     <path d="M6 6h12v12H6z" />
                   </svg>
-                  <span className="font-bold text-white text-base">정지</span>
+                  <span className="font-bold text-white" style={{ fontSize: '11px' }}>정지</span>
                 </button>
                 <button
                   onClick={handleRestart}
-                  className="px-4 py-2 rounded-full font-semibold text-sm flex items-center gap-2 bg-gradient-to-r from-purple-500 to-purple-600 hover:from-purple-600 hover:to-purple-700 shadow-lg hover:shadow-purple-500/50 transition-all duration-300"
+                  className="rounded font-semibold flex items-center justify-center gap-1 bg-gradient-to-r from-purple-500 to-purple-600 hover:from-purple-600 hover:to-purple-700 transition-all duration-300" style={{ padding: '3px 4px', fontSize: '11px' }}
                 >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                   </svg>
-                  <span className="font-bold text-white text-base">재시작</span>
+                  <span className="font-bold text-white" style={{ fontSize: '11px' }}>재시작</span>
                 </button>
                 <button
                   onClick={handleRefreshAccount}
                   disabled={!connected || !selectedAccount}
-                  className={`px-4 py-2 rounded-full font-semibold text-sm flex items-center gap-2 transition-all duration-300 ${
+                  className={`px-2 py-0.5 rounded font-semibold flex items-center justify-center gap-1 transition-all duration-300 ${
                     (!connected || !selectedAccount)
                       ? 'bg-gray-500 cursor-not-allowed opacity-50'
                       : 'btn-gradient-primary'
                   }`}
+                  style={{ gridColumn: '1 / -1' }}
                 >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                   </svg>
-                  <span className="font-bold text-white text-base">갱신</span>
+                  <span className="font-bold text-white" style={{ fontSize: '11px' }}>갱신</span>
                 </button>
               </div>
             </div>
 
             {/* 계좌 요약 */}
             <div
-              className="account-summary-section"
+              className="account-summary-section at-sec-account"
               style={{
-                padding: '12px',
+                padding: '2px 4px',
                 backgroundColor: theme === 'dark' ? '#1f2937' : '#f9fafb',
                 borderBottom: theme === 'dark' ? '1px solid #374151' : '1px solid #d1d5db',
                 flexShrink: 0
               }}
             >
-              <h3 style={{ fontSize: '12px', fontWeight: 600, marginBottom: '12px', color: theme === 'dark' ? '#f3f4f6' : '#111827', display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <h3 style={{ fontSize: '12px', fontWeight: 600, margin: '0 0 2px 0', color: theme === 'dark' ? '#f3f4f6' : '#111827', display: 'flex', alignItems: 'center', gap: '4px' }}>
                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
                 </svg>
@@ -6224,8 +7823,8 @@ const AutoTrading = () => {
                   ⚠️ {accountInfoData?.error || accountInfoError?.message || '계좌 정보 조회 중 오류가 발생했습니다.'}
                 </div>
               )}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '8px', fontSize: '10px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <div className="at-account-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2px 6px', fontSize: '10px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                   <label style={{ whiteSpace: 'nowrap', fontWeight: 500, color: theme === 'dark' ? '#d1d5db' : '#111827' }}>예수금:</label>
                   <input
                     type="text"
@@ -6233,118 +7832,93 @@ const AutoTrading = () => {
                     value={accountInfoData?.deposit ? Number(accountInfoData.deposit).toLocaleString() : '-'}
                     style={{
                       flex: 1,
-                      padding: '4px 6px',
+                      minWidth: 0,
+                      padding: '1px 4px',
                       border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
                       backgroundColor: theme === 'dark' ? '#374151' : 'white',
                       color: theme === 'dark' ? '#f3f4f6' : '#111827',
                       textAlign: 'right',
-                      fontSize: '11px'
+                      fontSize: '10px'
                     }}
                   />
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                   <label style={{ whiteSpace: 'nowrap', fontWeight: 500, color: theme === 'dark' ? '#d1d5db' : '#111827' }}>총매입금액:</label>
                   <input
                     type="text"
                     readOnly
-                    value={holdingStocks.reduce((sum, s) => sum + (s.purchasePrice * s.quantity), 0).toLocaleString()}
+                    value={accountTotals.totalPurchase.toLocaleString()}
                     style={{
                       flex: 1,
-                      padding: '4px 6px',
+                      minWidth: 0,
+                      padding: '1px 4px',
                       border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
                       backgroundColor: theme === 'dark' ? '#374151' : 'white',
                       color: theme === 'dark' ? '#f3f4f6' : '#111827',
                       textAlign: 'right',
-                      fontSize: '11px'
+                      fontSize: '10px'
                     }}
                   />
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                   <label style={{ whiteSpace: 'nowrap', fontWeight: 500, color: theme === 'dark' ? '#d1d5db' : '#111827' }}>총평가금액:</label>
                   <input
                     type="text"
                     readOnly
-                    value={(() => {
-                      const 총평가금액 = holdingStocks.reduce((sum, s) => sum + (s.currentPrice * s.quantity), 0)
-                      return holdingStocks.length > 0 
-                        ? 총평가금액.toLocaleString()
-                        : (accountInfoData?.totalAsset ? Number(accountInfoData.totalAsset).toLocaleString() : '0')
-                    })()}
+                    value={accountTotals.totalStockValue.toLocaleString()}
                     style={{
                       flex: 1,
-                      padding: '4px 6px',
+                      minWidth: 0,
+                      padding: '1px 4px',
                       border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
                       backgroundColor: theme === 'dark' ? '#374151' : 'white',
                       color: theme === 'dark' ? '#f3f4f6' : '#111827',
                       textAlign: 'right',
-                      fontSize: '11px'
+                      fontSize: '10px'
                     }}
                   />
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                   <label style={{ whiteSpace: 'nowrap', fontWeight: 500, color: theme === 'dark' ? '#d1d5db' : '#111827' }}>총평가손익:</label>
                   <input
                     type="text"
                     readOnly
-                    value={(() => {
-                      const 총평가손익 = holdingStocks.reduce((sum, s) => sum + s.profit, 0)
-                      return holdingStocks.length > 0
-                        ? 총평가손익.toLocaleString()
-                        : (accountInfoData?.totalProfit ? Number(accountInfoData.totalProfit).toLocaleString() : '0')
-                    })()}
+                    value={accountTotals.totalProfit.toLocaleString()}
                     style={{
                       flex: 1,
-                      padding: '4px 6px',
+                      minWidth: 0,
+                      padding: '1px 4px',
                       border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
                       backgroundColor: theme === 'dark' ? '#374151' : 'white',
                       textAlign: 'right',
-                      fontSize: '11px',
-                      color: (() => {
-                        const 총평가손익 = holdingStocks.length > 0
-                          ? holdingStocks.reduce((sum, s) => sum + s.profit, 0)
-                          : (accountInfoData?.totalProfit ? Number(accountInfoData.totalProfit) : 0)
-                        return 총평가손익 > 0 ? '#dc2626' :
-                               총평가손익 < 0 ? '#2563eb' : 
-                               (theme === 'dark' ? '#f3f4f6' : '#000')
-                      })()
+                      fontSize: '10px',
+                      color: accountTotals.totalProfit > 0 ? '#dc2626' :
+                             accountTotals.totalProfit < 0 ? '#2563eb' : 
+                             (theme === 'dark' ? '#f3f4f6' : '#000')
                     }}
                   />
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                   <label style={{ whiteSpace: 'nowrap', fontWeight: 500, color: theme === 'dark' ? '#d1d5db' : '#111827' }}>총수익률:</label>
                   <input
                     type="text"
                     readOnly
-                    value={(() => {
-                      const 총매입 = holdingStocks.reduce((sum, s) => sum + (s.purchasePrice * s.quantity), 0)
-                      const 총손익 = holdingStocks.reduce((sum, s) => sum + s.profit, 0)
-                      if (holdingStocks.length > 0 && 총매입 > 0) {
-                        return ((총손익 / 총매입) * 100).toFixed(2) + '%'
-                      }
-                      return accountInfoData?.totalProfitRate 
-                        ? Number(accountInfoData.totalProfitRate).toFixed(2) + '%' 
-                        : '0.00%'
-                    })()}
+                    value={accountTotals.totalProfitRate.toFixed(2) + '%'}
                     style={{
                       flex: 1,
-                      padding: '4px 6px',
+                      minWidth: 0,
+                      padding: '1px 4px',
                       border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
                       backgroundColor: theme === 'dark' ? '#374151' : 'white',
                       textAlign: 'right',
-                      fontSize: '11px',
-                      color: (() => {
-                        const 총매입 = holdingStocks.reduce((sum, s) => sum + (s.purchasePrice * s.quantity), 0)
-                        const 총손익 = holdingStocks.reduce((sum, s) => sum + s.profit, 0)
-                        const 수익률 = holdingStocks.length > 0 && 총매입 > 0
-                          ? ((총손익 / 총매입) * 100)
-                          : (accountInfoData?.totalProfitRate ? Number(accountInfoData.totalProfitRate) : 0)
-                        
-                        return 수익률 > 0 ? '#dc2626' : 수익률 < 0 ? '#2563eb' : (theme === 'dark' ? '#f3f4f6' : '#000')
-                      })()
+                      fontSize: '10px',
+                      color: accountTotals.totalProfitRate > 0 ? '#dc2626' :
+                             accountTotals.totalProfitRate < 0 ? '#2563eb' :
+                             (theme === 'dark' ? '#f3f4f6' : '#000')
                     }}
                   />
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                   <label style={{ whiteSpace: 'nowrap', fontWeight: 500, color: theme === 'dark' ? '#d1d5db' : '#111827' }}>오늘 실현손익:</label>
                   <input
                     type="text"
@@ -6356,11 +7930,12 @@ const AutoTrading = () => {
                       : '0원'}
                     style={{
                       flex: 1,
-                      padding: '4px 6px',
+                      minWidth: 0,
+                      padding: '1px 4px',
                       border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
                       backgroundColor: theme === 'dark' ? '#374151' : 'white',
                       textAlign: 'right',
-                      fontSize: '11px',
+                      fontSize: '10px',
                       fontWeight: 'bold',
                       color: todayTotalRealizedProfit > 0 ? '#dc2626' :
                              todayTotalRealizedProfit < 0 ? '#2563eb' : 
@@ -6368,20 +7943,37 @@ const AutoTrading = () => {
                     }}
                   />
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
                   <label style={{ whiteSpace: 'nowrap', fontWeight: 500, color: theme === 'dark' ? '#d1d5db' : '#111827' }}>보유종목:</label>
-                  <span style={{ fontWeight: 'bold', fontSize: '12px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{holdingStocks.length}개</span>
+                  <span style={{ fontWeight: 'bold', fontSize: '12px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{displayHoldingOrdersWithLive.length}개</span>
+                  {(() => {
+                    const blockedCount = displayHoldingOrdersWithLive.filter(
+                      o => o.sellableQuantity !== undefined && o.sellableQuantity <= 0
+                    ).length
+                    if (blockedCount === 0) return null
+                    return (
+                      <span
+                        style={{ marginLeft: '6px', fontSize: '10px', color: '#f59e0b', fontWeight: 'normal' }}
+                        title="미체결 매도 주문이 물량을 잡고 있습니다. '미체결취소' 후 매도하세요."
+                      >
+                        매도불가 {blockedCount}개
+                      </span>
+                    )
+                  })()}
                 </div>
               </div>
             </div>
 
-            {/* 주문 내역 */}
+            {/* 현재 보유 종목 (매수 체결 기준, 매도 내역 제외) */}
             <div 
+              className="at-sec-orders"
               style={{
                 minHeight: '200px',
                 borderBottom: theme === 'dark' ? '1px solid #374151' : '1px solid #d1d5db',
                 padding: '8px',
                 flexShrink: 0,
+                display: 'flex',
+                flexDirection: 'column',
                 backgroundColor: theme === 'dark' ? '#111827' : 'transparent'
               }}
             >
@@ -6395,35 +7987,66 @@ const AutoTrading = () => {
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                   </svg>
-                  주문 내역
+                  현재 보유 종목
                 </h3>
               </div>
-              <div style={{ overflowX: 'auto' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
+              <div className="at-order-table-wrap" style={{ overflowX: 'auto', overflowY: 'auto', flex: '1 1 auto', minHeight: 0 }}>
+                <table className="at-order-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '11px', tableLayout: 'fixed' }}>
+                  <colgroup>
+                    <col className="c-check" />
+                    <col className="c-name" />
+                    <col className="c-type" />
+                    <col className="c-qty" />
+                    <col className="c-price" />
+                    <col className="c-status" />
+                    <col className="c-cur" />
+                    <col className="c-profit" />
+                    <col className="c-action" />
+                    <col className="c-time" />
+                  </colgroup>
                   <thead>
                     <tr style={{ backgroundColor: theme === 'dark' ? '#374151' : '#f3f4f6' }}>
-                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'left', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827', width: '70px' }}>시간</th>
-                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'left', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>종목명</th>
-                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'center', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>구분</th>
-                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>수량</th>
-                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>가격</th>
-                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'center', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>상태</th>
-                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>현재가</th>
-                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>수익률</th>
-                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'center', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827', width: '60px' }}>매도</th>
+                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 4px', textAlign: 'center', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827', position: 'sticky', top: 0, zIndex: 2, backgroundColor: theme === 'dark' ? '#374151' : '#f3f4f6' }}>
+                        <input
+                          type="checkbox"
+                          aria-label="전체 선택"
+                          title="전체 선택"
+                          checked={displayHoldingOrdersWithLive.length > 0 && displayHoldingOrdersWithLive.every(o => selectedHoldingCodes.has(o.stockCode))}
+                          onChange={(e) => {
+                            // 헤더 클릭 → 전체 선택 / 전체 해제
+                            setSelectedHoldingCodes(e.target.checked
+                              ? new Set(displayHoldingOrdersWithLive.map(o => o.stockCode))
+                              : new Set())
+                          }}
+                          style={{ width: '13px', height: '13px', cursor: 'pointer' }}
+                        />
+                      </th>
+                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'left', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827', position: 'sticky', top: 0, zIndex: 2, backgroundColor: theme === 'dark' ? '#374151' : '#f3f4f6' }}>종목명</th>
+                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'center', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827', position: 'sticky', top: 0, zIndex: 2, backgroundColor: theme === 'dark' ? '#374151' : '#f3f4f6' }}>구분</th>
+                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827', position: 'sticky', top: 0, zIndex: 2, backgroundColor: theme === 'dark' ? '#374151' : '#f3f4f6' }}>수량</th>
+                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827', position: 'sticky', top: 0, zIndex: 2, backgroundColor: theme === 'dark' ? '#374151' : '#f3f4f6' }}>가격</th>
+                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'center', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827', position: 'sticky', top: 0, zIndex: 2, backgroundColor: theme === 'dark' ? '#374151' : '#f3f4f6' }}>상태</th>
+                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827', position: 'sticky', top: 0, zIndex: 2, backgroundColor: theme === 'dark' ? '#374151' : '#f3f4f6' }}>현재가</th>
+                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827', position: 'sticky', top: 0, zIndex: 2, backgroundColor: theme === 'dark' ? '#374151' : '#f3f4f6' }}>수익률</th>
+                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'center', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827', width: '60px', position: 'sticky', top: 0, zIndex: 2, backgroundColor: theme === 'dark' ? '#374151' : '#f3f4f6' }}>매도</th>
+                      <th style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'left', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827', position: 'sticky', top: 0, zIndex: 2, backgroundColor: theme === 'dark' ? '#374151' : '#f3f4f6' }}>시간</th>
                     </tr>
                   </thead>
                   <tbody>
                     {(() => {
-                      // 취소된 주문 제외 (구분이 '취소'인 주문 필터링)
-                      const filteredOrders = orderLogs.filter(order => 
-                        order.type !== 'cancel' && order.status !== '취소'
-                      )
+                      // 잔고 기준으로 필터링된 목록을 쓴다 (잔고 0주 종목은 표시하지 않음)
+                      const filteredOrders = displayHoldingOrdersWithLive
                       
                       return filteredOrders.length > 0 ? (
                         filteredOrders.map((order) => (
                           <tr
                             key={order.id} 
+                            onClick={(e) => {
+                              // 매도 버튼 클릭은 별도 처리
+                              if ((e.target as HTMLElement).closest('button')) return
+                              showChartForOrder(order)
+                            }}
+                            title={`${order.stockName} 차트 보기`}
                             style={{ cursor: 'pointer', backgroundColor: theme === 'dark' ? '#1f2937' : 'white' }}
                             onMouseEnter={(e) => {
                               e.currentTarget.style.backgroundColor = theme === 'dark' ? '#374151' : '#f9fafb'
@@ -6432,8 +8055,30 @@ const AutoTrading = () => {
                               e.currentTarget.style.backgroundColor = theme === 'dark' ? '#1f2937' : 'white'
                             }}
                           >
-                            <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{order.time}</td>
-                            <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{order.stockName}</td>
+                            <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 4px', textAlign: 'center' }}>
+                              <input
+                                type="checkbox"
+                                aria-label={`${order.stockName} 선택`}
+                                checked={selectedHoldingCodes.has(order.stockCode)}
+                                onChange={(e) => {
+                                  e.stopPropagation()
+                                  setSelectedHoldingCodes(prev => {
+                                    const next = new Set(prev)
+                                    if (e.target.checked) next.add(order.stockCode)
+                                    else next.delete(order.stockCode)
+                                    return next
+                                  })
+                                }}
+                                onClick={(e) => e.stopPropagation()}
+                                style={{ width: '13px', height: '13px', cursor: 'pointer' }}
+                              />
+                            </td>
+                            <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', color: theme === 'dark' ? '#f3f4f6' : '#111827', overflow: 'hidden', textOverflow: 'ellipsis' }} title={order.stockName}>
+                              {order.stockName}
+                              {order.count > 1 && (
+                                <span style={{ marginLeft: '4px', fontSize: '9px', color: theme === 'dark' ? '#fbbf24' : '#b45309' }}>×{order.count}</span>
+                              )}
+                            </td>
                             <td style={{ 
                               border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
                               padding: '4px 8px', 
@@ -6442,7 +8087,15 @@ const AutoTrading = () => {
                             }}>
                               {order.type === 'buy' ? '매수' : order.type === 'sell' ? '매도' : '취소'}
                             </td>
-                            <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{order.quantity.toLocaleString()}</td>
+                            <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>
+                              {order.quantity.toLocaleString()}
+                              {/* 매도가능수량이 보유수량보다 적으면 미체결 매도 주문이 물량을 잡고 있다 */}
+                              {order.sellableQuantity !== undefined && order.sellableQuantity < order.quantity && (
+                                <span style={{ display: 'block', fontSize: '9px', color: '#f59e0b' }} title="미체결 매도 주문이 잡아둔 수량을 제외한 주문 가능 수량">
+                                  매도가능 {order.sellableQuantity}
+                                </span>
+                              )}
+                            </td>
                             <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'right', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>
                               {order.isMarketOrder ? (
                                 <span>
@@ -6486,51 +8139,64 @@ const AutoTrading = () => {
                               textAlign: 'center' 
                             }}>
                               {order.type === 'buy' && (order.status === '체결' || order.status === '부분체결' || order.isExecuted) ? (
+                                (() => {
+                                  // 매도가능수량(잔고의 trde_able_qty)이 0이면 주문해도 800033으로 거부된다.
+                                  // 미체결 매도 주문이 물량을 잡고 있으므로 버튼을 막고 사유를 알린다.
+                                  const noSellable = order.sellableQuantity !== undefined && order.sellableQuantity <= 0
+                                  const disabled = !connected || !selectedAccount || noSellable
+                                  return (
                                 <button
                                   onClick={(e) => {
                                     e.stopPropagation()
                                     console.log(`[매도 버튼 클릭] ${order.stockName} (${order.stockCode})`)
                                     handleSellStock(order.stockCode, order.stockName)
                                   }}
-                                  disabled={!connected || !selectedAccount}
+                                  disabled={disabled}
+                                  title={noSellable
+                                    ? '매도가능수량이 0주입니다. 미체결 매도 주문을 먼저 취소하세요.'
+                                    : undefined}
                                   style={{
                                     padding: '2px 8px',
                                     fontSize: '10px',
                                     fontWeight: 'bold',
                                     color: 'white',
-                                    backgroundColor: !connected || !selectedAccount ? '#9ca3af' : '#dc2626',
+                                    backgroundColor: disabled ? '#9ca3af' : '#dc2626',
                                     border: 'none',
                                     borderRadius: '4px',
-                                    cursor: !connected || !selectedAccount ? 'not-allowed' : 'pointer',
-                                    opacity: !connected || !selectedAccount ? 0.5 : 1,
+                                    cursor: disabled ? 'not-allowed' : 'pointer',
+                                    opacity: disabled ? 0.5 : 1,
+                                    whiteSpace: 'nowrap',
                                   }}
                                   onMouseEnter={(e) => {
-                                    if (connected && selectedAccount) {
+                                    if (!disabled) {
                                       e.currentTarget.style.backgroundColor = '#b91c1c'
                                     }
                                   }}
                                   onMouseLeave={(e) => {
-                                    if (connected && selectedAccount) {
+                                    if (!disabled) {
                                       e.currentTarget.style.backgroundColor = '#dc2626'
                                     }
                                   }}
                                 >
-                                  매도
+                                  {noSellable ? '불가' : '매도'}
                                 </button>
+                                  )
+                                })()
                               ) : '-'}
                             </td>
+                            <td style={{ border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', padding: '4px 8px', textAlign: 'left', color: theme === 'dark' ? '#9ca3af' : '#6b7280' }}>{order.time}</td>
                           </tr>
                         ))
                       ) : (
                         <tr>
-                          <td colSpan={9} style={{ 
+                          <td colSpan={10} style={{ 
                             border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
                             padding: '16px', 
                             textAlign: 'center', 
                             color: theme === 'dark' ? '#9ca3af' : '#6b7280', 
                             backgroundColor: theme === 'dark' ? '#1f2937' : '#f9fafb' 
                           }}>
-                            주문 내역이 없습니다
+                            {balanceLoading ? '보유 종목을 불러오는 중...' : '보유 종목이 없습니다'}
                           </td>
                         </tr>
                       )
@@ -6540,9 +8206,12 @@ const AutoTrading = () => {
               </div>
             </div>
 
+            {/* 우측 패널 (PC 2열) - 모바일에서는 display:contents 로 기존 흐름 유지 */}
+            <div className="at-right-col">
             {/* 선택된 종목 */}
             {watchlistStocks.length > 0 && (
               <div 
+                className="at-sec-watchlist"
                 style={{
                   minHeight: '200px',
                   borderTop: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
@@ -6604,8 +8273,8 @@ const AutoTrading = () => {
                     전체 삭제
                   </button>
                 </div>
-                <div style={{ overflowX: 'auto' }}>
-                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
+                <div style={{ overflowX: 'auto', maxHeight: '260px', overflowY: 'auto' }}>
+                  <table className="at-watch-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px' }}>
                     <thead>
                       <tr style={{ backgroundColor: theme === 'dark' ? '#374151' : '#e5e7eb' }}>
                         <th style={{ 
@@ -6695,9 +8364,8 @@ const AutoTrading = () => {
                             whiteSpace: 'nowrap',
                             overflow: 'hidden',
                             textOverflow: 'ellipsis',
-                            maxWidth: '80px'
                           }}>
-                            ★ {stock.name.length > 5 ? stock.name.substring(0, 5) + '...' : stock.name}
+                            ★ {stock.name}
                           </td>
                           <td style={{ 
                             border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
@@ -6717,7 +8385,7 @@ const AutoTrading = () => {
                               : (theme === 'dark' ? '#d1d5db' : '#000'),
                             whiteSpace: 'nowrap'
                           }}>
-                            {stock.change > 0 ? '+' : ''}{stock.change.toLocaleString()}
+                            {stock.change > 0 ? '+' : ''}{Math.round(stock.change).toLocaleString()}
                           </td>
                           <td style={{ 
                             border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
@@ -6789,8 +8457,22 @@ const AutoTrading = () => {
             )}
 
             {/* 차트 영역 */}
-            {selectedStockForChart && (
+            {(() => {
+              if (!selectedStockForChart) return null
+              // 클릭 시점 스냅샷 대신 최신 시세를 사용한다.
+              // (selectedStockForChart는 WebSocket/폴링 갱신을 받지 않아 실시간 반영이 안 됐다)
+              const liveStock =
+                detectedStocks.find(s => s.code === selectedStockForChart.code) ||
+                watchlistStocks.find(s => s.code === selectedStockForChart.code) ||
+                (() => {
+                  const h = holdingStocks.find(x => x.code === selectedStockForChart.code)
+                  return h
+                    ? { ...selectedStockForChart, price: h.currentPrice, changePercent: h.profitPercent }
+                    : selectedStockForChart
+                })()
+              return (
               <div 
+                className="at-sec-chart"
                 style={{
                   border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
                   backgroundColor: theme === 'dark' ? '#1f2937' : 'white',
@@ -6813,14 +8495,14 @@ const AutoTrading = () => {
                       fontWeight: 600,
                       color: theme === 'dark' ? '#f3f4f6' : '#374151'
                     }}>
-                      {selectedStockForChart.name} ({selectedStockForChart.code}) 차트
+                      {liveStock.name} ({liveStock.code}) 차트
                     </h3>
                     <span style={{ 
                       fontSize: '11px', 
                       fontWeight: 'bold',
-                      backgroundImage: selectedStockForChart.changePercent > 0 
+                      backgroundImage: liveStock.changePercent > 0 
                         ? 'linear-gradient(135deg, #ef4444 0%, #dc2626 100%)'
-                        : selectedStockForChart.changePercent < 0 
+                        : liveStock.changePercent < 0 
                         ? 'linear-gradient(135deg, #3b82f6 0%, #2563eb 100%)'
                         : theme === 'dark'
                         ? 'linear-gradient(135deg, #9ca3af 0%, #6b7280 100%)'
@@ -6829,8 +8511,8 @@ const AutoTrading = () => {
                       WebkitTextFillColor: 'transparent',
                       backgroundClip: 'text'
                     }}>
-                      {selectedStockForChart.price.toLocaleString()}원 
-                      ({selectedStockForChart.changePercent > 0 ? '+' : ''}{selectedStockForChart.changePercent.toFixed(2)}%)
+                      {liveStock.price.toLocaleString()}원 
+                      ({liveStock.changePercent > 0 ? '+' : ''}{liveStock.changePercent.toFixed(2)}%)
                     </span>
                   </div>
                   <div style={{ display: 'flex', gap: '4px' }}>
@@ -6875,17 +8557,19 @@ const AutoTrading = () => {
                   </div>
                 </div>
                 <StockChart 
-                  code={selectedStockForChart.code} 
+                  code={liveStock.code} 
                   period={chartPeriod}
                   isConnected={connected}
-                  stockInfo={selectedStockForChart}
+                  stockInfo={liveStock}
                   isSelected={true} // 선택된 종목이므로 true
                 />
               </div>
-            )}
+              )
+            })()}
 
             {/* 검색된 종목 리스트 */}
             <div 
+              className="at-sec-detected"
               style={{
                 height: '400px',
                 borderBottom: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
@@ -6929,6 +8613,7 @@ const AutoTrading = () => {
               </div>
               <div 
                 ref={stocksScrollRef}
+                className="at-detected-scroll"
                 style={{ 
                   overflowX: 'auto', 
                   overflowY: 'auto',
@@ -6937,7 +8622,7 @@ const AutoTrading = () => {
                   minHeight: 0 // flexbox 스크롤을 위한 필수 설정
                 }}
               >
-                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '11px', lineHeight: '1.2', tableLayout: 'fixed' }}>
+                <table className="at-detected-table" style={{ width: '100%', minWidth: 'max-content', borderCollapse: 'collapse', fontSize: '11px', lineHeight: '1.2' }}>
                   <thead>
                     <tr style={{ backgroundColor: theme === 'dark' ? '#374151' : '#f3f4f6' }}>
                       <th style={{ 
@@ -6952,7 +8637,7 @@ const AutoTrading = () => {
                         WebkitTextFillColor: 'transparent',
                         backgroundClip: 'text',
                         color: theme === 'dark' ? '#f3f4f6' : '#111827',
-                        width: `${columnWidths.name}px`,
+                        minWidth: '300px',
                         position: 'relative',
                         userSelect: 'none'
                       }}>
@@ -7477,7 +9162,9 @@ const AutoTrading = () => {
                             }
                           }}
                         >
-                          <td style={{ 
+                          <td 
+                            className="at-col-name"
+                            style={{ 
                             border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
                             padding: '2px 6px',
                             color: theme === 'dark' 
@@ -7487,9 +9174,6 @@ const AutoTrading = () => {
                             fontWeight: isInWatchlist ? 'bold' : 'normal',
                             position: 'relative',
                             whiteSpace: 'nowrap',
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis',
-                            width: `${columnWidths.name}px`,
                             lineHeight: '1.2'
                           }}>
                             {isInWatchlist && (
@@ -7499,7 +9183,7 @@ const AutoTrading = () => {
                                 fontSize: '10px'
                               }}>★</span>
                             )}
-                            {stock.name.length > 5 ? stock.name.substring(0, 5) + '...' : stock.name}
+                            {stock.name}
                           </td>
                           <td style={{ 
                             border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
@@ -7523,7 +9207,7 @@ const AutoTrading = () => {
                             lineHeight: '1.2',
                             width: `${columnWidths.change}px`
                           }}>
-                            {stock.change > 0 ? '+' : ''}{stock.change.toLocaleString()}
+                            {stock.change > 0 ? '+' : ''}{Math.round(stock.change).toLocaleString()}
                           </td>
                           <td style={{ 
                             border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
@@ -7546,7 +9230,11 @@ const AutoTrading = () => {
                             fontSize: '13px',
                             lineHeight: '1.2',
                             width: `${columnWidths.openPercent}px`
-                          }}>-</td>
+                          }}>{(() => {
+                            const prevClose = stock.prevClose || (stock.price - stock.change)
+                            const v = pricePercentFromPrevClose(stock.openPrice, prevClose)
+                            return v === null ? '-' : `${v > 0 ? '+' : ''}${v.toFixed(2)}%`
+                          })()}</td>
                           <td style={{ 
                             border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
                             padding: '2px 6px', 
@@ -7555,7 +9243,11 @@ const AutoTrading = () => {
                             fontSize: '13px',
                             lineHeight: '1.2',
                             width: `${columnWidths.highPercent}px`
-                          }}>-</td>
+                          }}>{(() => {
+                            const prevClose = stock.prevClose || (stock.price - stock.change)
+                            const v = pricePercentFromPrevClose(stock.highPrice, prevClose)
+                            return v === null ? '-' : `${v > 0 ? '+' : ''}${v.toFixed(2)}%`
+                          })()}</td>
                           <td style={{ 
                             border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db', 
                             padding: '2px 6px', 
@@ -7648,8 +9340,83 @@ const AutoTrading = () => {
                 </table>
               </div>
             </div>
+            </div>
+
+            {/* 로그 (좌측 사이드 하단) - at-right-col과 형제 */}
+
+            {/* 하단 로그 영역 */}
+            {showLogSection && (
+              <div 
+                className="at-log"
+                style={{
+                  backgroundColor: '#111827',
+                  color: '#4ade80',
+                  borderTop: '2px solid #374151',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  flexShrink: 0
+                }}
+              >
+                <div 
+                  style={{
+                    padding: '5px',
+                    backgroundColor: '#1f2937',
+                    borderBottom: '1px solid #374151',
+                    width: '100%',
+                    display: 'flex',
+                    flexFlow: 'row',
+                    userSelect: 'none'
+                  }}
+                >
+                  <span style={{ 
+                    fontSize: '14px', 
+                    fontWeight: 500,
+                    display: 'flex',
+                    justifyContent: 'center',
+                    alignItems: 'center',
+                    fontFamily: '"Segoe UI Emoji"',
+                    textAlign: 'center',
+                    paddingLeft: '20px',
+                    paddingRight: '20px',
+                    marginLeft: '20px',
+                    marginRight: '20px'
+                  }}>로그</span>
+                </div>
+                <div
+                  ref={logContainerRef}
+                  style={{
+                    flex: 1,
+                    overflowY: 'auto',
+                    padding: '5px',
+                    fontFamily: 'Consolas, monospace',
+                    fontSize: '12px',
+                    width: '100%'
+                  }}
+                >
+                {logs.length > 0 ? (
+                  logs.map((log) => (
+                    <div
+                      key={log.id}
+                      className={`${
+                        log.level === 'error' ? 'text-red-400' :
+                        log.level === 'warning' ? 'text-yellow-400' :
+                        log.level === 'success' ? 'text-green-400' :
+                        'text-gray-300'
+                      }`}
+                      style={{ width: '100%', padding: '2px 0' }}
+                    >
+                      <span className="text-gray-500">[{log.time}]</span> {log.message}
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-gray-500">로그가 없습니다</div>
+                )}
+              </div>
+            </div>
+            )}
           </div>
         )}
+
 
         {activeTab === 'conditions' && (
           <div 
@@ -7660,9 +9427,9 @@ const AutoTrading = () => {
               backgroundColor: theme === 'dark' ? '#111827' : '#f0f0f0'
             }}
           >
-            <div style={{ maxWidth: '100%', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+            <div className="at-conditions-grid">
               {/* 조건검색식 - 매수후보 탐색 (웹 기반 자체 조건식) */}
-              <div style={{ 
+              <div className="at-span2" style={{ 
                 border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999', 
                 backgroundColor: theme === 'dark' ? '#1f2937' : 'white', 
                 padding: '8px',
@@ -7681,8 +9448,10 @@ const AutoTrading = () => {
                 }}>
                   조건검색식 - 매수후보 탐색 <span style={{ fontSize: '10px', color: theme === 'dark' ? '#9ca3af' : '#6b7280', fontWeight: 'normal' }}>(웹 기반)</span>
                 </h4>
+                <div className="at-cond-body">
+                <div className="at-cond-main">
                 {conditions.length > 0 ? (
-                  <div style={{ marginBottom: '8px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px' }}>
+                  <div className="at-cond-list" style={{ marginBottom: '8px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px' }}>
                     {conditions.map((condition) => (
                       <label 
                         key={condition.id} 
@@ -7790,14 +9559,19 @@ const AutoTrading = () => {
                             code: stock.code,
                             name: stock.name,
                             price: stock.price,
-                            change: stock.price * (stock.changeRate / 100),
+                            change: changeFromRate(stock.price, stock.changeRate),
                             changePercent: stock.changeRate,
                             volume: stock.volume,
+                            openPrice: stock.openPrice,
+                            highPrice: stock.highPrice,
                             detectedCondition: result.appliedConditions.join(', '),
                             detectedTime: new Date().toLocaleTimeString(),
                           }))
                           
-                          setDetectedStocks(newStocks)
+                          applyConditionResults(newStocks)
+                          
+                          // 시가/고가 즉시 보강 (순위정보에는 없는 값)
+                          enrichOpenHigh(newStocks.map(s => s.code))
                           
                           // 선택된 종목도 업데이트
                           if (watchlistStocks.length > 0) {
@@ -7858,7 +9632,250 @@ const AutoTrading = () => {
                     초기화
                   </button>
                 </div>
-                
+                </div>
+
+                {/* 종목 직접 추가 (수동) — PC에서는 조건식 우측에 배치 */}
+                <div className="at-cond-manual" style={{
+                  marginTop: '8px',
+                  paddingTop: '8px',
+                  borderTop: theme === 'dark' ? '1px solid #4b5563' : '1px solid #e5e7eb'
+                }}>
+                  <div style={{ fontSize: '11px', fontWeight: 600, marginBottom: '4px', color: theme === 'dark' ? '#d1d5db' : '#374151' }}>
+                    종목 직접 추가
+                  </div>
+                  <div style={{ display: 'flex', gap: '4px', marginBottom: '6px' }}>
+                    <input
+                      type="text"
+                      value={manualKeyword}
+                      onChange={(e) => setManualKeyword(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleManualSearch()
+                      }}
+                      placeholder="종목명 또는 종목코드"
+                      style={{
+                        flex: 1,
+                        minWidth: 0,
+                        padding: '4px 8px',
+                        fontSize: '12px',
+                        border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
+                        borderRadius: '6px',
+                        backgroundColor: theme === 'dark' ? '#374151' : 'white',
+                        color: theme === 'dark' ? '#f3f4f6' : '#111827'
+                      }}
+                    />
+                    <button
+                      onClick={handleManualSearch}
+                      disabled={isManualSearching || !manualKeyword.trim()}
+                      style={{
+                        padding: '4px 10px',
+                        fontSize: '12px',
+                        color: 'white',
+                        backgroundColor: isManualSearching || !manualKeyword.trim() ? '#9ca3af' : '#2563eb',
+                        border: 'none',
+                        borderRadius: '6px',
+                        cursor: isManualSearching || !manualKeyword.trim() ? 'not-allowed' : 'pointer',
+                        flexShrink: 0
+                      }}
+                    >
+                      {isManualSearching ? '검색중' : '검색'}
+                    </button>
+                    <button
+                      onClick={handleManualAdd}
+                      disabled={manualSelectedCodes.size === 0}
+                      style={{
+                        padding: '4px 10px',
+                        fontSize: '12px',
+                        color: 'white',
+                        backgroundColor: manualSelectedCodes.size === 0 ? '#9ca3af' : '#16a34a',
+                        border: 'none',
+                        borderRadius: '6px',
+                        cursor: manualSelectedCodes.size === 0 ? 'not-allowed' : 'pointer',
+                        flexShrink: 0,
+                        whiteSpace: 'nowrap'
+                      }}
+                    >
+                      선택종목 추가 ({manualSelectedCodes.size})
+                    </button>
+                  </div>
+
+                  {manualResults.length > 0 && (
+                    <div style={{
+                      maxHeight: '180px',
+                      overflowY: 'auto',
+                      border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #d1d5db',
+                      borderRadius: '6px'
+                    }}>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '11px' }}>
+                        <thead>
+                          <tr style={{ backgroundColor: theme === 'dark' ? '#374151' : '#f3f4f6' }}>
+                            <th style={{ padding: '3px 4px', width: '28px' }}>
+                              <input
+                                type="checkbox"
+                                aria-label="전체 선택"
+                                checked={manualResults.length > 0 && manualResults.every(s => manualSelectedCodes.has(s.code))}
+                                onChange={(e) => setManualSelectedCodes(e.target.checked ? new Set(manualResults.map(s => s.code)) : new Set())}
+                                style={{ width: '13px', height: '13px', cursor: 'pointer' }}
+                              />
+                            </th>
+                            <th style={{ padding: '3px 4px', textAlign: 'left', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>종목코드</th>
+                            <th style={{ padding: '3px 4px', textAlign: 'left', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>종목명</th>
+                            <th style={{ padding: '3px 4px', width: '44px', fontWeight: 'normal', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>상태</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {manualResults.map((stock) => {
+                            const checked = manualSelectedCodes.has(stock.code)
+                            const addedStock = detectedStocks.find(s => s.code === stock.code)
+                            return (
+                              <tr
+                                key={stock.code}
+                                onClick={() => {
+                                  if (addedStock) return
+                                  setManualSelectedCodes(prev => {
+                                    const next = new Set(prev)
+                                    if (next.has(stock.code)) next.delete(stock.code)
+                                    else next.add(stock.code)
+                                    return next
+                                  })
+                                }}
+                                style={{
+                                  cursor: addedStock ? 'default' : 'pointer',
+                                  opacity: addedStock ? 0.7 : 1,
+                                  backgroundColor: addedStock
+                                    ? (theme === 'dark' ? '#3f2d0f' : '#fef3c7')
+                                    : checked
+                                      ? (theme === 'dark' ? '#064e3b' : '#f0fdf4')
+                                      : (theme === 'dark' ? '#1f2937' : 'white')
+                                }}
+                              >
+                                <td style={{ padding: '3px 4px', textAlign: 'center' }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={addedStock ? false : checked}
+                                    disabled={!!addedStock}
+                                    onChange={() => {}}
+                                    onClick={(e) => e.stopPropagation()}
+                                    style={{ width: '13px', height: '13px', cursor: addedStock ? 'default' : 'pointer' }}
+                                  />
+                                </td>
+                                <td style={{ padding: '3px 4px', color: theme === 'dark' ? '#9ca3af' : '#6b7280' }}>{stock.code}</td>
+                                <td style={{ padding: '3px 4px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{stock.name}</td>
+                                <td style={{ padding: '3px 4px', textAlign: 'center' }}>
+                                  {addedStock ? (
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        handleManualRemove(stock.code, stock.name)
+                                      }}
+                                      title="선택 해제"
+                                      style={{
+                                        padding: '1px 5px',
+                                        fontSize: '10px',
+                                        color: 'white',
+                                        backgroundColor: '#dc2626',
+                                        border: 'none',
+                                        borderRadius: '4px',
+                                        cursor: 'pointer',
+                                        whiteSpace: 'nowrap'
+                                      }}
+                                    >
+                                      추가됨 ✕
+                                    </button>
+                                  ) : (
+                                    <span style={{ fontSize: '10px', color: theme === 'dark' ? '#6b7280' : '#9ca3af' }}>-</span>
+                                  )}
+                                </td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  {/* 추가된 종목 목록 */}
+                  {(() => {
+                    const manualAdded = detectedStocks.filter(s => s.detectedCondition === '수동추가')
+                    return (
+                      <div style={{ marginTop: '6px' }}>
+                        <div style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'space-between',
+                          fontSize: '11px',
+                          fontWeight: 600,
+                          marginBottom: '4px',
+                          color: theme === 'dark' ? '#d1d5db' : '#374151'
+                        }}>
+                          <span>추가된 종목 ({manualAdded.length}개)</span>
+                          {manualAdded.length > 0 && (
+                            <button
+                              onClick={() => {
+                                setDetectedStocks(prev => prev.filter(s => s.detectedCondition !== '수동추가'))
+                                setManualSelectedCodes(new Set())
+                                addLog('수동 추가 종목 전체 해제', 'info')
+                              }}
+                              style={{
+                                padding: '1px 8px',
+                                fontSize: '10px',
+                                color: 'white',
+                                backgroundColor: theme === 'dark' ? '#4b5563' : '#6b7280',
+                                border: 'none',
+                                borderRadius: '4px',
+                                cursor: 'pointer'
+                              }}
+                            >
+                              전체 해제
+                            </button>
+                          )}
+                        </div>
+                        {manualAdded.length === 0 ? (
+                          <div style={{ fontSize: '10px', color: theme === 'dark' ? '#6b7280' : '#9ca3af', padding: '2px 0' }}>
+                            추가된 종목이 없습니다
+                          </div>
+                        ) : (
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px' }}>
+                            {manualAdded.map((s) => (
+                              <span
+                                key={s.code}
+                                style={{
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: '4px',
+                                  padding: '2px 6px',
+                                  fontSize: '11px',
+                                  borderRadius: '12px',
+                                  border: theme === 'dark' ? '1px solid #92400e' : '1px solid #fbbf24',
+                                  backgroundColor: theme === 'dark' ? '#78350f' : '#fef3c7',
+                                  color: theme === 'dark' ? '#fde68a' : '#92400e'
+                                }}
+                              >
+                                {s.name}
+                                <button
+                                  onClick={() => handleManualRemove(s.code, s.name)}
+                                  title="선택 해제"
+                                  style={{
+                                    background: 'none',
+                                    border: 'none',
+                                    color: 'inherit',
+                                    cursor: 'pointer',
+                                    fontSize: '12px',
+                                    lineHeight: 1,
+                                    padding: 0,
+                                    fontWeight: 'bold'
+                                  }}
+                                >
+                                  ✕
+                                </button>
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })()}
+                </div>
+
                 <div style={{ 
                   fontSize: '10px', 
                   color: theme === 'dark' ? '#9ca3af' : '#666', 
@@ -7868,11 +9885,13 @@ const AutoTrading = () => {
                   <div>✓ 체크한 조건식에 맞는 종목만 검색됩니다</div>
                   <div>✓ 여러 조건식을 동시에 선택할 수 있습니다</div>
                   <div>✓ 검색 결과는 "주문시작" 탭의 "검색된 종목"에 표시됩니다</div>
+                  <div>✓ 조건식에 없는 종목은 "종목 직접 추가"로 넣을 수 있습니다</div>
+                </div>
                 </div>
               </div>
 
               {/* 사용자수식 */}
-              <div style={{ 
+              <div className="at-span2" style={{ 
                 border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999', 
                 backgroundColor: theme === 'dark' ? '#1f2937' : 'white', 
                 padding: '8px',
@@ -7892,8 +9911,10 @@ const AutoTrading = () => {
                   사용자수식
                 </h4>
                 
+                {/* 매수/매도 조건 — PC에서는 2열 */}
+                <div className="at-formula-grid">
                 {/* 매수조건 체크박스 */}
-                <div style={{ marginBottom: '12px' }}>
+                <div style={{ marginBottom: '0' }}>
                   <div style={{ 
                     fontSize: '11px', 
                     fontWeight: 500, 
@@ -7909,30 +9930,6 @@ const AutoTrading = () => {
                     매수조건:
                   </div>
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', marginLeft: '8px' }}>
-                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', cursor: 'pointer' }}>
-                      <input
-                        type="checkbox"
-                        checked={buyFormula1}
-                        onChange={(e) => {
-                          setBuyFormula1(e.target.checked)
-                          if (e.target.checked && buyFormula2) {
-                            setBuyFormula2(false) // 하나만 선택 가능
-                          }
-                        }}
-                        style={{ width: '14px', height: '14px', cursor: 'pointer', borderRadius: '3px' }}
-                      />
-                      <span style={{
-                        backgroundImage: buyFormula1 
-                          ? 'linear-gradient(135deg, #a855f7 0%, #ec4899 100%)'
-                          : (theme === 'dark' 
-                            ? 'linear-gradient(135deg, #9ca3af 0%, #6b7280 100%)'
-                            : 'linear-gradient(135deg, #6b7280 0%, #4b5563 100%)'),
-                        WebkitBackgroundClip: 'text',
-                        WebkitTextFillColor: 'transparent',
-                        backgroundClip: 'text',
-                        color: theme === 'dark' ? '#9ca3af' : '#6b7280'
-                      }}>My 매수수식 1 (기본 매수 조건: MA5/MA20 상승, 연속상승봉)</span>
-                    </label>
                     <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', cursor: 'pointer' }}>
                       <input
                         type="checkbox"
@@ -7957,11 +9954,35 @@ const AutoTrading = () => {
                         color: theme === 'dark' ? '#9ca3af' : '#6b7280'
                       }}>My 매수수식 2 (고급 매수 조건: 장시작급등주, 볼린저밴드, 스캘핑, 돌파매수, 장마감종가배팅)</span>
                     </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', cursor: 'pointer' }}>
+                      <input
+                        type="checkbox"
+                        checked={buyFormula1}
+                        onChange={(e) => {
+                          setBuyFormula1(e.target.checked)
+                          if (e.target.checked && buyFormula2) {
+                            setBuyFormula2(false) // 하나만 선택 가능
+                          }
+                        }}
+                        style={{ width: '14px', height: '14px', cursor: 'pointer', borderRadius: '3px' }}
+                      />
+                      <span style={{
+                        backgroundImage: buyFormula1 
+                          ? 'linear-gradient(135deg, #a855f7 0%, #ec4899 100%)'
+                          : (theme === 'dark' 
+                            ? 'linear-gradient(135deg, #9ca3af 0%, #6b7280 100%)'
+                            : 'linear-gradient(135deg, #6b7280 0%, #4b5563 100%)'),
+                        WebkitBackgroundClip: 'text',
+                        WebkitTextFillColor: 'transparent',
+                        backgroundClip: 'text',
+                        color: theme === 'dark' ? '#9ca3af' : '#6b7280'
+                      }}>My 매수수식 1 (기본 매수 조건: MA5/MA20 상승, 연속상승봉)</span>
+                    </label>
                   </div>
                 </div>
 
                 {/* 매도조건 체크박스 */}
-                <div style={{ marginBottom: '8px' }}>
+                <div style={{ marginBottom: '0' }}>
                   <div style={{ 
                     fontSize: '11px', 
                     fontWeight: 500, 
@@ -8027,9 +10048,12 @@ const AutoTrading = () => {
                     </label>
                   </div>
                 </div>
+                </div>
               </div>
               
 
+              {/* PC: 아래 카드들은 다단(masonry) 배치, 모바일은 세로 1열 */}
+              <div className="at-conditions-cards">
               {/* 매매조건 입력 */}
               <div style={{ 
                 border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999', 
@@ -8478,236 +10502,69 @@ const AutoTrading = () => {
                   WebkitTextFillColor: 'transparent',
                   backgroundClip: 'text'
                 }}>매매시간 설정</h4>
-                <div style={{ marginBottom: '6px', fontSize: '11px', display: 'flex', flexWrap: 'wrap', gap: '4px', alignItems: 'center' }}>
-                  <span style={{
-                    background: theme === 'dark' 
-                      ? 'linear-gradient(135deg, #f3f4f6 0%, #d1d5db 100%)'
-                      : 'linear-gradient(135deg, #111827 0%, #374151 100%)',
-                    WebkitBackgroundClip: 'text',
-                    WebkitTextFillColor: 'transparent',
-                    backgroundClip: 'text',
-                    color: theme === 'dark' ? '#f3f4f6' : '#111827'
-                  }}>시작:</span>
-                  <input
-                    type="number"
-                    value={startHour}
-                    onChange={(e) => setStartHour(Number(e.target.value))}
-                    style={{ 
-                      width: '35px', 
-                      padding: '2px 3px', 
-                      border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999', 
-                      backgroundColor: theme === 'dark' ? '#374151' : 'white',
-                      color: theme === 'dark' ? '#f3f4f6' : '#111827',
-                      textAlign: 'center', 
-                      fontSize: '11px',
-                      borderRadius: '8px'
-                    }}
-                  />
-                  <span style={{
-                    background: theme === 'dark' 
-                      ? 'linear-gradient(135deg, #f3f4f6 0%, #d1d5db 100%)'
-                      : 'linear-gradient(135deg, #111827 0%, #374151 100%)',
-                    WebkitBackgroundClip: 'text',
-                    WebkitTextFillColor: 'transparent',
-                    backgroundClip: 'text',
-                    color: theme === 'dark' ? '#f3f4f6' : '#111827'
-                  }}>시</span>
-                  <input
-                    type="number"
-                    value={startMinute}
-                    onChange={(e) => setStartMinute(Number(e.target.value))}
-                    style={{ 
-                      width: '35px', 
-                      padding: '2px 3px', 
-                      border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999',
-                      backgroundColor: theme === 'dark' ? '#374151' : 'white',
-                      color: theme === 'dark' ? '#f3f4f6' : '#111827',
-                      textAlign: 'center', 
-                      fontSize: '11px',
-                      borderRadius: '8px'
-                    }}
-                  />
-                  <span style={{
-                    background: theme === 'dark' 
-                      ? 'linear-gradient(135deg, #f3f4f6 0%, #d1d5db 100%)'
-                      : 'linear-gradient(135deg, #111827 0%, #374151 100%)',
-                    WebkitBackgroundClip: 'text',
-                    WebkitTextFillColor: 'transparent',
-                    backgroundClip: 'text',
-                    color: theme === 'dark' ? '#f3f4f6' : '#111827'
-                  }}>분</span>
-                  <span style={{ 
-                    marginLeft: '4px',
-                    background: theme === 'dark' 
-                      ? 'linear-gradient(135deg, #f3f4f6 0%, #d1d5db 100%)'
-                      : 'linear-gradient(135deg, #111827 0%, #374151 100%)',
-                    WebkitBackgroundClip: 'text',
-                    WebkitTextFillColor: 'transparent',
-                    backgroundClip: 'text',
-                    color: theme === 'dark' ? '#f3f4f6' : '#111827'
-                  }}>~ 종료:</span>
-                  <input
-                    type="number"
-                    value={endHour}
-                    onChange={(e) => setEndHour(Number(e.target.value))}
-                    style={{ 
-                      width: '35px', 
-                      padding: '2px 3px', 
-                      border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999',
-                      backgroundColor: theme === 'dark' ? '#374151' : 'white',
-                      color: theme === 'dark' ? '#f3f4f6' : '#111827',
-                      textAlign: 'center', 
-                      fontSize: '11px',
-                      borderRadius: '8px'
-                    }}
-                  />
-                  <span style={{
-                    background: theme === 'dark' 
-                      ? 'linear-gradient(135deg, #f3f4f6 0%, #d1d5db 100%)'
-                      : 'linear-gradient(135deg, #111827 0%, #374151 100%)',
-                    WebkitBackgroundClip: 'text',
-                    WebkitTextFillColor: 'transparent',
-                    backgroundClip: 'text',
-                    color: theme === 'dark' ? '#f3f4f6' : '#111827'
-                  }}>시</span>
-                  <input
-                    type="number"
-                    value={endMinute}
-                    onChange={(e) => setEndMinute(Number(e.target.value))}
-                    style={{ 
-                      width: '35px', 
-                      padding: '2px 3px', 
-                      border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999',
-                      backgroundColor: theme === 'dark' ? '#374151' : 'white',
-                      color: theme === 'dark' ? '#f3f4f6' : '#111827',
-                      textAlign: 'center', 
-                      fontSize: '11px',
-                      borderRadius: '8px'
-                    }}
-                  />
-                  <span style={{
-                    background: theme === 'dark' 
-                      ? 'linear-gradient(135deg, #f3f4f6 0%, #d1d5db 100%)'
-                      : 'linear-gradient(135deg, #111827 0%, #374151 100%)',
-                    WebkitBackgroundClip: 'text',
-                    WebkitTextFillColor: 'transparent',
-                    backgroundClip: 'text',
-                    color: theme === 'dark' ? '#f3f4f6' : '#111827'
-                  }}>분</span>
-                  <input
-                    type="number"
-                    value={endSecond}
-                    onChange={(e) => setEndSecond(Number(e.target.value))}
-                    style={{ 
-                      width: '35px', 
-                      padding: '2px 3px', 
-                      border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999',
-                      backgroundColor: theme === 'dark' ? '#374151' : 'white',
-                      color: theme === 'dark' ? '#f3f4f6' : '#111827',
-                      textAlign: 'center', 
-                      fontSize: '11px',
-                      borderRadius: '8px'
-                    }}
-                  />
-                  <span style={{
-                    background: theme === 'dark' 
-                      ? 'linear-gradient(135deg, #f3f4f6 0%, #d1d5db 100%)'
-                      : 'linear-gradient(135deg, #111827 0%, #374151 100%)',
-                    WebkitBackgroundClip: 'text',
-                    WebkitTextFillColor: 'transparent',
-                    backgroundClip: 'text',
-                    color: theme === 'dark' ? '#f3f4f6' : '#111827'
-                  }}>초 전</span>
+                <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: '4px', fontSize: '11px', marginBottom: '6px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>
+                  <span>시작:</span>
+                  <Hms h={startHour} m={startMinute} onH={setStartHour} onM={setStartMinute} theme={theme} />
+                  <span style={{ marginLeft: '4px' }}>~ 종료:</span>
+                  <Hms h={endHour} m={endMinute} s={endSecond} onH={setEndHour} onM={setEndMinute} onS={setEndSecond} theme={theme} />
                 </div>
-                <div style={{ marginBottom: '6px' }}>
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px' }}>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', marginBottom: '4px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>
+                  <input
+                    type="checkbox"
+                    checked={dropSellTime}
+                    onChange={(e) => setDropSellTime(e.target.checked)}
+                    style={{ width: '16px', height: '16px', borderRadius: '3px' }}
+                  />
+                  목표시간 도달시 보유종목 전량매도
+                </label>
+                <div style={{ marginLeft: '22px', marginBottom: '6px' }}>
+                  <Hms h={dropSellStartHour} m={dropSellStartMinute} s={dropSellEndSecond} onH={setDropSellStartHour} onM={setDropSellStartMinute} onS={setDropSellEndSecond} theme={theme} disabled={!dropSellTime} />
+                </div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', marginBottom: '4px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>
+                  <input
+                    type="checkbox"
+                    checked={pauseBuyEnabled}
+                    onChange={(e) => setPauseBuyEnabled(e.target.checked)}
+                    style={{ width: '16px', height: '16px', borderRadius: '3px' }}
+                  />
+                  시간대정지 (매수만 중단, 매도는 계속)
+                </label>
+                <div style={{ marginLeft: '22px', marginBottom: '6px', display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
+                  <Hms h={pauseStartHour} m={pauseStartMinute} onH={setPauseStartHour} onM={setPauseStartMinute} theme={theme} disabled={!pauseBuyEnabled} />
+                  <span style={{ fontSize: '11px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>~</span>
+                  <Hms h={pauseEndHour} m={pauseEndMinute} onH={setPauseEndHour} onM={setPauseEndMinute} theme={theme} disabled={!pauseBuyEnabled} />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '11px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>
                     <input
                       type="checkbox"
-                      checked={dropSellTime}
-                      onChange={(e) => setDropSellTime(e.target.checked)}
+                      checked={buyStopped}
+                      onChange={(e) => { setBuyStopped(e.target.checked); addLog(e.target.checked ? '즉시 매수정지 적용 (매도는 계속)' : '즉시 매수정지 해제', 'warning') }}
                       style={{ width: '16px', height: '16px', borderRadius: '3px' }}
                     />
-                    <span style={{
-                      background: theme === 'dark' 
-                        ? 'linear-gradient(135deg, #f3f4f6 0%, #d1d5db 100%)'
-                        : 'linear-gradient(135deg, #111827 0%, #374151 100%)',
-                      WebkitBackgroundClip: 'text',
-                      WebkitTextFillColor: 'transparent',
-                      backgroundClip: 'text',
-                      color: theme === 'dark' ? '#f3f4f6' : '#111827'
-                    }}>옵토시간 드랍시 보유종목 지정판도</span>
+                    즉시 매수정지 (매도는 계속)
                   </label>
+                  <button
+                    onClick={() => { setBuyStopped(false); addLog('매수 재개', 'success') }}
+                    disabled={!buyStopped}
+                    style={{
+                      padding: '3px 10px',
+                      backgroundColor: buyStopped ? '#16a34a' : (theme === 'dark' ? '#4b5563' : '#d1d5db'),
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '8px',
+                      cursor: buyStopped ? 'pointer' : 'not-allowed',
+                      fontSize: '11px',
+                      fontWeight: 600
+                    }}
+                  >
+                    매수 재개
+                  </button>
                 </div>
-                <div style={{ fontSize: '12px', marginLeft: '24px' }}>
-                  <input
-                    type="number"
-                    value={dropSellStartHour}
-                    onChange={(e) => setDropSellStartHour(Number(e.target.value))}
-                    style={{ 
-                      width: '40px', 
-                      padding: '2px 4px', 
-                      border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999',
-                      backgroundColor: theme === 'dark' ? '#374151' : 'white',
-                      color: theme === 'dark' ? '#f3f4f6' : '#111827',
-                      textAlign: 'center',
-                      borderRadius: '8px'
-                    }}
-                  />
-                  <span style={{
-                    background: theme === 'dark' 
-                      ? 'linear-gradient(135deg, #f3f4f6 0%, #d1d5db 100%)'
-                      : 'linear-gradient(135deg, #111827 0%, #374151 100%)',
-                    WebkitBackgroundClip: 'text',
-                    WebkitTextFillColor: 'transparent',
-                    backgroundClip: 'text',
-                    color: theme === 'dark' ? '#f3f4f6' : '#111827'
-                  }}> 시 </span>
-                  <input
-                    type="number"
-                    value={dropSellStartMinute}
-                    onChange={(e) => setDropSellStartMinute(Number(e.target.value))}
-                    style={{ 
-                      width: '40px', 
-                      padding: '2px 4px', 
-                      border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999',
-                      backgroundColor: theme === 'dark' ? '#374151' : 'white',
-                      color: theme === 'dark' ? '#f3f4f6' : '#111827',
-                      textAlign: 'center',
-                      borderRadius: '8px'
-                    }}
-                  />
-                  <span style={{
-                    background: theme === 'dark' 
-                      ? 'linear-gradient(135deg, #f3f4f6 0%, #d1d5db 100%)'
-                      : 'linear-gradient(135deg, #111827 0%, #374151 100%)',
-                    WebkitBackgroundClip: 'text',
-                    WebkitTextFillColor: 'transparent',
-                    backgroundClip: 'text',
-                    color: theme === 'dark' ? '#f3f4f6' : '#111827'
-                  }}> 분 ~ </span>
-                  <input
-                    type="number"
-                    value={dropSellEndSecond}
-                    onChange={(e) => setDropSellEndSecond(Number(e.target.value))}
-                    style={{ 
-                      width: '40px', 
-                      padding: '2px 4px', 
-                      border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999',
-                      backgroundColor: theme === 'dark' ? '#374151' : 'white',
-                      color: theme === 'dark' ? '#f3f4f6' : '#111827',
-                      textAlign: 'center',
-                      borderRadius: '8px'
-                    }}
-                  />
-                  <span style={{
-                    background: theme === 'dark' 
-                      ? 'linear-gradient(135deg, #f3f4f6 0%, #d1d5db 100%)'
-                      : 'linear-gradient(135deg, #111827 0%, #374151 100%)',
-                    WebkitBackgroundClip: 'text',
-                    WebkitTextFillColor: 'transparent',
-                    backgroundClip: 'text',
-                    color: theme === 'dark' ? '#f3f4f6' : '#111827'
-                  }}> 초 전</span>
+                <div style={{ fontSize: '11px', color: canBuy ? '#22c55e' : (theme === 'dark' ? '#fbbf24' : '#b45309') }}>
+                  매수상태: {canBuy ? '진행중' : `중단 (${buyBlockReason})`}
+                  {pauseBuyEnabled ? ` · 시간대정지 ${pad2(pauseStartHour)}:${pad2(pauseStartMinute)}~${pad2(pauseEndHour)}:${pad2(pauseEndMinute)}` : ''}
+                  {dropSellTime ? ` · 전량매도 ${pad2(dropSellStartHour)}:${pad2(dropSellStartMinute)}:${pad2(dropSellEndSecond)}` : ''}
                 </div>
               </div>
 
@@ -8752,7 +10609,7 @@ const AutoTrading = () => {
                       WebkitTextFillColor: 'transparent',
                       backgroundClip: 'text',
                       color: theme === 'dark' ? '#f3f4f6' : '#111827'
-                    }}>실질</span>
+                    }}>실행</span>
                   </label>
                 </div>
                 <div style={{ marginBottom: '12px', fontSize: '12px' }}>
@@ -8828,6 +10685,11 @@ const AutoTrading = () => {
                         color: theme === 'dark' ? '#f3f4f6' : '#111827'
                       }}> 지정가</span>
                     </label>
+                  </div>
+                  <div style={{ marginLeft: '24px', marginTop: '4px', fontSize: '10px', color: theme === 'dark' ? '#9ca3af' : '#6b7280' }}>
+                    {profitType === 'limit'
+                      ? '✓ 지정가 매도: 현재가로 주문합니다. 상한가처럼 매도 호가가 얇은 종목도 체결됩니다.'
+                      : '⚠ 시장가 매도: 유동성이 낮으면 체결되지 않고 미체결로 남아 물량이 잠깁니다.'}
                   </div>
                 </div>
                 <div style={{ fontSize: '12px' }}>
@@ -8932,8 +10794,7 @@ const AutoTrading = () => {
                         checked={lossType === 'market'}
                         onChange={() => setLossType('market')}
                         style={{ borderRadius: '50%' }}
-                      />
-                      <span style={{
+                      />                      <span style={{
                         backgroundImage: theme === 'dark' 
                           ? 'linear-gradient(135deg, #f3f4f6 0%, #d1d5db 100%)'
                           : 'linear-gradient(135deg, #111827 0%, #374151 100%)',
@@ -8985,6 +10846,66 @@ const AutoTrading = () => {
                       }}
                     />
                   </div>
+                </div>
+              </div>
+
+              {/* 단계별 익절 설정 */}
+              <div style={{ 
+                border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999', 
+                backgroundColor: theme === 'dark' ? '#1f2937' : 'white', 
+                padding: '12px',
+                borderRadius: '8px',
+                opacity: stepProfit.사용 ? 1 : 0.75
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+                  <h4 style={{ 
+                    fontSize: '13px', 
+                    fontWeight: 'bold', 
+                    margin: 0, 
+                    borderBottom: theme === 'dark' ? '1px solid #4b5563' : '1px solid #ddd', 
+                    paddingBottom: '8px',
+                    flex: 1,
+                    backgroundImage: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                    WebkitBackgroundClip: 'text',
+                    WebkitTextFillColor: 'transparent',
+                    backgroundClip: 'text'
+                  }}>단계별 익절 설정</h4>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>
+                    <input
+                      type="checkbox"
+                      checked={stepProfit.사용}
+                      onChange={(e) => setStepProfit(prev => ({ ...prev, 사용: e.target.checked }))}
+                      style={{ width: '16px', height: '16px', borderRadius: '3px' }}
+                    />
+                    사용
+                  </label>
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', fontSize: '11px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>
+                  {([
+                    ['익절1', '1차(10%)'],
+                    ['익절2', '2차(40%)'],
+                    ['익절3', '3차(60%)'],
+                    ['익절4', '4차(잔량)'],
+                    ['손절', '손절'],
+                  ] as const).map(([key, label]) => (
+                    <label key={key} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      <span>{label}</span>
+                      <Num
+                        value={stepProfit[key]}
+                        step={0.1}
+                        min={-100}
+                        max={1000}
+                        theme={theme}
+                        width="52px"
+                        disabled={!stepProfit.사용}
+                        onChange={(v) => setStepProfit(prev => ({ ...prev, [key]: v }))}
+                      />
+                      <span>%</span>
+                    </label>
+                  ))}
+                </div>
+                <div style={{ fontSize: '10px', marginTop: '6px', color: theme === 'dark' ? '#9ca3af' : '#6b7280' }}>
+                  단계 도달시 보유수량의 10% → 40% → 60% → 잔량 순으로 분할 매도합니다. (손절은 전량)
                 </div>
               </div>
 
@@ -9118,6 +11039,7 @@ const AutoTrading = () => {
                   </div>
                 </div>
               </div>
+              </div>
 
             </div>
           </div>
@@ -9132,7 +11054,7 @@ const AutoTrading = () => {
               backgroundColor: theme === 'dark' ? '#111827' : '#f0f0f0'
             }}
           >
-            <div style={{ maxWidth: '800px', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+            <div className="at-strategies-grid">
                 {/* 장마감급등주매수 */}
                 <div style={{ 
                   border: theme === 'dark' ? '1px solid #4b5563' : '1px solid #999', 
@@ -9673,80 +11595,6 @@ const AutoTrading = () => {
         )}
       </div>
 
-      {/* 하단 로그 영역 */}
-      {showLogSection && (
-        <div 
-          style={{
-            height: '128px',
-            backgroundColor: '#111827',
-            color: '#4ade80',
-            borderTop: '2px solid #374151',
-            display: 'flex',
-            flexDirection: 'column',
-            flexShrink: 0
-          }}
-        >
-          <div 
-            onClick={() => setShowLogSection(false)}
-            style={{
-              padding: '5px',
-              backgroundColor: '#1f2937',
-              borderBottom: '1px solid #374151',
-              width: '100%',
-              display: 'flex',
-              flexFlow: 'row',
-              borderRadius: '9999px',
-              cursor: 'pointer',
-              userSelect: 'none'
-            }}
-          >
-            <span style={{ 
-              fontSize: '14px', 
-              fontWeight: 500,
-              display: 'flex',
-              justifyContent: 'center',
-              alignItems: 'center',
-              fontFamily: '"Segoe UI Emoji"',
-              textAlign: 'center',
-              paddingLeft: '20px',
-              paddingRight: '20px',
-              marginLeft: '20px',
-              marginRight: '20px'
-            }}>로그</span>
-          </div>
-          <div
-            ref={logContainerRef}
-            style={{
-              flex: 1,
-              overflowY: 'auto',
-              padding: '5px',
-              fontFamily: 'Consolas, monospace',
-              fontSize: '12px',
-              width: '100%'
-            }}
-          >
-          {logs.length > 0 ? (
-            logs.map((log) => (
-              <div
-                key={log.id}
-                className={`${
-                  log.level === 'error' ? 'text-red-400' :
-                  log.level === 'warning' ? 'text-yellow-400' :
-                  log.level === 'success' ? 'text-green-400' :
-                  'text-gray-300'
-                }`}
-                style={{ width: '100%', padding: '2px 0' }}
-              >
-                <span className="text-gray-500">[{log.time}]</span> {log.message}
-              </div>
-            ))
-          ) : (
-            <div className="text-gray-500">로그가 없습니다</div>
-          )}
-        </div>
-      </div>
-      )}
-
       {/* 로그인 모달 */}
       {showLoginModal && (
         <div
@@ -10069,6 +11917,8 @@ const AutoTrading = () => {
                           method: 'POST',
                           headers: {
                             'Content-Type': 'application/json',
+                            // 관리자 API는 서버에서 토큰을 검증한다
+                            'x-admin-token': adminCode.trim(),
                           },
                           body: JSON.stringify({
                             validDays: adminValidDays,

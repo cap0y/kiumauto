@@ -1,14 +1,16 @@
-/**
+﻿/**
  * 조건식 관련 라우터 (키움증권 REST API 연동)
  * 순위정보 API를 사용하여 실제 종목 조회
  */
 import { Router, Request, Response } from 'express'
-import { KiwoomService } from '../services/kiwoomService'
+import { getKiwoom } from '../middleware/auth'
 import { StockConditionService } from '../services/stockConditionService'
 
 const router = Router()
-const kiwoomService = KiwoomService.getInstance()
 const stockConditionService = StockConditionService.getInstance()
+
+// 조건검색 결과 상한. 검색된 종목이 너무 많으면 실시간 등록·폴링이 한도를 넘기므로 50개로 제한한다.
+const MAX_CONDITION_RESULTS = 50
 
 // 조건식 인터페이스
 interface Condition {
@@ -61,6 +63,7 @@ router.post('/search', async (req: Request, res: Response) => {
     }
 
     // 연결 확인
+    const kiwoomService = getKiwoom(req)
     if (!kiwoomService.isConnected()) {
       return res.status(400).json({
         success: false,
@@ -139,6 +142,9 @@ router.post('/search', async (req: Request, res: Response) => {
           )
           
           if (code && code !== '0000' && !stockMap.has(code)) {
+            // 시가/고가: ka10095(다종목 시세)에서만 제공되므로 순위정보 응답에 없으면 undefined
+            const openRaw = stock.open_pric ?? stock.openPrice ?? stock.시가
+            const highRaw = stock.high_pric ?? stock.highPrice ?? stock.고가
             stockMap.set(code, {
               code: code.toString().padStart(6, '0'), // 6자리 종목코드로 정규화
               name: name || `종목${code}`,
@@ -146,6 +152,8 @@ router.post('/search', async (req: Request, res: Response) => {
               changeRate: changeRate || 0,
               volume: volume || 0,
               marketCap: 0,
+              openPrice: openRaw !== undefined ? Math.abs(parseFloat(String(openRaw))) : undefined,
+              highPrice: highRaw !== undefined ? Math.abs(parseFloat(String(highRaw))) : undefined,
             })
           }
         }
@@ -158,10 +166,10 @@ router.post('/search', async (req: Request, res: Response) => {
       }
     }
 
-    // Map을 배열로 변환
-    const resultStocks = Array.from(stockMap.values())
+    // Map을 배열로 변환 (최대 50종목만 반환)
+    const resultStocks = Array.from(stockMap.values()).slice(0, MAX_CONDITION_RESULTS)
     
-    console.log(`=== 총 ${resultStocks.length}개 종목 조회 완료 ===`)
+    console.log(`=== 총 ${resultStocks.length}개 종목 조회 완료 (상한 ${MAX_CONDITION_RESULTS}개) ===`)
     
     res.json({
       success: true,
@@ -185,6 +193,7 @@ router.post('/search', async (req: Request, res: Response) => {
  */
 router.get('/surge', async (req: Request, res: Response) => {
   try {
+    const kiwoomService = getKiwoom(req)
     if (!kiwoomService.isConnected()) {
       return res.status(400).json({
         success: false,
@@ -236,8 +245,8 @@ router.get('/surge', async (req: Request, res: Response) => {
     
     res.json({
       success: true,
-      stocks: stocks,
-      count: stocks.length,
+      stocks: stocks.slice(0, MAX_CONDITION_RESULTS),
+      count: Math.min(stocks.length, MAX_CONDITION_RESULTS),
     })
   } catch (error: any) {
     console.error('급등주 조회 오류:', error)
@@ -256,6 +265,7 @@ router.get('/surge', async (req: Request, res: Response) => {
 router.get('/stock/:code', async (req: Request, res: Response) => {
   try {
     const { code } = req.params
+    const kiwoomService = getKiwoom(req)
     
     if (!kiwoomService.isConnected()) {
       return res.status(400).json({

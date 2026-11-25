@@ -60,6 +60,14 @@ export const kiwoomApi = {
     return response.data
   },
 
+  // 종목명/코드 검색
+  searchStocks: async (keyword: string) => {
+    const response = await apiClient.get('/stocks/search', {
+      params: { q: keyword }
+    })
+    return response.data.stocks || []
+  },
+
   // 차트 데이터
   getCandle: async (code: string, period: string = 'min', start: string = '', end: string = '') => {
     const response = await apiClient.get(`/stocks/${code}/candle`, {
@@ -79,7 +87,7 @@ export const kiwoomApi = {
     return response.data
   },
 
-  // 보유 종목
+  // 보유 종목 (배열) — 기존 호출부 호환
   getBalance: async (accountNo?: string, accountProductCode?: string) => {
     const response = await apiClient.get('/accounts/balance', {
       params: {
@@ -87,7 +95,20 @@ export const kiwoomApi = {
         accountProductCode: accountProductCode || '01',
       }
     })
-    return response.data.stocks || []
+    if (response.data?.error) return response.data
+    return response.data?.stocks || []
+  },
+
+  // 보유 종목 + 서버 합계 (총매입금액/총평가금액/손익/수익률)
+  // 합계를 잃어버리면 클라이언트가 추정치로 계산해 값이 흔들린다.
+  getBalanceSummary: async (accountNo?: string, accountProductCode?: string) => {
+    const response = await apiClient.get('/accounts/balance', {
+      params: {
+        accountNo: accountNo || '',
+        accountProductCode: accountProductCode || '01',
+      }
+    })
+    return response.data
   },
 
   // 주문
@@ -96,6 +117,16 @@ export const kiwoomApi = {
       ...order,
       accountNo: order.accountNo || '',
       accountProductCode: order.accountProductCode || '01',
+    })
+    return response.data
+  },
+
+  // 주문 취소
+  cancelOrder: async (orderNumber: string, stockCode: string, quantity: number) => {
+    const response = await apiClient.post('/orders/cancel', {
+      orderNumber,
+      stockCode,
+      quantity,
     })
     return response.data
   },
