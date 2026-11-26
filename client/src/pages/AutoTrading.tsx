@@ -154,6 +154,29 @@ const resolveBuyPrice = (
  */
 const SESSION_PLACEHOLDER = '(로그인됨)'
 
+/**
+ * 체결가를 결정한다.
+ *
+ * 키움 00(주문체결)의 체결가 필드가 0으로 오는 경우가 있다 (시장가·모의투자).
+ * 그대로 order.price(시장가=0)로 폴백하면 매도가가 0이 되어
+ * 실현손익이 -100%로 계산된다. 실제 값이 있는 소스만 쓴다.
+ */
+const resolveExecutedPrice = (
+  fromSocket: number,
+  order: { price?: number; currentPrice?: number },
+  livePrice?: number
+): number => {
+  if (fromSocket > 0) return Math.round(fromSocket)
+  if (order.price && order.price > 0) return Math.round(order.price)
+  if (order.currentPrice && order.currentPrice > 0) return Math.round(order.currentPrice)
+  if (livePrice && livePrice > 0) return Math.round(livePrice)
+  return 0
+}
+
+/** 실현손익 계산에 쓸 만한 가격인지 (0원 배제) */
+const isValidTradePrice = (price: number): boolean =>
+  Number.isFinite(price) && price > 0
+
 // 전일대비 = 현재가 - 전일종가 (표시는 정수 원 단위)
 const changeFromRate = (price: number, changeRate: number): number => {
   const prev = prevCloseFromRate(price, changeRate)
@@ -2373,12 +2396,17 @@ const AutoTrading = () => {
       const held = holdingStocksRef.current.find(h => h.code === order.stockCode)
       const logBuy = orderLogs.find(o => o.type === 'buy' && o.stockCode === order.stockCode)
       const 매수가 = resolveBuyPrice(order.buyPrice, held, logBuy?.price)
-      const 매도가 = order.price > 0 ? order.price : (order.currentPrice || 0)
+      // 매도가: 주문가가 0(시장가)이면 체결 당시 현재가 → 잔고 현재가 순으로 보강
+      const 매도가 = resolveExecutedPrice(0, order, held?.currentPrice)
 
-      // 매수가를 알 수 없으면 집계하지 않고 다음 기회에 다시 시도한다
-      // (realizedProfit을 설정하지 않아야 이후에도 대상으로 남는다)
-      if (매수가 <= 0 || 매도가 <= 0) {
-        console.warn(`[실현손익] ${order.stockName} 매수가를 찾을 수 없어 건너뜀 (buyPrice=${order.buyPrice}, 잔고단가=${held?.purchasePrice})`)
+      // 가격을 알 수 없으면 집계하지 않고 다음 기회에 다시 시도한다
+      // (매도가 0을 그대로 쓰면 -100% 같은 엉터리 값이 누적된다)
+      if (!isValidTradePrice(매수가) || !isValidTradePrice(매도가)) {
+        console.warn(
+          `[실현손익] ${order.stockName} 가격 미확정으로 건너뜀 ` +
+          `(매수가=${매수가}, 매도가=${매도가}, buyPrice=${order.buyPrice}, 주문가=${order.price}, ` +
+          `주문당시=${order.currentPrice}, 잔고현재가=${held?.currentPrice})`
+        )
         continue
       }
 
@@ -2666,9 +2694,7 @@ const AutoTrading = () => {
                           if (unfilledQuantity === 0 && 주문수량 > 0) {
                             const 체결수량 = 주문수량
                             // executedPrice는 누적 체결금액이므로 평균 체결가 계산
-                            const 평균체결가 = executedPrice > 0
-                              ? Math.round(executedPrice)
-                              : order.price
+                            const 평균체결가 = resolveExecutedPrice(executedPrice, order)
                             console.log(`[WebSocket 체결] ${order.stockName} 매수 주문 전량 체결 (체결수량: ${체결수량}주, 주문수량: ${주문수량}주, 누적체결금액: ${executedPrice.toLocaleString()}원, 평균체결가: ${평균체결가.toLocaleString()}원)`)
                             addLog(`[체결 완료] ${order.stockName} ${체결수량}주 매수 체결 (평균가: ${평균체결가.toLocaleString()}원)`, 'success')
                             
@@ -2698,9 +2724,7 @@ const AutoTrading = () => {
                             if (unfilledQuantity === 0) {
                               // 전량 체결
                               // executedPrice는 누적 체결금액이므로 평균 체결가 계산
-                              const 평균체결가 = executedPrice > 0
-                                ? Math.round(executedPrice)
-                                : order.price
+                              const 평균체결가 = resolveExecutedPrice(executedPrice, order)
                               console.log(`[WebSocket 체결] ${order.stockName} 매수 주문 전량 체결 (체결수량: ${총체결수량}주, 주문수량: ${주문수량}주, 누적체결금액: ${executedPrice.toLocaleString()}원, 평균체결가: ${평균체결가.toLocaleString()}원)`)
                               addLog(`[체결 완료] ${order.stockName} ${총체결수량}주 매수 체결 (평균가: ${평균체결가.toLocaleString()}원)`, 'success')
                               
@@ -2724,9 +2748,7 @@ const AutoTrading = () => {
                             } else {
                               // 부분 체결
                               // executedPrice는 누적 체결금액이므로 평균 체결가 계산
-                              const 평균체결가 = executedPrice > 0
-                                ? Math.round(executedPrice)
-                                : order.price
+                              const 평균체결가 = resolveExecutedPrice(executedPrice, order)
                               console.log(`[WebSocket 부분체결] ${order.stockName} 매수 주문 부분 체결 (이번체결: ${체결수량}주, 총체결: ${총체결수량}주, 미체결: ${unfilledQuantity}주, 주문: ${주문수량}주, 누적체결금액: ${executedPrice.toLocaleString()}원, 평균체결가: ${평균체결가.toLocaleString()}원)`)
                               addLog(`[부분 체결] ${order.stockName} 이번 ${체결수량}주 체결 (총 ${총체결수량}주 체결, 평균가: ${평균체결가.toLocaleString()}원, 미체결: ${unfilledQuantity}주)`, 'info')
                               
@@ -2756,9 +2778,7 @@ const AutoTrading = () => {
                             if (unfilledQuantity === 0) {
                               // 전량 체결
                               // executedPrice는 누적 체결금액이므로 평균 체결가 계산
-                              const 평균체결가 = executedPrice > 0
-                                ? Math.round(executedPrice)
-                                : order.price
+                              const 평균체결가 = resolveExecutedPrice(executedPrice, order)
                               addLog(`[체결 완료] ${order.stockName} ${총체결수량}주 매수 체결 (평균가: ${평균체결가.toLocaleString()}원)`, 'success')
                               
                               // 체결 완료 시 즉시 보유종목 조회하여 실제 계좌 상태 확인 및 반영
@@ -2781,9 +2801,7 @@ const AutoTrading = () => {
                             } else {
                               // 부분 체결
                               // executedPrice는 누적 체결금액이므로 평균 체결가 계산
-                              const 평균체결가 = executedPrice > 0
-                                ? Math.round(executedPrice)
-                                : order.price
+                              const 평균체결가 = resolveExecutedPrice(executedPrice, order)
                               addLog(`[부분 체결] ${order.stockName} ${총체결수량}주 체결 (평균가: ${평균체결가.toLocaleString()}원, 미체결: ${unfilledQuantity}주)`, 'info')
                               
                               // 부분 체결 시 보유종목 조회하여 실제 계좌 상태 확인
@@ -2819,9 +2837,6 @@ const AutoTrading = () => {
                           // 미체결 수량이 0이면 전량 체결
                           if (unfilledQuantity === 0 && 주문수량 > 0) {
                             const 체결수량 = 주문수량
-                            const 평균체결가 = executedPrice > 0
-                              ? Math.round(executedPrice)
-                              : order.price
                             
                             // 실현손익 계산 (매도가 - 매수가) * 수량
                             // buyPrice가 0이면 잔고 평균단가/매수로그로 보강한다
@@ -2831,16 +2846,17 @@ const AutoTrading = () => {
                               heldForCalc,
                               orderLogs.find(o => o.type === 'buy' && o.stockCode === order.stockCode)?.price
                             )
-                            const 실현손익 = 매수가 > 0 ? (평균체결가 - 매수가) * 체결수량 : 0
-                            const 실현손익률 = 매수가 > 0 ? ((평균체결가 - 매수가) / 매수가) * 100 : 0
+                            // 체결가: 소켓값이 0이면 주문가/현재가 순으로 보강한다.
+                            // 시장가는 order.price가 0이라 그대로 두면 매도가 0 → -100%가 된다.
+                            const 평균체결가 = resolveExecutedPrice(executedPrice, order, heldForCalc?.currentPrice)
 
-                            // 매수가를 못 찾으면 0원을 누적하지 않는다 (아래 effect가 잔고 도착 후 집계)
-                            if (매수가 <= 0) {
+                            // 가격을 확정할 수 없으면 0원/-100%를 누적하지 않고 보류한다
+                            if (!isValidTradePrice(평균체결가) || !isValidTradePrice(매수가)) {
                               console.warn(
-                                `[실현손익 보류] ${order.stockName} (${order.stockCode}): 매수가 없음 ` +
-                                `(order.buyPrice=${order.buyPrice}, 잔고단가=${heldForCalc?.purchasePrice}, ` +
-                                `잔고매입금액=${heldForCalc?.purchaseAmount}, 보유수량=${heldForCalc?.quantity}, ` +
-                                `매수로그가=${orderLogs.find(o => o.type === 'buy' && o.stockCode === order.stockCode)?.price})`
+                                `[실현손익 보류] ${order.stockName} (${order.stockCode}): ` +
+                                `체결가=${평균체결가}, 매수가=${매수가} ` +
+                                `(소켓=${executedPrice}, 주문가=${order.price}, 주문당시=${order.currentPrice}, ` +
+                                `잔고현재가=${heldForCalc?.currentPrice}, 잔고단가=${heldForCalc?.purchasePrice})`
                               )
                               return {
                                 ...order,
@@ -2849,7 +2865,10 @@ const AutoTrading = () => {
                                 // realizedProfit을 설정하지 않아 이후 재집계 대상으로 남긴다
                               }
                             }
-                            
+
+                            const 실현손익 = (평균체결가 - 매수가) * 체결수량
+                            const 실현손익률 = ((평균체결가 - 매수가) / 매수가) * 100
+
                             console.log(`[WebSocket 체결] ${order.stockName} 매도 주문 전량 체결 (체결수량: ${체결수량}주, 주문수량: ${주문수량}주, 누적체결금액: ${executedPrice.toLocaleString()}원, 평균체결가: ${평균체결가.toLocaleString()}원, 매수가: ${매수가.toLocaleString()}원, 실현손익: ${실현손익.toLocaleString()}원, 실현손익률: ${실현손익률.toFixed(2)}%)`)
                             addLog(`[체결 완료] ${order.stockName} ${체결수량}주 매도 체결 (평균가: ${평균체결가.toLocaleString()}원, 실현손익: ${실현손익.toLocaleString()}원, ${실현손익률.toFixed(2)}%)`, 'success')
 
@@ -2896,9 +2915,7 @@ const AutoTrading = () => {
                             const 총체결수량 = 주문수량 - unfilledQuantity
                             
                             if (unfilledQuantity === 0) {
-                              const 평균체결가 = executedPrice > 0
-                                ? Math.round(executedPrice)
-                                : order.price
+                              const 평균체결가 = resolveExecutedPrice(executedPrice, order)
                               
                               // 실현손익 계산
                               // buyPrice가 0이면 잔고 평균단가/매수로그로 보강한다
@@ -2944,9 +2961,7 @@ const AutoTrading = () => {
                                 realizedProfitPercent: 실현손익률,
                               }
                             } else {
-                              const 평균체결가 = executedPrice > 0
-                                ? Math.round(executedPrice)
-                                : order.price
+                              const 평균체결가 = resolveExecutedPrice(executedPrice, order)
                               
                               // 부분체결 실현손익 계산 (체결된 수량만큼)
                               // buyPrice가 0이면 잔고 평균단가/매수로그로 보강한다
@@ -2956,11 +2971,15 @@ const AutoTrading = () => {
                                 heldPartial2,
                                 orderLogs.find(o => o.type === 'buy' && o.stockCode === order.stockCode)?.price
                               )
-                              const 부분실현손익 = 매수가 > 0 ? (평균체결가 - 매수가) * 총체결수량 : 0
-                              const 부분실현손익률 = 매수가 > 0 ? ((평균체결가 - 매수가) / 매수가) * 100 : 0
+                              const 부분실현손익 = isValidTradePrice(평균체결가) && isValidTradePrice(매수가)
+                                ? (평균체결가 - 매수가) * 총체결수량
+                                : undefined
+                              const 부분실현손익률 = 부분실현손익 !== undefined
+                                ? ((평균체결가 - 매수가) / 매수가) * 100
+                                : 0
                               
-                              console.log(`[WebSocket 부분체결] ${order.stockName} 매도 주문 부분 체결 (이번체결: ${체결수량}주, 총체결: ${총체결수량}주, 미체결: ${unfilledQuantity}주, 부분실현손익: ${부분실현손익.toLocaleString()}원)`)
-                              addLog(`[부분 체결] ${order.stockName} 이번 ${체결수량}주 체결 (총 ${총체결수량}주 체결, 평균가: ${평균체결가.toLocaleString()}원, 미체결: ${unfilledQuantity}주, 부분실현손익: ${부분실현손익.toLocaleString()}원)`, 'info')
+                              console.log(`[WebSocket 부분체결] ${order.stockName} 매도 주문 부분 체결 (이번체결: ${체결수량}주, 총체결: ${총체결수량}주, 미체결: ${unfilledQuantity}주, 부분실현손익: ${부분실현손익?.toLocaleString() ?? '보류'}원)`)
+                              addLog(`[부분 체결] ${order.stockName} 이번 ${체결수량}주 체결 (총 ${총체결수량}주 체결, 평균가: ${평균체결가.toLocaleString()}원, 미체결: ${unfilledQuantity}주, 부분실현손익: ${부분실현손익?.toLocaleString() ?? '보류'}원)`, 'info')
                               
                               setTimeout(() => {
                                 refetchBalance()
@@ -2973,8 +2992,13 @@ const AutoTrading = () => {
                                 status: '부분체결',
                                 price: 평균체결가,
                                 unfilledQuantity: unfilledQuantity,
-                                realizedProfit: 부분실현손익,
-                                realizedProfitPercent: 부분실현손익률,
+                                // 가격을 확정하지 못했으면 realizedProfit을 남기지 않는다 (재집계 대상)
+                                ...(부분실현손익 !== undefined
+                                  ? {
+                                      realizedProfit: 부분실현손익,
+                                      realizedProfitPercent: 부분실현손익률,
+                                    }
+                                  : {}),
                               }
                             }
                           }
