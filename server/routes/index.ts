@@ -16,6 +16,7 @@ import settingsRoutes from './settings'
 import conditionRoutes from './condition'
 import adminRoutes from './admin'
 import authRoutes from './auth'
+import stateRoutes from './state'
 import { requireAdmin, requireLicense, withKiwoomService } from '../middleware/auth'
 
 const router = Router()
@@ -35,5 +36,6 @@ router.use('/stocks', ...session, stockRoutes) // /api/stocks/*
 router.use('/orders', ...session, orderRoutes) // /api/orders/*
 router.use('/settings', ...session, settingsRoutes) // /api/settings/*
 router.use('/conditions', ...session, conditionRoutes) // /api/conditions/*
+router.use('/state', requireLicense, stateRoutes) // /api/state/* (세션 서비스 불필요)
 
 export default router

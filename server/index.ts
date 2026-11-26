@@ -13,6 +13,7 @@ import routes from './routes/index'
 import { KiwoomService } from './services/kiwoomService'
 import { kiwoomRegistry } from './services/kiwoomRegistry'
 import keyService from './services/keyService'
+import userStateService from './services/userStateService'
 import { LICENSE_COOKIE } from './middleware/auth'
 
 // 환경 변수 로드
@@ -332,6 +333,11 @@ const start = async () => {
     await keyService.initialize()
   } catch (error: any) {
     console.error('[시작] 키 저장소 초기화 실패:', error.message)
+  }
+  try {
+    await userStateService.initialize()
+  } catch (error: any) {
+    console.error('[시작] 상태 저장소 초기화 실패:', error.message)
   }
 
   // Railway는 0.0.0.0 바인딩이 필요하다 (기본 localhost면 헬스체크가 실패한다)

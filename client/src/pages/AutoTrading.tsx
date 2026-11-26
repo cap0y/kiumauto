@@ -1,7 +1,7 @@
 ﻿import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import { kiwoomApi } from '../api/kiwoom'
-import { authHeaders } from '../api/client'
+import apiClient, { authHeaders } from '../api/client'
 import { useKiwoomStore } from '../store/useKiwoomStore'
 import { useThemeStore } from '../store/useThemeStore'
 import { hmsToSec, secInRange, pad2, stepSellTier } from '../utils/tradingTime'
@@ -916,6 +916,8 @@ const AutoTrading = () => {
   const [strategyBasicBuy, setStrategyBasicBuy] = useState<boolean>(true) // 기본매수설정
   
   // 오늘의 실현손익 총합 (매도 체결 완료 시 누적)
+  // localStorage는 즉시 표시용 캐시로만 쓰고, 실제 값은 서버(라이선스 키 단위)에 저장한다.
+  // (localStorage만 쓰면 브라우저·도메인마다 값이 달라진다)
   const [todayTotalRealizedProfit, setTodayTotalRealizedProfit] = useState<number>(() => {
     const saved = localStorage.getItem('today_realized_profit')
     const savedDate = localStorage.getItem('today_realized_profit_date')
@@ -2203,6 +2205,8 @@ const AutoTrading = () => {
         setTodayTotalRealizedProfit(0)
         localStorage.setItem('today_realized_profit', '0')
         localStorage.setItem('today_realized_profit_date', today)
+        // 서버에도 0으로 반영해야 다른 기기에서도 초기화된다
+        saveRealizedProfitToServer(0, today)
       }
     }
     
@@ -2215,6 +2219,50 @@ const AutoTrading = () => {
     return () => clearInterval(intervalId)
   }, [])
   
+  /** 오늘 실현손익을 서버에 저장한다 (라이선스 키 단위) */
+  const saveRealizedProfitToServer = async (amount: number, date?: string) => {
+    try {
+      await apiClient.put('/state/today_realized_profit', {
+        value: { amount, date: date || new Date().toLocaleDateString('ko-KR') },
+      })
+    } catch (error: any) {
+      // 저장 실패는 조용히 넘긴다 (localStorage 캐시는 유지)
+      if (process.env.NODE_ENV === 'development') {
+        console.warn('[실현손익] 서버 저장 실패:', error.message)
+      }
+    }
+  }
+
+  // 앱 시작 시 서버에서 오늘 실현손익을 불러온다.
+  // localStorage는 캐시일 뿐이라 다른 기기/Railway 도메인에서는 비어 있다.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const response = await apiClient.get('/state/today_realized_profit')
+        const value = response.data?.value
+        if (cancelled || !value) return
+
+        const today = new Date().toLocaleDateString('ko-KR')
+        // 날짜가 다르면 오늘 실적이 아니다
+        if (value.date !== today) return
+
+        const amount = Number(value.amount)
+        if (!Number.isFinite(amount)) return
+
+        setTodayTotalRealizedProfit(amount)
+        // 다음 오프라인 표시를 위해 캐시도 갱신
+        localStorage.setItem('today_realized_profit', String(amount))
+        localStorage.setItem('today_realized_profit_date', today)
+      } catch {
+        // 서버 조회 실패 시 localStorage 캐시를 그대로 쓴다
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   // 매도 체결 → 오늘 실현손익 누적
   // (WebSocket 체결 이벤트를 놓쳐도 주문 상태가 '체결'이 되면 여기서 집계된다)
   const realizedCountedRef = useRef<Set<string>>(new Set())
@@ -2244,6 +2292,8 @@ const AutoTrading = () => {
       const today = new Date().toLocaleDateString('ko-KR')
       localStorage.setItem('today_realized_profit', newTotal.toString())
       localStorage.setItem('today_realized_profit_date', today)
+      // 서버에도 누적값을 저장해야 다른 기기에서도 같은 값이 보인다
+      void saveRealizedProfitToServer(newTotal, today)
       console.log(`[실현손익 누적] +${added.toLocaleString()}원, 오늘 총 실현손익: ${newTotal.toLocaleString()}원`)
       return newTotal
     })
@@ -2684,6 +2734,7 @@ const AutoTrading = () => {
                               const today = new Date().toLocaleDateString('ko-KR')
                               localStorage.setItem('today_realized_profit', newTotal.toString())
                               localStorage.setItem('today_realized_profit_date', today)
+                              void saveRealizedProfitToServer(newTotal, today)
                               console.log(`[실현손익 누적] ${order.stockName}: ${실현손익.toLocaleString()}원, 오늘 총 실현손익: ${newTotal.toLocaleString()}원`)
                               return newTotal
                             })
@@ -2745,6 +2796,7 @@ const AutoTrading = () => {
                                 const today = new Date().toLocaleDateString('ko-KR')
                                 localStorage.setItem('today_realized_profit', newTotal.toString())
                                 localStorage.setItem('today_realized_profit_date', today)
+                                void saveRealizedProfitToServer(newTotal, today)
                                 console.log(`[실현손익 누적] ${order.stockName}: ${실현손익.toLocaleString()}원, 오늘 총 실현손익: ${newTotal.toLocaleString()}원`)
                                 return newTotal
                               })

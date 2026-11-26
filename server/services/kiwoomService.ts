@@ -888,7 +888,11 @@ export class KiwoomService {
     const isMock = this.config.host.includes('mockapi')
     const socketBase = isMock ? 'wss://mockapi.kiwoom.com:10000' : 'wss://api.kiwoom.com:10000'
 
-    this.webSocketService = new KiwoomWebSocketService()
+    // ⚠️ 여기서 new로 새 인스턴스를 만들면 이미 등록된 실시간 콜백이 죽은 인스턴스에 남는다.
+    //    (onRealTimeData가 먼저 호출되는 경우가 일반적이다)
+    if (!this.webSocketService) {
+      this.webSocketService = new KiwoomWebSocketService()
+    }
 
     // 이미 연결·로그인돼 있으면 새로 붙이지 않는다
     if (this.webSocketService.isConnected()) {
