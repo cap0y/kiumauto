@@ -36,6 +36,24 @@ router.get('/:name', async (req: Request, res: Response) => {
   }
 })
 
+/**
+ * 오늘 실현손익 값 검증.
+ *
+ * 버그로 -100%(매도가 0) 같은 엉터리 값이 누적되는 사고가 반복됐다.
+ * 서버에서 비정상 값을 거부해 DB가 오염되는 것을 막는다.
+ */
+export const MAX_ABS_REALIZED_PROFIT = 1_000_000_000 // 10억 원 (넘으면 계산 오류)
+
+export const validateRealizedProfit = (value: any): string | null => {  if (!value || typeof value !== 'object') return 'value는 객체여야 합니다'
+  const amount = Number(value.amount)
+  if (!Number.isFinite(amount)) return 'amount가 숫자가 아닙니다'
+  if (Math.abs(amount) > MAX_ABS_REALIZED_PROFIT) {
+    return `amount가 비정상적으로 큽니다 (${amount.toLocaleString()})`
+  }
+  if (typeof value.date !== 'string' || !value.date) return 'date가 필요합니다'
+  return null
+}
+
 // 상태 저장 (덮어쓰기)
 router.put('/:name', async (req: Request, res: Response) => {
   try {
@@ -45,6 +63,15 @@ router.put('/:name', async (req: Request, res: Response) => {
     }
     if (req.body?.value === undefined) {
       return res.status(400).json({ success: false, error: 'value가 필요합니다' })
+    }
+
+    // 실현손익은 계산 버그로 오염되기 쉬워 서버에서 형식을 검증한다
+    if (name === 'today_realized_profit') {
+      const invalid = validateRealizedProfit(req.body.value)
+      if (invalid) {
+        console.warn(`[상태 저장 거부] ${name}: ${invalid}`, req.body.value)
+        return res.status(400).json({ success: false, error: invalid })
+      }
     }
 
     await userStateService.set(getUserKey(req), name, req.body.value)

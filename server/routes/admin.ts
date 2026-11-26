@@ -5,6 +5,7 @@
 import { Router, Request, Response } from 'express'
 import keyService from '../services/keyService'
 import userStateService from '../services/userStateService'
+import { validateRealizedProfit } from './state'
 
 const router = Router()
 
@@ -194,6 +195,14 @@ router.put('/state/:key/:name', async (req: Request, res: Response) => {
     const check = await keyService.checkKey(key)
     if (!check.valid) {
       return res.status(404).json({ success: false, message: '라이선스 키를 찾을 수 없습니다' })
+    }
+
+    // 일반 저장 경로와 같은 검증을 적용한다 (계산 버그로 DB가 오염되는 것을 막는다)
+    if (name === 'today_realized_profit') {
+      const invalid = validateRealizedProfit(req.body.value)
+      if (invalid) {
+        return res.status(400).json({ success: false, message: invalid })
+      }
     }
 
     await userStateService.set(key, name, req.body.value)

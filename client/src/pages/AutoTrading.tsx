@@ -2384,11 +2384,21 @@ const AutoTrading = () => {
       const key = order.orderNumber || `${order.stockCode}_${order.time}_${order.quantity}`
       if (realizedCountedRef.current.has(key)) continue
 
-      // WebSocket이 이미 계산해 둔 값이 있으면 그대로 쓴다
+      // WebSocket이 이미 계산해 둔 값이 있으면 그대로 쓴다.
+      // 단, 계산 버그로 -100%(매도가 0) 같은 값이 들어올 수 있으므로
+      // 수익률이 비정상(±100% 초과)이면 신뢰하지 않고 아래에서 재계산한다.
       if (order.realizedProfit !== undefined) {
-        realizedCountedRef.current.add(key)
-        added += order.realizedProfit
-        continue
+        const pct = order.realizedProfitPercent
+        const isSane = pct === undefined || (Number.isFinite(pct) && pct > -100 && pct < 1000)
+        if (isSane) {
+          realizedCountedRef.current.add(key)
+          added += order.realizedProfit
+          continue
+        }
+        console.warn(
+          `[실현손익 무시] ${order.stockName}: 비정상 수익률 ${pct?.toFixed?.(2)}% ` +
+          `(실현손익 ${order.realizedProfit.toLocaleString()}원) — 재계산합니다`
+        )
       }
 
       // 매수가를 찾는다.
