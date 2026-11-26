@@ -2836,10 +2836,30 @@ const AutoTrading = () => {
                           
                           const 주문수량 = order.quantity
                           const 이전미체결수량 = order.unfilledQuantity || 주문수량
-                          
-                          // 미체결 수량이 0이면 전량 체결
-                          if (unfilledQuantity === 0 && 주문수량 > 0) {
-                            const 체결수량 = 주문수량
+
+                          // 취소/거부된 주문은 체결이 아니다.
+                          // (취소되면 미체결수량이 0이 되어 '전량 체결'로 오인하고,
+                          //  체결가가 없어 매도가 0원 → -100%로 계산되던 원인)
+                          const isCancelledStatus =
+                            orderStatus.includes('취소') || orderStatus.includes('거부')
+
+                          if (isCancelledStatus) {
+                            console.log(`[체결 무시] ${order.stockName}: 주문 상태가 '${orderStatus}'이므로 체결 처리하지 않음`)
+                            return {
+                              ...order,
+                              status: '취소',
+                              type: 'cancel' as const,
+                              cancelTimestamp: Date.now(),
+                            }
+                          }
+
+                          // 체결 수량이 실제로 있어야 체결이다.
+                          // (미체결 0만 보고 판단하면 취소도 체결로 오인한다)
+                          const hasFill = actualFilledQuantity > 0
+
+                          // 미체결 수량이 0이고 실제 체결 수량이 있으면 전량 체결
+                          if (unfilledQuantity === 0 && 주문수량 > 0 && hasFill) {
+                            const 체결수량 = Math.min(actualFilledQuantity || 주문수량, 주문수량)
                             
                             // 실현손익 계산 (매도가 - 매수가) * 수량
                             // buyPrice가 0이면 잔고 평균단가/매수로그로 보강한다
@@ -2928,8 +2948,12 @@ const AutoTrading = () => {
                                 heldPartial,
                                 orderLogs.find(o => o.type === 'buy' && o.stockCode === order.stockCode)?.price
                               )
-                              const 실현손익 = 매수가 > 0 ? (평균체결가 - 매수가) * 총체결수량 : 0
-                              const 실현손익률 = 매수가 > 0 ? ((평균체결가 - 매수가) / 매수가) * 100 : 0
+                              const 실현손익 = isValidTradePrice(평균체결가) && isValidTradePrice(매수가)
+                                ? (평균체결가 - 매수가) * 총체결수량
+                                : 0
+                              const 실현손익률 = 매수가 > 0 && isValidTradePrice(평균체결가)
+                                ? ((평균체결가 - 매수가) / 매수가) * 100
+                                : 0
                               
                               console.log(`[WebSocket 체결] ${order.stockName} 매도 주문 전량 체결 (체결수량: ${총체결수량}주, 주문수량: ${주문수량}주, 실현손익: ${실현손익.toLocaleString()}원)`)
                               addLog(`[체결 완료] ${order.stockName} ${총체결수량}주 매도 체결 (평균가: ${평균체결가.toLocaleString()}원, 실현손익: ${실현손익.toLocaleString()}원, ${실현손익률.toFixed(2)}%)`, 'success')
@@ -2960,8 +2984,13 @@ const AutoTrading = () => {
                                 isExecuted: true,
                                 price: 평균체결가,
                                 unfilledQuantity: 0,
-                                realizedProfit: 실현손익,
-                                realizedProfitPercent: 실현손익률,
+                                // 가격 미확정이면 realizedProfit을 남기지 않아 재집계 대상이 된다
+                                ...(isValidTradePrice(평균체결가) && isValidTradePrice(매수가)
+                                  ? {
+                                      realizedProfit: 실현손익,
+                                      realizedProfitPercent: 실현손익률,
+                                    }
+                                  : {}),
                               }
                             } else {
                               const 평균체결가 = resolveExecutedPrice(executedPrice, order)
