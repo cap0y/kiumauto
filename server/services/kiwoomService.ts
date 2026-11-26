@@ -564,8 +564,7 @@ export class KiwoomService {
     // 종목명 기준으로 한 번 더 병합한다. 표에 같은 이름이 여러 줄로 보이는 것을 막는다.
     const byName = new Map<string, any>()
     for (const h of holdings) {
-      const key = (h.name || h.code).replace(/\s/g, '')
-      const existing = byName.get(key)
+      const key = (h.name || h.code).replace(/\s/g, '')      const existing = byName.get(key)
       if (!existing) {
         byName.set(key, { ...h })
         continue
@@ -586,6 +585,17 @@ export class KiwoomService {
     const mergedByName = Array.from(byName.values())
     if (mergedByName.length !== holdings.length) {
       console.log(`[잔고] 같은 종목명 병합: ${holdings.length}개 → ${mergedByName.length}개`)
+      // 어떤 코드가 하나로 합쳐졌는지 남긴다 (중복 원인 추적용)
+      const codeGroups = new Map<string, string[]>()
+      for (const h of holdings) {
+        const nameKey = (h.name || h.code).replace(/\s/g, '')
+        const list = codeGroups.get(nameKey) || []
+        list.push(`${h.code}(${h.quantity}주)`)
+        codeGroups.set(nameKey, list)
+      }
+      for (const [name, codes] of codeGroups) {
+        if (codes.length > 1) console.log(`[잔고] 중복 병합 — ${name}: ${codes.join(' + ')}`)
+      }
     }
     const finalHoldings = mergedByName
 

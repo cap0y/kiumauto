@@ -5791,9 +5791,29 @@ const AutoTrading = () => {
         currentPrice: Number(b.currentPrice ?? b.현재가 ?? 0),
         profitPercent: Number(b.profitPercent ?? b.수익률 ?? 0),
       }))
-      // 매도가능수량이 0인 종목은 '보유' 표에 넣지 않는다.
-      // (미체결 매도 주문이 전량 잡고 있어 팔 수 없는 상태 — 표시하면 오해를 준다)
-      .filter((b: any) => b.code && b.quantity > 0 && b.sellableQuantity > 0)
+      // 보유 수량이 있는 종목만 표시한다.
+      // 매도가능 0(미체결 매도 주문이 물량을 잡은 상태)이라도 '보유'에는 변함이 없으므로
+      // 숨기면 주문이 걸릴 때마다 목록에서 사라졌다 나타나 깜빡인다.
+      // 매도 버튼만 비활성화하면 된다.
+      .filter((b: any) => b.code && b.quantity > 0)
+      // 같은 종목이 서버에서 여러 줄로 내려오는 경우를 마지막으로 막는다.
+      // (신용/현금 구분, 구코드/신코드 등) 코드가 다르면 이름으로도 합친다.
+      .reduce((acc: any[], row: any) => {
+        const key = row.name.replace(/\s/g, '') || row.code
+        const found = acc.find((x: any) => x.code === row.code || x.name.replace(/\s/g, '') === key)
+        if (!found) {
+          acc.push({ ...row })
+          return acc
+        }
+        const totalQty = found.quantity + row.quantity
+        const totalAmount =
+          found.purchasePrice * found.quantity + row.purchasePrice * row.quantity
+        found.quantity = totalQty
+        found.sellableQuantity += row.sellableQuantity
+        found.purchasePrice = totalQty > 0 ? Math.round(totalAmount / totalQty) : found.purchasePrice
+        if (!found.currentPrice && row.currentPrice) found.currentPrice = row.currentPrice
+        return acc
+      }, [])
   })()
 
   const logRows = buildDisplayOrders(orderLogs)
@@ -8222,23 +8242,23 @@ const AutoTrading = () => {
                   <label style={{ whiteSpace: 'nowrap', fontWeight: 500, color: theme === 'dark' ? '#d1d5db' : '#111827' }}>보유종목:</label>
                   <span style={{ fontWeight: 'bold', fontSize: '12px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{displayHoldingOrdersWithLive.length}개</span>
                   {(() => {
-                    // 매도가능수량이 0이라 표에서 제외된 종목 수
-                    // (미체결 매도 주문이 전량 잡고 있어 팔 수 없는 상태)
+                    // 매도가능수량이 0인 종목 수
+                    // (미체결 매도 주문이 물량을 잡고 있어 지금은 팔 수 없는 상태)
                     const rawRows: any[] = Array.isArray((balanceData as any)?.stocks)
                       ? (balanceData as any).stocks
                       : Array.isArray(balanceData) ? (balanceData as any) : []
-                    const hidden = rawRows.filter((b: any) => {
+                    const waiting = rawRows.filter((b: any) => {
                       const qty = Number(b.quantity ?? 0)
                       const sellable = Number(b.sellableQuantity ?? b.quantity ?? 0)
                       return qty > 0 && sellable <= 0
                     }).length
-                    if (hidden === 0) return null
+                    if (waiting === 0) return null
                     return (
                       <span
                         style={{ marginLeft: '6px', fontSize: '10px', color: '#f59e0b', fontWeight: 'normal' }}
                         title="미체결 매도 주문이 물량을 잡고 있습니다. '미체결취소' 후 매도하세요."
                       >
-                        매도대기 {hidden}개
+                        매도대기 {waiting}개
                       </span>
                     )
                   })()}
