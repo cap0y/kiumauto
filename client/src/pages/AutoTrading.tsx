@@ -147,6 +147,13 @@ const resolveBuyPrice = (
   return 0
 }
 
+/**
+ * HttpOnly 세션 쿠키로 이미 인증된 상태를 나타내는 표시값.
+ * 키 값 자체는 JS에서 읽을 수 없으므로 입력창에 이 값을 넣어
+ * "로그인됨"을 보여주고, 서버 인증은 쿠키로 처리한다.
+ */
+const SESSION_PLACEHOLDER = '(로그인됨)'
+
 // 전일대비 = 현재가 - 전일종가 (표시는 정수 원 단위)
 const changeFromRate = (price: number, changeRate: number): number => {
   const prev = prevCloseFromRate(price, changeRate)
@@ -2334,13 +2341,15 @@ const AutoTrading = () => {
   }, [keyInfo])
 
   // 매도 체결 → 오늘 실현손익 누적
-  // (WebSocket 체결 이벤트를 놓쳐도 주문 상태가 '체결'이 되면 여기서 집계된다)
+  //
+  // 단일 집계 지점이다. WebSocket onmessage/setOrderLogs 업데이터 안에서
+  // setState를 중첩하면 React 배치 처리로 누락·중복이 생기므로 여기서만 누적한다.
+  // realizedCountedRef로 같은 주문이 두 번 집계되지 않게 막는다.
   const realizedCountedRef = useRef<Set<string>>(new Set())
   useEffect(() => {
     const settled = orderLogs.filter(order =>
       order.type === 'sell' &&
-      (order.status === '체결' || order.isExecuted === true) &&
-      order.realizedProfit === undefined
+      (order.status === '체결' || order.status === '부분체결' || order.isExecuted === true)
     )
     if (settled.length === 0) return
 
@@ -2348,6 +2357,13 @@ const AutoTrading = () => {
     for (const order of settled) {
       const key = order.orderNumber || `${order.stockCode}_${order.time}_${order.quantity}`
       if (realizedCountedRef.current.has(key)) continue
+
+      // WebSocket이 이미 계산해 둔 값이 있으면 그대로 쓴다
+      if (order.realizedProfit !== undefined) {
+        realizedCountedRef.current.add(key)
+        added += order.realizedProfit
+        continue
+      }
 
       // 매수가를 찾는다.
       // 1순위: 주문에 저장된 buyPrice (주문 생성 시점의 잔고 평균단가)
@@ -2836,19 +2852,11 @@ const AutoTrading = () => {
                             
                             console.log(`[WebSocket 체결] ${order.stockName} 매도 주문 전량 체결 (체결수량: ${체결수량}주, 주문수량: ${주문수량}주, 누적체결금액: ${executedPrice.toLocaleString()}원, 평균체결가: ${평균체결가.toLocaleString()}원, 매수가: ${매수가.toLocaleString()}원, 실현손익: ${실현손익.toLocaleString()}원, 실현손익률: ${실현손익률.toFixed(2)}%)`)
                             addLog(`[체결 완료] ${order.stockName} ${체결수량}주 매도 체결 (평균가: ${평균체결가.toLocaleString()}원, 실현손익: ${실현손익.toLocaleString()}원, ${실현손익률.toFixed(2)}%)`, 'success')
-                            
-                            // 실현손익을 오늘의 총 실현손익에 누적
-                            setTodayTotalRealizedProfit(prev => {
-                              const newTotal = prev + 실현손익
-                              const today = dateKey()
-                              localStorage.setItem('today_realized_profit', newTotal.toString())
-                              localStorage.setItem('today_realized_profit_date', today)
-                              void saveRealizedProfitToServer(newTotal, today)
-                              console.log(`[실현손익 누적] ${order.stockName}: ${실현손익.toLocaleString()}원, 오늘 총 실현손익: ${newTotal.toLocaleString()}원`)
-                              return newTotal
-                            })
-                            // 아래 effect가 같은 체결을 다시 집계하지 않도록 표시
-                            realizedCountedRef.current.add(order.orderNumber || `${order.stockCode}_${order.time}_${order.quantity}`)
+
+                            // 실현손익 누적은 아래 전용 effect가 orderLogs 변경을 보고 처리한다.
+                            // (setOrderLogs 업데이터 안에서 다른 setState를 호출하면
+                            //  React가 업데이터를 여러 번 실행하거나 배치 처리해 누락·중복이 생긴다)
+                            // 여기서 realizedCountedRef를 선점하면 effect가 집계하지 못하므로 건드리지 않는다.
                             
                             // 매도 체결 완료 후 해당 매수/매도 주문을 orderLogs에서 삭제
                             // 집계 effect가 실행될 시간을 확보한다 (500ms는 너무 짧아 누락됐다)
@@ -2893,23 +2901,20 @@ const AutoTrading = () => {
                                 : order.price
                               
                               // 실현손익 계산
-                              const 매수가 = order.buyPrice || 0
+                              // buyPrice가 0이면 잔고 평균단가/매수로그로 보강한다
+                              const heldPartial = holdingStocksRef.current.find(h => h.code === order.stockCode)
+                              const 매수가 = resolveBuyPrice(
+                                order.buyPrice,
+                                heldPartial,
+                                orderLogs.find(o => o.type === 'buy' && o.stockCode === order.stockCode)?.price
+                              )
                               const 실현손익 = 매수가 > 0 ? (평균체결가 - 매수가) * 총체결수량 : 0
                               const 실현손익률 = 매수가 > 0 ? ((평균체결가 - 매수가) / 매수가) * 100 : 0
                               
                               console.log(`[WebSocket 체결] ${order.stockName} 매도 주문 전량 체결 (체결수량: ${총체결수량}주, 주문수량: ${주문수량}주, 실현손익: ${실현손익.toLocaleString()}원)`)
                               addLog(`[체결 완료] ${order.stockName} ${총체결수량}주 매도 체결 (평균가: ${평균체결가.toLocaleString()}원, 실현손익: ${실현손익.toLocaleString()}원, ${실현손익률.toFixed(2)}%)`, 'success')
-                              
-                              // 실현손익을 오늘의 총 실현손익에 누적
-                              setTodayTotalRealizedProfit(prev => {
-                                const newTotal = prev + 실현손익
-                                const today = dateKey()
-                                localStorage.setItem('today_realized_profit', newTotal.toString())
-                                localStorage.setItem('today_realized_profit_date', today)
-                                void saveRealizedProfitToServer(newTotal, today)
-                                console.log(`[실현손익 누적] ${order.stockName}: ${실현손익.toLocaleString()}원, 오늘 총 실현손익: ${newTotal.toLocaleString()}원`)
-                                return newTotal
-                              })
+
+                              // 누적은 아래 전용 effect가 담당한다 (realizedProfit만 기록)
                               
                               // 매도 체결 완료 후 해당 매수/매도 주문을 orderLogs에서 삭제
                               setTimeout(() => {
@@ -2944,7 +2949,13 @@ const AutoTrading = () => {
                                 : order.price
                               
                               // 부분체결 실현손익 계산 (체결된 수량만큼)
-                              const 매수가 = order.buyPrice || 0
+                              // buyPrice가 0이면 잔고 평균단가/매수로그로 보강한다
+                              const heldPartial2 = holdingStocksRef.current.find(h => h.code === order.stockCode)
+                              const 매수가 = resolveBuyPrice(
+                                order.buyPrice,
+                                heldPartial2,
+                                orderLogs.find(o => o.type === 'buy' && o.stockCode === order.stockCode)?.price
+                              )
                               const 부분실현손익 = 매수가 > 0 ? (평균체결가 - 매수가) * 총체결수량 : 0
                               const 부분실현손익률 = 매수가 > 0 ? ((평균체결가 - 매수가) / 매수가) * 100 : 0
                               
@@ -3495,6 +3506,8 @@ const AutoTrading = () => {
     try {
       const finalAppkey = appkey.trim()
       const finalSecretkey = secretkey.trim()
+      // 세션 표시값이면 실제 키가 아니다 (HttpOnly 쿠키로 이미 인증됨)
+      const isSessionAuth = licenseKey.trim() === SESSION_PLACEHOLDER
 
       // 라이선스 키 필수 체크
       if (!licenseKey.trim()) {
@@ -3511,15 +3524,18 @@ const AutoTrading = () => {
       }
 
       // 라이선스 키 유효성 검증 (필수)
-      try {
-        await validateLicenseKey(licenseKey.trim())
-        if (keyInfo?.remainingDays !== undefined) {
-          addLog(`라이선스 키 검증 성공 (남은 기간: ${keyInfo.remainingDays}일)`, 'success')
+      // 세션 쿠키로 이미 인증된 경우에는 서버가 쿠키로 검증하므로 건너뛴다.
+      if (!isSessionAuth) {
+        try {
+          await validateLicenseKey(licenseKey.trim())
+          if (keyInfo?.remainingDays !== undefined) {
+            addLog(`라이선스 키 검증 성공 (남은 기간: ${keyInfo.remainingDays}일)`, 'success')
+          }
+        } catch (error: any) {
+          addLog(`라이선스 키 검증 실패: ${error.message}`, 'error')
+          setIsConnecting(false)
+          return
         }
-      } catch (error: any) {
-        addLog(`라이선스 키 검증 실패: ${error.message}`, 'error')
-        setIsConnecting(false)
-        return
       }
 
       // API 호스트 설정 (모의투자/실전투자) - 키움증권
@@ -6701,6 +6717,10 @@ const AutoTrading = () => {
           if (data?.authenticated && data.remainingDays !== undefined) {
             setUseLicenseKey(true)
             setKeyInfo({ expiresAt: data.expiresAt, remainingDays: data.remainingDays })
+            // 입력창이 비어 있으면 안 된다.
+            // 키 값 자체는 HttpOnly 쿠키라 JS에서 읽을 수 없으므로
+            // '세션 유지 중'임을 나타내는 표시값을 넣는다 (검증은 쿠키로 이뤄진다).
+            setLicenseKey(prev => prev || SESSION_PLACEHOLDER)
           } else {
             setUseLicenseKey(true) // 키 입력 UI는 유지 (재로그인 유도)
           }
