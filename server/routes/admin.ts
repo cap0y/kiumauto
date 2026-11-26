@@ -4,6 +4,7 @@
  */
 import { Router, Request, Response } from 'express'
 import keyService from '../services/keyService'
+import userStateService from '../services/userStateService'
 
 const router = Router()
 
@@ -158,5 +159,49 @@ router.delete('/keys/:key', async (req: Request, res: Response) => {
   }
 })
 
-export default router
+/**
+ * 세션 상태 조회 (관리자용)
+ * GET /api/admin/state/:key/:name
+ *
+ * 서버에 저장된 사용자 상태를 확인한다 (마이그레이션 검증용).
+ */
+router.get('/state/:key/:name', async (req: Request, res: Response) => {
+  try {
+    const value = await userStateService.get(req.params.key, req.params.name)
+    res.json({ success: true, value })
+  } catch (error: any) {
+    console.error('상태 조회 오류:', error)
+    res.status(500).json({ success: false, message: error.message })
+  }
+})
 
+/**
+ * 세션 상태 저장 (관리자용)
+ * PUT /api/admin/state/:key/:name
+ * Body: { value: any }
+ *
+ * 기존 localStorage에만 있던 값을 서버로 옮길 때 쓴다.
+ * (도메인마다 localStorage가 달라 로컬 실적이 Railway에서 보이지 않던 문제)
+ */
+router.put('/state/:key/:name', async (req: Request, res: Response) => {
+  try {
+    const { key, name } = req.params
+    if (req.body?.value === undefined) {
+      return res.status(400).json({ success: false, message: 'value가 필요합니다' })
+    }
+
+    // 존재하는 키에만 쓸 수 있다 (오타로 유령 세션을 만들지 않도록)
+    const check = await keyService.checkKey(key)
+    if (!check.valid) {
+      return res.status(404).json({ success: false, message: '라이선스 키를 찾을 수 없습니다' })
+    }
+
+    await userStateService.set(key, name, req.body.value)
+    res.json({ success: true, value: req.body.value })
+  } catch (error: any) {
+    console.error('상태 저장 오류:', error)
+    res.status(500).json({ success: false, message: error.message })
+  }
+})
+
+export default router
