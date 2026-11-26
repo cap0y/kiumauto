@@ -2352,10 +2352,11 @@ const AutoTrading = () => {
       // 매수가를 찾는다.
       // 1순위: 주문에 저장된 buyPrice (주문 생성 시점의 잔고 평균단가)
       // 2순위: 보유종목의 평균단가 (buyPrice가 0으로 저장되는 경우가 있다)
-      // 3순위: 같은 종목의 매수 주문 로그
+      // 3순위: 매입금액 ÷ 수량
+      // 4순위: 같은 종목의 매수 주문 로그
       const held = holdingStocksRef.current.find(h => h.code === order.stockCode)
       const logBuy = orderLogs.find(o => o.type === 'buy' && o.stockCode === order.stockCode)
-      const 매수가 = order.buyPrice || held?.purchasePrice || logBuy?.price || 0
+      const 매수가 = resolveBuyPrice(order.buyPrice, held, logBuy?.price)
       const 매도가 = order.price > 0 ? order.price : (order.currentPrice || 0)
 
       // 매수가를 알 수 없으면 집계하지 않고 다음 기회에 다시 시도한다
@@ -2819,7 +2820,12 @@ const AutoTrading = () => {
 
                             // 매수가를 못 찾으면 0원을 누적하지 않는다 (아래 effect가 잔고 도착 후 집계)
                             if (매수가 <= 0) {
-                              console.warn(`[WebSocket 체결] ${order.stockName}: 매수가를 찾지 못해 실현손익 집계 보류`)
+                              console.warn(
+                                `[실현손익 보류] ${order.stockName} (${order.stockCode}): 매수가 없음 ` +
+                                `(order.buyPrice=${order.buyPrice}, 잔고단가=${heldForCalc?.purchasePrice}, ` +
+                                `잔고매입금액=${heldForCalc?.purchaseAmount}, 보유수량=${heldForCalc?.quantity}, ` +
+                                `매수로그가=${orderLogs.find(o => o.type === 'buy' && o.stockCode === order.stockCode)?.price})`
+                              )
                               return {
                                 ...order,
                                 status: '체결',
@@ -2845,6 +2851,7 @@ const AutoTrading = () => {
                             realizedCountedRef.current.add(order.orderNumber || `${order.stockCode}_${order.time}_${order.quantity}`)
                             
                             // 매도 체결 완료 후 해당 매수/매도 주문을 orderLogs에서 삭제
+                            // 집계 effect가 실행될 시간을 확보한다 (500ms는 너무 짧아 누락됐다)
                             setTimeout(() => {
                               setOrderLogs(prevLogs => {
                                 const filtered = prevLogs.filter(log => 
@@ -2854,7 +2861,7 @@ const AutoTrading = () => {
                                 console.log(`[주문 내역 정리] ${order.stockName} 매수/매도 주문 삭제 완료 (이전: ${prevLogs.length}개, 현재: ${filtered.length}개)`)
                                 return filtered
                               })
-                            }, 500)
+                            }, 3000)
                             
                             // 체결 완료 시 보유종목 및 계좌 정보 조회
                             setTimeout(() => {
@@ -5470,12 +5477,23 @@ const AutoTrading = () => {
             // 실제 보유 수량 - 미체결 매도 수량 = 매도가능수량
             // (클라이언트 로컬 수량이 크면 800033 매도가능수량 부족으로 거부된다)
             let actualSellQty = sellQuantity
+            // 잔고 응답에서 확인한 평균단가. 실현손익 계산의 신뢰할 수 있는 출처다.
+            let liveBuyPrice = 0
             try {
               const balance = await kiwoomApi.getBalance(accountNo, accountProductCode)
               const rows = normalizeBalanceRows(balance)
               const live = rows.find((b: any) => String(b.code ?? b.stockCode ?? b.종목코드).trim() === stockCode)
               const heldQty = Number(live?.quantity ?? live?.보유수량 ?? 0)
               const apiSellable = live?.sellableQuantity
+              // 평균단가: pur_pric이 0이면 매입금액/수량으로 역산한다
+              liveBuyPrice = resolveBuyPrice(
+                Number(live?.purchasePrice ?? live?.매입가 ?? 0),
+                {
+                  purchasePrice: Number(live?.purchasePrice ?? live?.매입가 ?? 0),
+                  purchaseAmount: Number(live?.purchaseAmount ?? live?.매입금액 ?? 0),
+                  quantity: heldQty,
+                }
+              )
               if (Number.isFinite(heldQty) && heldQty > 0) {
                 const pendingQty = orderLogs
                   .filter(o => o.stockCode === stockCode && o.type === 'sell' && isPendingSellStatus(o.status))
@@ -5534,8 +5552,10 @@ const AutoTrading = () => {
                   orderNumber: sellOrderResult.orderNumber,
                   orderTimestamp, // 주문 접수 시점 기록
                   isMarketOrder, // 시장가 주문 여부
+                  // 매수가: 잔고에서 방금 읽은 평균단가를 최우선한다
+                  // (로컬 보유종목 캐시는 오래됐거나 비어 있을 수 있다)
                   buyPrice: resolveBuyPrice(
-                    holding.purchasePrice,
+                    liveBuyPrice || holding.purchasePrice,
                     holding,
                     orderLogs.find(o => o.type === 'buy' && o.stockCode === stockCode)?.price
                   ), // 실현손익 계산용 매수가
@@ -5689,7 +5709,9 @@ const AutoTrading = () => {
         currentPrice: Number(b.currentPrice ?? b.현재가 ?? 0),
         profitPercent: Number(b.profitPercent ?? b.수익률 ?? 0),
       }))
-      .filter((b: any) => b.code && b.quantity > 0)
+      // 매도가능수량이 0인 종목은 '보유' 표에 넣지 않는다.
+      // (미체결 매도 주문이 전량 잡고 있어 팔 수 없는 상태 — 표시하면 오해를 준다)
+      .filter((b: any) => b.code && b.quantity > 0 && b.sellableQuantity > 0)
   })()
 
   const logRows = buildDisplayOrders(orderLogs)
@@ -8114,16 +8136,23 @@ const AutoTrading = () => {
                   <label style={{ whiteSpace: 'nowrap', fontWeight: 500, color: theme === 'dark' ? '#d1d5db' : '#111827' }}>보유종목:</label>
                   <span style={{ fontWeight: 'bold', fontSize: '12px', color: theme === 'dark' ? '#f3f4f6' : '#111827' }}>{displayHoldingOrdersWithLive.length}개</span>
                   {(() => {
-                    const blockedCount = displayHoldingOrdersWithLive.filter(
-                      o => o.sellableQuantity !== undefined && o.sellableQuantity <= 0
-                    ).length
-                    if (blockedCount === 0) return null
+                    // 매도가능수량이 0이라 표에서 제외된 종목 수
+                    // (미체결 매도 주문이 전량 잡고 있어 팔 수 없는 상태)
+                    const rawRows: any[] = Array.isArray((balanceData as any)?.stocks)
+                      ? (balanceData as any).stocks
+                      : Array.isArray(balanceData) ? (balanceData as any) : []
+                    const hidden = rawRows.filter((b: any) => {
+                      const qty = Number(b.quantity ?? 0)
+                      const sellable = Number(b.sellableQuantity ?? b.quantity ?? 0)
+                      return qty > 0 && sellable <= 0
+                    }).length
+                    if (hidden === 0) return null
                     return (
                       <span
                         style={{ marginLeft: '6px', fontSize: '10px', color: '#f59e0b', fontWeight: 'normal' }}
                         title="미체결 매도 주문이 물량을 잡고 있습니다. '미체결취소' 후 매도하세요."
                       >
-                        매도불가 {blockedCount}개
+                        매도대기 {hidden}개
                       </span>
                     )
                   })()}
