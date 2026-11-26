@@ -288,6 +288,17 @@ class KeyService {
 
     this.initPromise = (async () => {
       const databaseUrl = String(process.env.DATABASE_URL || '').trim()
+      const isProduction = process.env.NODE_ENV === 'production'
+
+      // 운영 환경에서 DATABASE_URL 미설정은 치명적이다.
+      // 배포마다 빈 SQLite로 시작해 발급한 라이선스 키가 전부 사라진다.
+      if (isProduction && !databaseUrl) {
+        console.error(
+          '[키 저장소] ⚠️ 운영 환경인데 DATABASE_URL이 없습니다. ' +
+          'Railway Variables에 DATABASE_URL을 등록하지 않으면 ' +
+          '배포할 때마다 라이선스 키가 초기화됩니다.'
+        )
+      }
 
       if (databaseUrl) {
         const store = new PostgresKeyStore(databaseUrl)
@@ -296,7 +307,13 @@ class KeyService {
           this.store = store
           console.log(`[키 저장소] ${store.describe()} 사용`)
         } catch (error: any) {
-          console.error('[키 저장소] PostgreSQL 연결 실패, SQLite로 폴백:', error.message)
+          console.error('[키 저장소] PostgreSQL 연결 실패:', error.message)
+          if (isProduction) {
+            console.error(
+              '[키 저장소] ⚠️ 운영 환경에서 DB 연결 실패. DATABASE_URL 값을 확인하세요. ' +
+              '(SQLite로 임시 동작하지만 재배포 시 키가 사라집니다)'
+            )
+          }
         }
       }
 

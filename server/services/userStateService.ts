@@ -162,6 +162,18 @@ class UserStateService {
 
     this.initPromise = (async () => {
       const databaseUrl = String(process.env.DATABASE_URL || '').trim()
+      const isProduction = process.env.NODE_ENV === 'production'
+
+      // 운영 환경에서 DATABASE_URL이 없으면 경고를 크게 남긴다.
+      // (Railway에 환경변수를 등록하지 않으면 매 배포마다 빈 SQLite로 시작해
+      //  사용자 상태가 사라진다 — "실현손익이 0원"의 실제 원인이었다)
+      if (isProduction && !databaseUrl) {
+        console.error(
+          '[상태 저장소] ⚠️ 운영 환경인데 DATABASE_URL이 없습니다. ' +
+          'Railway Variables에 DATABASE_URL을 등록하지 않으면 ' +
+          '배포할 때마다 사용자 데이터(실현손익 등)가 초기화됩니다.'
+        )
+      }
 
       if (databaseUrl) {
         const store = new PostgresStateStore(databaseUrl)
@@ -169,7 +181,14 @@ class UserStateService {
           await store.init()
           this.store = store
         } catch (error: any) {
-          console.error('[상태 저장소] PostgreSQL 실패, SQLite 폴백:', error.message)
+          console.error('[상태 저장소] PostgreSQL 연결 실패:', error.message)
+          if (isProduction) {
+            // 운영에서는 로컬 파일로 떨어져도 데이터가 유지되지 않으므로 명시적으로 알린다
+            console.error(
+              '[상태 저장소] ⚠️ 운영 환경에서 DB 연결에 실패했습니다. ' +
+              'DATABASE_URL 값을 확인하세요. (SQLite로 임시 동작하지만 데이터는 유지되지 않습니다)'
+            )
+          }
         }
       }
       if (!this.store) {
@@ -202,6 +221,11 @@ class UserStateService {
   async remove(userKey: string): Promise<void> {
     await this.initialize()
     return this.requireStore().remove(userKey)
+  }
+
+  /** 사용 중인 저장소 설명 (진단용) */
+  describeStore(): string {
+    return this.store ? this.store.describe() : '초기화 전'
   }
 }
 

@@ -110,6 +110,26 @@ app.get('/health', (_req, res) => {
   })
 })
 
+/**
+ * 배포 진단 (Railway에서 환경변수가 실제로 들어왔는지 확인)
+ * GET /diagnostics
+ *
+ * 값 자체는 노출하지 않고 설정 여부만 알려준다.
+ * "실현손익 0원"처럼 배포 환경 문제를 빠르게 찾기 위한 용도.
+ */
+app.get('/diagnostics', (_req, res) => {
+  const has = (name: string) => String(process.env[name] || '').trim().length > 0
+  res.json({
+    nodeEnv: process.env.NODE_ENV || '(미설정)',
+    databaseUrl: has('DATABASE_URL') ? '설정됨' : '없음 ⚠️',
+    adminToken: has('ADMIN_TOKEN') ? '설정됨' : '없음',
+    allowedOrigins: has('ALLOWED_ORIGINS') ? '설정됨' : '없음(기본 localhost)',
+    keyStore: keyService.describeStore(),
+    stateStore: userStateService.describeStore(),
+    uptime: Math.round(process.uptime()),
+  })
+})
+
 // API 라우터 설정
 app.use('/api', routes)
 
