@@ -2305,10 +2305,11 @@ const AutoTrading = () => {
   }, [])
   
   /** 오늘 실현손익을 서버에 저장한다 (라이선스 키 단위) */
-  const lastLocalSaveAtRef = useRef<number>(0)
+  // 저장 요청이 진행 중인 동안에는 서버 재조회 결과를 무시한다.
+  // (누적 직후 GET이 먼저 도착해 이전 값으로 되돌리는 경쟁 조건 방지)
+  const saveInFlightRef = useRef<number>(0)
   const saveRealizedProfitToServer = async (amount: number, date?: string) => {
-    // 저장 시각 기록 — 서버 재조회가 방금 저장한 값을 덮어쓰지 않게 한다
-    lastLocalSaveAtRef.current = Date.now()
+    saveInFlightRef.current += 1
     try {
       await apiClient.put('/state/today_realized_profit', {
         value: { amount, date: date || dateKey() },
@@ -2318,6 +2319,8 @@ const AutoTrading = () => {
       if (process.env.NODE_ENV === 'development') {
         console.warn('[실현손익] 서버 저장 실패:', error.message)
       }
+    } finally {
+      saveInFlightRef.current = Math.max(0, saveInFlightRef.current - 1)
     }
   }
 
@@ -2332,9 +2335,9 @@ const AutoTrading = () => {
     let cancelled = false
     ;(async () => {
       try {
-        // 이미 이번 세션에서 누적이 시작됐으면 서버 값으로 덮어쓰지 않는다
-        // (누적 직후 재조회가 돌아 이전 값으로 되돌리는 것을 막는다)
-        if (lastLocalSaveAtRef.current > Date.now() - 3000) return
+        // 저장 요청이 진행 중이면 서버 값을 덮어쓰지 않는다
+        // (누적 직후 GET이 먼저 도착해 이전 값으로 되돌리는 경쟁 조건 방지)
+        if (saveInFlightRef.current > 0) return
 
         const response = await apiClient.get('/state/today_realized_profit')
         const value = response.data?.value
