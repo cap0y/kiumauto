@@ -63,8 +63,8 @@ app.use((req, res, next) => {
   if (process.env.NODE_ENV !== 'production') return next()
   const proto = String(req.headers['x-forwarded-proto'] || req.protocol || '').split(',')[0].trim()
   if (proto === 'https') return next()
-  // 로컬 헬스체크는 막지 않는다
-  if (req.path === '/api/kiwoom/status' && req.method === 'GET') return next()
+  // Railway 헬스체크(/health)는 내부 HTTP로 들어오므로 막지 않는다
+  if (req.method === 'GET' && (req.path === '/health' || req.path === '/api/kiwoom/status')) return next()
   return res.status(403).json({
     success: false,
     error: 'HTTPS 연결이 필요합니다',
