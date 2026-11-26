@@ -12,6 +12,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import * as crypto from 'crypto'
 import { createRequire } from 'node:module'
+import { createPool } from './db'
 
 const nodeRequire = createRequire(import.meta.url)
 
@@ -71,18 +72,7 @@ class PostgresKeyStore implements KeyStore {
   }
 
   async init(): Promise<void> {
-    const { Pool } = nodeRequire('pg')
-    this.pool = new Pool({
-      connectionString: this.connectionString,
-      ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
-      max: 5,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000,
-    })
-    // 유휴 커넥션 오류로 프로세스가 죽지 않게 한다
-    this.pool.on('error', (error: any) => {
-      console.error('[키 저장소] PostgreSQL 커넥션 오류:', error.message)
-    })
+    this.pool = createPool(this.connectionString)
 
     await this.pool.query(CREATE_TABLE_SQL)
     await this.pool.query(

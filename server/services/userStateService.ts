@@ -8,6 +8,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import { createRequire } from 'node:module'
+import { createPool } from './db'
 
 const nodeRequire = createRequire(import.meta.url)
 
@@ -30,17 +31,7 @@ class PostgresStateStore implements StateStore {
   }
 
   async init(): Promise<void> {
-    const { Pool } = nodeRequire('pg')
-    this.pool = new Pool({
-      connectionString: this.connectionString,
-      ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
-      max: 5,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 10000,
-    })
-    this.pool.on('error', (error: any) => {
-      console.error('[상태 저장소] PostgreSQL 커넥션 오류:', error.message)
-    })
+    this.pool = createPool(this.connectionString)
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS user_state (
         user_key   TEXT NOT NULL,

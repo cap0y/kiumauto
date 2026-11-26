@@ -131,6 +131,20 @@ const changeFromRate = (price: number, changeRate: number): number => {
   return prev === undefined ? 0 : Math.round(price - prev)
 }
 
+/**
+ * 날짜 비교용 키 (YYYY-MM-DD, 로컬 시간 기준)
+ *
+ * toLocaleDateString('ko-KR')은 "2026. 11. 26."처럼 공백·마침표가 들어가고
+ * 엔진/로캘에 따라 형식이 달라진다. 서버에 저장한 값과 비교하면
+ * 같은 날인데도 불일치해 실현손익이 0으로 보이는 원인이 된다.
+ */
+const dateKey = (d: Date = new Date()): string => {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
 // 숫자 입력 (매매시간/수익률 공용 - C# NumericUpDown 대응)
 const Num = ({ value, onChange, theme, width = '40px', step = 1, min, max, disabled = false }: {
   value: number
@@ -921,7 +935,7 @@ const AutoTrading = () => {
   const [todayTotalRealizedProfit, setTodayTotalRealizedProfit] = useState<number>(() => {
     const saved = localStorage.getItem('today_realized_profit')
     const savedDate = localStorage.getItem('today_realized_profit_date')
-    const today = new Date().toLocaleDateString('ko-KR')
+    const today = dateKey()
     
     // 저장된 날짜가 오늘이면 저장된 값 사용, 아니면 0으로 초기화
     if (savedDate === today && saved) {
@@ -2197,7 +2211,7 @@ const AutoTrading = () => {
   // 날짜 변경 감지 및 오늘의 실현손익 초기화
   useEffect(() => {
     const checkDateChange = () => {
-      const today = new Date().toLocaleDateString('ko-KR')
+      const today = dateKey()
       const savedDate = localStorage.getItem('today_realized_profit_date')
       
       if (savedDate && savedDate !== today) {
@@ -2223,7 +2237,7 @@ const AutoTrading = () => {
   const saveRealizedProfitToServer = async (amount: number, date?: string) => {
     try {
       await apiClient.put('/state/today_realized_profit', {
-        value: { amount, date: date || new Date().toLocaleDateString('ko-KR') },
+        value: { amount, date: date || dateKey() },
       })
     } catch (error: any) {
       // 저장 실패는 조용히 넘긴다 (localStorage 캐시는 유지)
@@ -2243,9 +2257,12 @@ const AutoTrading = () => {
         const value = response.data?.value
         if (cancelled || !value) return
 
-        const today = new Date().toLocaleDateString('ko-KR')
-        // 날짜가 다르면 오늘 실적이 아니다
-        if (value.date !== today) return
+        const today = dateKey()
+        // 저장된 날짜가 오늘인지 확인한다.
+        // 예전 버전은 "2026. 11. 26." 형식으로 저장했으므로 숫자만 비교한다.
+        const savedDigits = String(value.date || '').replace(/[^0-9]/g, '')
+        const todayDigits = today.replace(/[^0-9]/g, '')
+        if (savedDigits && savedDigits !== todayDigits) return
 
         const amount = Number(value.amount)
         if (!Number.isFinite(amount)) return
@@ -2289,7 +2306,7 @@ const AutoTrading = () => {
 
     setTodayTotalRealizedProfit(prev => {
       const newTotal = prev + added
-      const today = new Date().toLocaleDateString('ko-KR')
+      const today = dateKey()
       localStorage.setItem('today_realized_profit', newTotal.toString())
       localStorage.setItem('today_realized_profit_date', today)
       // 서버에도 누적값을 저장해야 다른 기기에서도 같은 값이 보인다
@@ -2731,7 +2748,7 @@ const AutoTrading = () => {
                             // 실현손익을 오늘의 총 실현손익에 누적
                             setTodayTotalRealizedProfit(prev => {
                               const newTotal = prev + 실현손익
-                              const today = new Date().toLocaleDateString('ko-KR')
+                              const today = dateKey()
                               localStorage.setItem('today_realized_profit', newTotal.toString())
                               localStorage.setItem('today_realized_profit_date', today)
                               void saveRealizedProfitToServer(newTotal, today)
@@ -2793,7 +2810,7 @@ const AutoTrading = () => {
                               // 실현손익을 오늘의 총 실현손익에 누적
                               setTodayTotalRealizedProfit(prev => {
                                 const newTotal = prev + 실현손익
-                                const today = new Date().toLocaleDateString('ko-KR')
+                                const today = dateKey()
                                 localStorage.setItem('today_realized_profit', newTotal.toString())
                                 localStorage.setItem('today_realized_profit_date', today)
                                 void saveRealizedProfitToServer(newTotal, today)
