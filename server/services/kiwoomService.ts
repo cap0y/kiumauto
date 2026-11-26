@@ -564,7 +564,8 @@ export class KiwoomService {
     // 종목명 기준으로 한 번 더 병합한다. 표에 같은 이름이 여러 줄로 보이는 것을 막는다.
     const byName = new Map<string, any>()
     for (const h of holdings) {
-      const key = (h.name || h.code).replace(/\s/g, '')      const existing = byName.get(key)
+      const key = (h.name || h.code).replace(/\s/g, '')
+      const existing = byName.get(key)
       if (!existing) {
         byName.set(key, { ...h })
         continue
@@ -814,6 +815,16 @@ export class KiwoomService {
       const rows: any[] = data?.acnt_ord_cntr_prps_dtl || []
       const today = new Date().toLocaleDateString('ko-KR')
 
+      // 실현손익 필드명 확인용 (첫 매도 체결 행의 원본 키를 한 번만 남긴다)
+      if (!(globalThis as any).__kt00007Sampled && rows.length > 0) {
+        const sellRow = rows.find((r: any) => String(r.io_tp_nm || '').includes('매도'))
+        if (sellRow) {
+          ;(globalThis as any).__kt00007Sampled = true
+          console.log('[kt00007 필드]', Object.keys(sellRow).join(','))
+          console.log('[kt00007 매도행]', JSON.stringify(sellRow))
+        }
+      }
+
       return rows.map((item: any, index: number) => {
         const quantity = this.num(item.ord_qty)
         const filled = this.num(item.cntr_qty)
@@ -848,6 +859,11 @@ export class KiwoomService {
           unfilledQuantity: remaining,
           status,
           isExecuted: status === '체결' || status === '부분체결',
+          // 키움 실현손익 필드 (있으면 이게 가장 정확하다)
+          // kt00007은 계좌별 주문체결 상세라 매도 체결 건에 실현손익이 함께 온다.
+          realizedProfit: this.num(
+            item.rlzt_pfls ?? item.rlzt_pfls_amt ?? item.실현손익 ?? item.realized_profit ?? 0
+          ) || undefined,
           orderNumber: item.ord_no || '',
         }
       })

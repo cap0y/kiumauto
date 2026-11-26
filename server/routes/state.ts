@@ -20,6 +20,23 @@ const ALLOWED_NAMES = new Set([
 
 const isValidName = (name: string) => ALLOWED_NAMES.has(name)
 
+/**
+ * 상태 저장 키를 결정한다.
+ *
+ * 기기마다 라이선스 키가 다르면(폰/PC) 실현손익이 따로 쌓여 값이 달라진다.
+ * 계좌번호를 넘기면 계좌 기준으로 저장해 어느 기기에서든 같은 값이 보이게 한다.
+ * 계좌번호가 없으면 기존처럼 라이선스 키 기준(하위 호환).
+ */
+const resolveStateKey = (req: Request): string => {
+  const account = String((req.query.account as string) || (req.body?.account as string) || '').trim()
+  if (account) {
+    // 계좌번호만 남긴다 ('8135796711-01' → '8135796711')
+    const digits = account.split('-')[0].replace(/[^0-9]/g, '')
+    if (digits) return `account:${digits}`
+  }
+  return getUserKey(req)
+}
+
 // 상태 조회
 router.get('/:name', async (req: Request, res: Response) => {
   try {
@@ -28,7 +45,7 @@ router.get('/:name', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: '지원하지 않는 상태 이름입니다' })
     }
 
-    const value = await userStateService.get(getUserKey(req), name)
+    const value = await userStateService.get(resolveStateKey(req), name)
     res.json({ success: true, name, value })
   } catch (error: any) {
     console.error('[상태 조회] 오류:', error.message)
@@ -44,7 +61,8 @@ router.get('/:name', async (req: Request, res: Response) => {
  */
 export const MAX_ABS_REALIZED_PROFIT = 1_000_000_000 // 10억 원 (넘으면 계산 오류)
 
-export const validateRealizedProfit = (value: any): string | null => {  if (!value || typeof value !== 'object') return 'value는 객체여야 합니다'
+export const validateRealizedProfit = (value: any): string | null => {
+  if (!value || typeof value !== 'object') return 'value는 객체여야 합니다'
   const amount = Number(value.amount)
   if (!Number.isFinite(amount)) return 'amount가 숫자가 아닙니다'
   if (Math.abs(amount) > MAX_ABS_REALIZED_PROFIT) {
@@ -74,7 +92,7 @@ router.put('/:name', async (req: Request, res: Response) => {
       }
     }
 
-    await userStateService.set(getUserKey(req), name, req.body.value)
+    await userStateService.set(resolveStateKey(req), name, req.body.value)
     res.json({ success: true })
   } catch (error: any) {
     console.error('[상태 저장] 오류:', error.message)

@@ -2311,8 +2311,11 @@ const AutoTrading = () => {
   const saveRealizedProfitToServer = async (amount: number, date?: string) => {
     saveInFlightRef.current += 1
     try {
+      // account를 함께 보내 계좌 기준으로 저장한다.
+      // (기기마다 라이선스 키가 다르면 폰/PC 값이 따로 쌓여 달라진다)
       await apiClient.put('/state/today_realized_profit', {
         value: { amount, date: date || dateKey() },
+        account: selectedAccount,
       })
     } catch (error: any) {
       // 저장 실패는 조용히 넘긴다 (localStorage 캐시는 유지)
@@ -2339,7 +2342,9 @@ const AutoTrading = () => {
         // (누적 직후 GET이 먼저 도착해 이전 값으로 되돌리는 경쟁 조건 방지)
         if (saveInFlightRef.current > 0) return
 
-        const response = await apiClient.get('/state/today_realized_profit')
+        const response = await apiClient.get('/state/today_realized_profit', {
+          params: { account: selectedAccount },
+        })
         const value = response.data?.value
         if (cancelled || !value) return
 
@@ -2364,7 +2369,7 @@ const AutoTrading = () => {
     return () => {
       cancelled = true
     }
-  }, [keyInfo])
+  }, [keyInfo, selectedAccount])
 
   // 매도 체결 → 오늘 실현손익 누적
   //
