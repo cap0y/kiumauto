@@ -958,9 +958,13 @@ const AutoTrading = () => {
     const saved = localStorage.getItem('today_realized_profit')
     const savedDate = localStorage.getItem('today_realized_profit_date')
     const today = dateKey()
-    
-    // 저장된 날짜가 오늘이면 저장된 값 사용, 아니면 0으로 초기화
-    if (savedDate === today && saved) {
+
+    // 날짜 비교는 숫자만으로 한다 (이전 "2026. 11. 26." 형식 호환)
+    const savedDigits = String(savedDate || '').replace(/[^0-9]/g, '')
+    const todayDigits = today.replace(/[^0-9]/g, '')
+
+    // 저장된 날짜가 오늘이면 저장된 값 사용, 아니면 0
+    if (savedDigits && savedDigits === todayDigits && saved) {
       return parseFloat(saved) || 0
     }
     return 0
@@ -2235,14 +2239,29 @@ const AutoTrading = () => {
     const checkDateChange = () => {
       const today = dateKey()
       const savedDate = localStorage.getItem('today_realized_profit_date')
-      
-      if (savedDate && savedDate !== today) {
+
+      // 날짜 비교는 숫자만으로 한다.
+      // 이전 버전은 "2026. 11. 26." 형식으로 저장했으므로 문자열 그대로 비교하면
+      // 같은 날인데도 '날짜 변경'으로 오판해 매분 0으로 초기화된다.
+      const savedDigits = String(savedDate || '').replace(/[^0-9]/g, '')
+      const todayDigits = today.replace(/[^0-9]/g, '')
+
+      // 저장값이 없거나 손상됐으면 초기화하지 않고 오늘 날짜만 기록한다
+      if (!savedDigits) {
+        localStorage.setItem('today_realized_profit_date', today)
+        return
+      }
+
+      if (savedDigits !== todayDigits) {
         console.log(`[날짜 변경 감지] ${savedDate} → ${today}, 오늘의 실현손익 초기화`)
         setTodayTotalRealizedProfit(0)
         localStorage.setItem('today_realized_profit', '0')
         localStorage.setItem('today_realized_profit_date', today)
         // 서버에도 0으로 반영해야 다른 기기에서도 초기화된다
         saveRealizedProfitToServer(0, today)
+      } else if (savedDate !== today) {
+        // 같은 날짜인데 형식만 다르면 새 형식으로 교체한다 (초기화 금지)
+        localStorage.setItem('today_realized_profit_date', today)
       }
     }
     
@@ -2256,7 +2275,10 @@ const AutoTrading = () => {
   }, [])
   
   /** 오늘 실현손익을 서버에 저장한다 (라이선스 키 단위) */
+  const lastLocalSaveAtRef = useRef<number>(0)
   const saveRealizedProfitToServer = async (amount: number, date?: string) => {
+    // 저장 시각 기록 — 서버 재조회가 방금 저장한 값을 덮어쓰지 않게 한다
+    lastLocalSaveAtRef.current = Date.now()
     try {
       await apiClient.put('/state/today_realized_profit', {
         value: { amount, date: date || dateKey() },
@@ -2271,10 +2293,19 @@ const AutoTrading = () => {
 
   // 앱 시작 시 서버에서 오늘 실현손익을 불러온다.
   // localStorage는 캐시일 뿐이라 다른 기기/Railway 도메인에서는 비어 있다.
+  //
+  // keyInfo(라이선스 검증 결과)가 의존성인 이유:
+  // 앱 시작 직후에는 HttpOnly 세션 쿠키가 아직 없어 401이 난다.
+  // 라이선스 검증(/api/auth/validate-key)이 끝나 쿠키가 심어진 뒤에 다시 조회해야 한다.
   useEffect(() => {
+    if (!keyInfo) return
     let cancelled = false
     ;(async () => {
       try {
+        // 이미 이번 세션에서 누적이 시작됐으면 서버 값으로 덮어쓰지 않는다
+        // (누적 직후 재조회가 돌아 이전 값으로 되돌리는 것을 막는다)
+        if (lastLocalSaveAtRef.current > Date.now() - 3000) return
+
         const response = await apiClient.get('/state/today_realized_profit')
         const value = response.data?.value
         if (cancelled || !value) return
@@ -2300,7 +2331,7 @@ const AutoTrading = () => {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [keyInfo])
 
   // 매도 체결 → 오늘 실현손익 누적
   // (WebSocket 체결 이벤트를 놓쳐도 주문 상태가 '체결'이 되면 여기서 집계된다)
