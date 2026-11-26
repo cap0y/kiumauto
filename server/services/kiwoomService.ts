@@ -506,7 +506,11 @@ export class KiwoomService {
     // 같은 종목이 신용구분별로 여러 줄로 올 수 있으므로 종목코드 기준으로 합산
     const merged = new Map<string, any>()
     for (const row of rawHoldings) {
-      const code = String(row.stk_cd || '').replace(/^[A-Z]/, '').trim()
+      // 키움은 종목코드 앞에 시장 구분 문자를 붙여 내려준다 (A001527, A36328K ...).
+      // 알파벳을 하나만 떼면 'K' 같은 잔여 문자가 남아 같은 종목이 다른 코드로 갈라진다.
+      // 숫자 6자리만 남겨 정규화한다 (예: 'A001527' → '001527', 'A36328K' → '36328K')
+      const rawCode = String(row.stk_cd || '').trim()
+      const code = rawCode.replace(/^[A-Za-z]+/, '').replace(/\s/g, '')
       const quantity = this.num(row.rmnd_qty)
       if (!code || quantity <= 0) continue
 
@@ -556,11 +560,40 @@ export class KiwoomService {
       }
     })
 
+    // 같은 종목이 코드만 다르게(신용/현금, 구코드/신코드) 내려오는 경우가 있어
+    // 종목명 기준으로 한 번 더 병합한다. 표에 같은 이름이 여러 줄로 보이는 것을 막는다.
+    const byName = new Map<string, any>()
+    for (const h of holdings) {
+      const key = (h.name || h.code).replace(/\s/g, '')
+      const existing = byName.get(key)
+      if (!existing) {
+        byName.set(key, { ...h })
+        continue
+      }
+      const totalQty = existing.quantity + h.quantity
+      const totalPurchase = existing.purchaseAmount + h.purchaseAmount
+      existing.quantity = totalQty
+      existing.sellableQuantity += h.sellableQuantity
+      existing.purchaseAmount = totalPurchase
+      existing.evaluation += h.evaluation
+      existing.purchasePrice = totalQty > 0 ? Math.round(totalPurchase / totalQty) : existing.purchasePrice
+      existing.avgPrice = existing.purchasePrice
+      existing.profit = existing.evaluation - totalPurchase
+      existing.profitPercent = totalPurchase > 0
+        ? Number(((existing.profit / totalPurchase) * 100).toFixed(2))
+        : 0
+    }
+    const mergedByName = Array.from(byName.values())
+    if (mergedByName.length !== holdings.length) {
+      console.log(`[잔고] 같은 종목명 병합: ${holdings.length}개 → ${mergedByName.length}개`)
+    }
+    const finalHoldings = mergedByName
+
     // kt00018 응답에는 종목별 합계 필드가 없는 경우가 있다(모의투자).
     // 그럴 때는 방금 합산한 보유종목 값으로 계산해 화면 합계와 반드시 일치시킨다.
-    const sumPurchaseAmount = holdings.reduce((sum: number, h: any) => sum + (h.purchaseAmount || 0), 0)
-    const sumEvaluation = holdings.reduce((sum: number, h: any) => sum + (h.evaluation || 0), 0)
-    const sumProfit = holdings.reduce((sum: number, h: any) => sum + (h.profit || 0), 0)
+    const sumPurchaseAmount = finalHoldings.reduce((sum: number, h: any) => sum + (h.purchaseAmount || 0), 0)
+    const sumEvaluation = finalHoldings.reduce((sum: number, h: any) => sum + (h.evaluation || 0), 0)
+    const sumProfit = finalHoldings.reduce((sum: number, h: any) => sum + (h.profit || 0), 0)
 
     const apiPurchase = this.num(balanceRes?.tot_pur_amt)
     const apiStockValue = this.num(balanceRes?.tot_evlt_amt)
@@ -575,7 +608,7 @@ export class KiwoomService {
     const data = {
       deposit,
       orderable,
-      holdings,
+      holdings: finalHoldings,
       totalPurchase,
       totalStockValue,
       totalAsset: deposit + totalStockValue,
@@ -797,7 +830,7 @@ export class KiwoomService {
           time: item.ord_tm || '',
           type: status === '취소' ? 'cancel' : String(item.io_tp_nm || '').includes('매도') ? 'sell' : 'buy',
           stockName: item.stk_nm || '',
-          stockCode: String(item.stk_cd || '').replace(/^[A-Z]/, ''),
+          stockCode: String(item.stk_cd || '').replace(/^[A-Za-z]+/, '').replace(/\s/g, ''),
           quantity,
           price: filled > 0 ? this.num(item.cntr_uv) : this.num(item.ord_uv),
           orderPrice: this.num(item.ord_uv),

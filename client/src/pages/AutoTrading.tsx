@@ -125,6 +125,28 @@ const prevCloseFromRate = (price: number, changeRate: number): number | undefine
   return denom > 0 ? price / denom : undefined
 }
 
+/**
+ * 실현손익 계산용 매수가를 결정한다.
+ *
+ * 잔고(kt00018)의 pur_pric(평균단가)이 0으로 오는 경우가 있어
+ * 그대로 쓰면 실현손익이 항상 0원이 된다.
+ * 매입금액/수량 → 현재 보유종목 평균단가 → 매수 주문 로그 순으로 보강한다.
+ */
+const resolveBuyPrice = (
+  explicit: number | undefined,
+  held: { purchasePrice?: number; purchaseAmount?: number; quantity?: number } | undefined,
+  buyOrderPrice?: number
+): number => {
+  if (explicit && explicit > 0) return explicit
+  if (held?.purchasePrice && held.purchasePrice > 0) return held.purchasePrice
+  // 매입금액이 있으면 수량으로 나눠 평균단가를 구한다
+  if (held?.purchaseAmount && held.purchaseAmount > 0 && held.quantity && held.quantity > 0) {
+    return Math.round(held.purchaseAmount / held.quantity)
+  }
+  if (buyOrderPrice && buyOrderPrice > 0) return buyOrderPrice
+  return 0
+}
+
 // 전일대비 = 현재가 - 전일종가 (표시는 정수 원 단위)
 const changeFromRate = (price: number, changeRate: number): number => {
   const prev = prevCloseFromRate(price, changeRate)
@@ -2295,11 +2317,24 @@ const AutoTrading = () => {
     for (const order of settled) {
       const key = order.orderNumber || `${order.stockCode}_${order.time}_${order.quantity}`
       if (realizedCountedRef.current.has(key)) continue
-      realizedCountedRef.current.add(key)
 
-      const 매수가 = order.buyPrice || 0
+      // 매수가를 찾는다.
+      // 1순위: 주문에 저장된 buyPrice (주문 생성 시점의 잔고 평균단가)
+      // 2순위: 보유종목의 평균단가 (buyPrice가 0으로 저장되는 경우가 있다)
+      // 3순위: 같은 종목의 매수 주문 로그
+      const held = holdingStocksRef.current.find(h => h.code === order.stockCode)
+      const logBuy = orderLogs.find(o => o.type === 'buy' && o.stockCode === order.stockCode)
+      const 매수가 = order.buyPrice || held?.purchasePrice || logBuy?.price || 0
       const 매도가 = order.price > 0 ? order.price : (order.currentPrice || 0)
-      if (매수가 <= 0 || 매도가 <= 0) continue
+
+      // 매수가를 알 수 없으면 집계하지 않고 다음 기회에 다시 시도한다
+      // (realizedProfit을 설정하지 않아야 이후에도 대상으로 남는다)
+      if (매수가 <= 0 || 매도가 <= 0) {
+        console.warn(`[실현손익] ${order.stockName} 매수가를 찾을 수 없어 건너뜀 (buyPrice=${order.buyPrice}, 잔고단가=${held?.purchasePrice})`)
+        continue
+      }
+
+      realizedCountedRef.current.add(key)
       added += (매도가 - 매수가) * order.quantity
     }
     if (added === 0) return
@@ -2314,7 +2349,10 @@ const AutoTrading = () => {
       console.log(`[실현손익 누적] +${added.toLocaleString()}원, 오늘 총 실현손익: ${newTotal.toLocaleString()}원`)
       return newTotal
     })
-  }, [orderLogs])
+  // holdingStocks도 의존성에 넣는다.
+  // 매도 체결 직후에는 buyPrice가 비어 있을 수 있고, 잔고가 나중에 도착하면
+  // 그때 평균단가로 실현손익을 계산할 수 있다.
+  }, [orderLogs, holdingStocks])
 
   const addLog = (message: string, level: LogMessage['level'] = 'info') => {
     const newLog: LogMessage = {
@@ -2738,9 +2776,26 @@ const AutoTrading = () => {
                               : order.price
                             
                             // 실현손익 계산 (매도가 - 매수가) * 수량
-                            const 매수가 = order.buyPrice || 0
+                            // buyPrice가 0이면 잔고 평균단가/매수로그로 보강한다
+                            const heldForCalc = holdingStocksRef.current.find(h => h.code === order.stockCode)
+                            const 매수가 = resolveBuyPrice(
+                              order.buyPrice,
+                              heldForCalc,
+                              orderLogs.find(o => o.type === 'buy' && o.stockCode === order.stockCode)?.price
+                            )
                             const 실현손익 = 매수가 > 0 ? (평균체결가 - 매수가) * 체결수량 : 0
                             const 실현손익률 = 매수가 > 0 ? ((평균체결가 - 매수가) / 매수가) * 100 : 0
+
+                            // 매수가를 못 찾으면 0원을 누적하지 않는다 (아래 effect가 잔고 도착 후 집계)
+                            if (매수가 <= 0) {
+                              console.warn(`[WebSocket 체결] ${order.stockName}: 매수가를 찾지 못해 실현손익 집계 보류`)
+                              return {
+                                ...order,
+                                status: '체결',
+                                isExecuted: true,
+                                // realizedProfit을 설정하지 않아 이후 재집계 대상으로 남긴다
+                              }
+                            }
                             
                             console.log(`[WebSocket 체결] ${order.stockName} 매도 주문 전량 체결 (체결수량: ${체결수량}주, 주문수량: ${주문수량}주, 누적체결금액: ${executedPrice.toLocaleString()}원, 평균체결가: ${평균체결가.toLocaleString()}원, 매수가: ${매수가.toLocaleString()}원, 실현손익: ${실현손익.toLocaleString()}원, 실현손익률: ${실현손익률.toFixed(2)}%)`)
                             addLog(`[체결 완료] ${order.stockName} ${체결수량}주 매도 체결 (평균가: ${평균체결가.toLocaleString()}원, 실현손익: ${실현손익.toLocaleString()}원, ${실현손익률.toFixed(2)}%)`, 'success')
@@ -3150,7 +3205,7 @@ const AutoTrading = () => {
                 orderNumber: sellResult.orderNumber || sellResult.order_number,
                 isExecuted: false,
                 orderTimestamp: Date.now(),
-                buyPrice: stock.purchasePrice, // 실현손익 계산용 매수가
+                buyPrice: resolveBuyPrice(stock.purchasePrice, stock), // 실현손익 계산용 매수가
                 currentPrice: stock.currentPrice,
               }
               
@@ -5448,7 +5503,11 @@ const AutoTrading = () => {
                   orderNumber: sellOrderResult.orderNumber,
                   orderTimestamp, // 주문 접수 시점 기록
                   isMarketOrder, // 시장가 주문 여부
-                  buyPrice: holding.purchasePrice, // 실현손익 계산용 매수가
+                  buyPrice: resolveBuyPrice(
+                    holding.purchasePrice,
+                    holding,
+                    orderLogs.find(o => o.type === 'buy' && o.stockCode === stockCode)?.price
+                  ), // 실현손익 계산용 매수가
                   currentPrice: holding.currentPrice,
                 }
 
@@ -5855,7 +5914,11 @@ const AutoTrading = () => {
               orderNumber: sellAllOrderResult.orderNumber,
               orderTimestamp, // 주문 접수 시점 기록
               isMarketOrder, // 시장가 주문 여부
-              buyPrice: stock.purchasePrice, // 실현손익 계산용 매수가
+              buyPrice: resolveBuyPrice(
+                stock.purchasePrice,
+                live,
+                orderLogs.find(o => o.type === 'buy' && o.stockCode === stockCode)?.price
+              ), // 실현손익 계산용 매수가
               currentPrice: stock.currentPrice,
             }
 
@@ -6104,7 +6167,11 @@ const AutoTrading = () => {
           orderTimestamp: Date.now(),
           isMarketOrder: sellOrderOption === '03',
           currentPrice: referencePrice,
-          buyPrice: stock.purchasePrice,
+          buyPrice: resolveBuyPrice(
+            stock.purchasePrice,
+            stock,
+            orderLogs.find(o => o.type === 'buy' && o.stockCode === validStockCode)?.price
+          ),
         }
 
         setOrderLogs(prev => {
